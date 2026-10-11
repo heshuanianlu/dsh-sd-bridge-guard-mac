@@ -3,9 +3,9 @@
 [![npm](https://img.shields.io/npm/v/dsh-sd-bridge-guard.svg)](https://www.npmjs.com/package/dsh-sd-bridge-guard)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-**DeepSeek Harness 插件 · 本机 Stable Diffusion 生图五件套 + 违规分流协议 · 跨机器零适配**
+**DeepSeek Harness 插件 · 本机 Stable Diffusion 生图 + 违规分流协议 
 
-让 DeepSeek Harness 直接调用你电脑里的 Stable Diffusion WebUI 生图：不用提前打开 SD（首次调用自动以纯 API 模式拉起）、不用改任何路径——装上插件就能用。
+让 DeepSeek Harness 直接调用你电脑里的 Stable Diffusion 生图：不用提前打开 SD（首次调用自动以纯 API 模式拉起）、不用改任何路径——装上插件就能用。
 
 | 文生图 | 图生图 |
 | --- | --- |
@@ -70,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File "插件目录\install-sd.ps1"
 判定标准 = 模型自己会拒绝执行的尺度，不依赖固定词表。需求里只要有一部分违规就触发分流，不整单拒绝：
 
 - **A 档 · 轻微违规**（删几个词后完全正常）→ 剔除违规片段、照常出图存盘、说明剔除、附脚本、回复最末尾英文违规词清单。
-- **B 档 · 明显违规**（露骨/整体性质）→ **一张图都不生成**，只给合规素体的可复现脚本（`sd_script`），末尾同样列英文违规词。
+- **B 档 · 明显违规**（露骨/整体性质）→ **不生成任何图**，只给合规素体的可复现脚本（`sd_script`），末尾列英文违规词。
 
 ## 配置（`cordis.patch.yml` 中按 id `sd-bridge` 覆盖）
 
