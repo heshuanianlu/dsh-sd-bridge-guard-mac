@@ -1,0 +1,43 @@
+{
+  "name": "dsh-sd-bridge-guard",
+  "version": "0.5.0",
+  "description": "DeepSeek Harness 插件：本机 Stable Diffusion 生图五件套（文生图/图生图/只生成脚本/模型清单/服务管理）+ 违规分流协议。跨机器零适配——SD 目录自动探测，找不到可一键自举安装，产物目录自动落在会话工作区。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "stable-diffusion",
+    "automatic1111",
+    "txt2img",
+    "img2img",
+    "image-generation",
+    "guard"
+  ],
+  "type": "module",
+  "main": "sd-bridge.js",
+  "files": [
+    "sd-bridge.js",
+    "sd-direct.ps1",
+    "install-sd.ps1",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/savinglighting/dsh-sd-bridge-guard.git"
+  },
+  "homepage": "https://github.com/savinglighting/dsh-sd-bridge-guard#readme",
+  "bugs": {
+    "url": "https://github.com/savinglighting/dsh-sd-bridge-guard/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

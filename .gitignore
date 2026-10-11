@@ -1,0 +1,13 @@
+# 依赖与产物
+node_modules/
+*.tgz
+*.log
+
+# 本机运行产物（工作区化后默认落在会话工作区，仓库里不保留）
+SD-Picture/
+ref/
+tmp/
+
+# 系统杂物
+.DS_Store
+Thumbs.db
