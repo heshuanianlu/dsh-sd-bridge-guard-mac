@@ -47,7 +47,7 @@ dsh plugin add link:D:\path\to\dsh-sd-bridge-guard
 powershell -ExecutionPolicy Bypass -File "插件目录\install-sd.ps1"
 ```
 
-装完重启 DSH。首次生图会在线安装 Python/torch 依赖（10-30 分钟），之后秒级响应。
+装完重启 DSH。首次生图会在线安装 Python/torch 依赖。
 
 ## 提供的工具
 
@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File "插件目录\install-sd.ps1"
 ### 保存与命名
 
 - 产物目录：**会话工作区下的 `SD-Picture/`**（可用 `outputDir` 改成绝对路径）
-- 文件名 = **提示词总结_三位序号.png**；`summary` 参数决定文件名，序号自动递增永不覆盖
+- 文件名 = **提示词总结_三位序号.png**；`summary` 参数决定文件名，序号自动递增
 - 返回 `paths`（绝对路径）、`fileNames`、`savedDir`、`replyImages`（Markdown，贴进回复即全尺寸展示）、`script`（可复现脚本）
 
 ## 违规分流协议（`sd-paint` 技能全文内置）
