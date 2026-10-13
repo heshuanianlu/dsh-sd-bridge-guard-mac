@@ -42,20 +42,44 @@ assert.ok(c.includes('轻微违规'), 'mild wording')
 assert.ok(c.includes('末尾'), 'list violating prompts at end')
 assert.ok(c.includes('译成提示词') || c.includes('翻译成提示词'), 'image-to-prompt scenario')
 
+// 出图自检循环 + 图生图画风一致（画质优化新增）
+assert.ok(c.includes('出图自检'), 'self-check section missing')
+assert.ok(c.includes('优化循环'), 'optimize loop missing')
+assert.ok(c.includes('图生图画风一致'), 'img2img style-consistency section missing')
+assert.ok(c.includes('read_image'), 'must instruct reading the image back for review')
+assert.ok(c.includes('不管违不违规'), 'self-check must apply regardless of violation branch')
+assert.ok(c.includes('denoising'), 'style-consistency must mention denoising guidance')
+
+// 蒙版重绘（sd_inpaint）
+assert.ok(c.includes('蒙版重绘'), 'inpaint section missing')
+assert.ok(c.includes('maskBox'), 'maskBox fallback must be documented')
+assert.ok(c.includes('接缝'), 'inpaint self-check must mention seams')
+
 // 可移植性：文案里的占位符已按本机配置注入，源码级硬编码盘符不得漏进注册文案
 assert.ok(!c.includes('D:\\DSWorkPlace'), 'skill content must not leak hardcoded workspace path')
 assert.ok(!c.includes('%OUT%') && !c.includes('%SD%') && !c.includes('%REF%') && !c.includes('%DIRECT%'), 'doc tokens must be replaced')
 
-// 五个工具
-assert.deepEqual([...tools.keys()], ['sd_txt2img', 'sd_img2img', 'sd_script', 'sd_models', 'sd_server'])
+// 六个工具（含蒙版重绘）
+assert.deepEqual([...tools.keys()], ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_models', 'sd_server'])
+
+// sd_inpaint：蒙版来源二选一 + 蒙版参数 + 自检提醒
+const ip = tools.get('sd_inpaint')
+assert.ok(ip, 'sd_inpaint missing')
+assert.ok(ip.description.includes('蒙版'), 'sd_inpaint description must mention mask')
+assert.ok(ip.parameters.properties.mask && ip.parameters.properties.maskBox, 'mask 与 maskBox 必须都在参数表里')
+assert.ok(ip.parameters.properties.denoisingStrength, 'denoisingStrength missing')
+assert.ok(ip.output.schema.properties.selfCheck, 'sd_inpaint must return selfCheck')
+assert.equal(ip.output.schema.properties.script.properties.mode.enum[0], '蒙版重绘')
 
 // 生图工具描述带双分支协议 + 无占位符残留
 for (const name of ['sd_txt2img', 'sd_img2img']) {
   const d = tools.get(name).description
   assert.ok(d.includes('轻微违规') && d.includes('明显违规'), `${name} dual-branch missing`)
   assert.ok(d.includes('sd_script'), `${name} must point to sd_script`)
+  assert.ok(d.includes('read_image'), `${name} must require image self-review`)
   assert.ok(!d.includes('D:\\DSWorkPlace') && !d.includes('%OUT%') && !d.includes('%SD%'), `${name} description must be portable (runtime-injected real paths are fine)`)
   assert.ok(tools.get(name).output.schema.properties.script)
+  assert.ok(tools.get(name).output.schema.properties.selfCheck, `${name} must return selfCheck hint`)
 }
 
 // sd_script：只生成命令、不出图

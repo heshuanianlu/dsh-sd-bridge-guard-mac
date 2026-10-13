@@ -1,6 +1,7 @@
 // dsh-sd-bridge-guard 验收测试：自动拉起 SD → 出图 → 按「提示词总结_序号」保存 → 返回可复现脚本
 // 跨机器可移植：SD 目录走自动探测（DSH_SD_DIR 可覆盖），工作区默认临时目录（ACCEPTANCE_WS 可覆盖）。
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -65,6 +66,10 @@ assert.ok(a.script.command.includes('-Prompt'))
 assert.ok(a.script.command.includes(`-OutDir "${outDir}"`), 'command must inject the workspace output dir')
 assert.ok(a.script.asMarkdown.startsWith('【文生图】\n```powershell'))
 assert.ok(a.script.asMarkdown.includes(a.script.command))
+// 画质默认：采样器必须进命令，否则复现出来的图与会话里不一致
+assert.ok(a.script.command.includes('-Sampler "DPM++ 2M"'), `命令必须带采样器：${a.script.command}`)
+// 出图自检：工具必须回传 read_image 自检提醒
+assert.ok(a.selfCheck && a.selfCheck.includes('read_image'), 'txt2img 必须返回自检提醒 selfCheck')
 const seq1 = Number(/_(\d+)\.png$/.exec(a.fileNames[0])[1])
 
 // 2) 同名 summary 序号递增，不覆盖
@@ -109,6 +114,8 @@ assert.ok(/^蓝发改色_\d{3}\.png$/.test(e.fileNames[0]))
 assert.equal(e.script.mode, '图生图')
 assert.ok(e.script.command.includes('-InitImage'))
 assert.ok(e.script.command.includes('-Denoising'))
+// 图生图自检：必须提醒与参考图并排对照画风
+assert.ok(e.selfCheck && e.selfCheck.includes('参考图'), 'img2img 必须返回画风自检提醒')
 assert.ok(e.script.asMarkdown.startsWith('【图生图】'))
 // 工作区内的参考图直接用原路径，不复制
 assert.equal(e.source, e.sourceOriginal)
@@ -140,7 +147,7 @@ assert.ok(fs.existsSync(/-InitImage "([^"]+)"/.exec(sB.command)[1]))
 fs.rmSync(tmpRef2, { force: true })
 
 // 7) sd_script：B 档（明显违规）只出脚本不生图——纯命令生成，不碰 SD
-assert.deepEqual([...tools.keys()], ['sd_txt2img', 'sd_img2img', 'sd_script', 'sd_models', 'sd_server'])
+assert.deepEqual([...tools.keys()], ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_models', 'sd_server'])
 const before = fs.readdirSync(outDir).length
 const s = await tools.get('sd_script').execute(
   { prompt: '1girl, white sheet, soft light, masterpiece', initImage: a.paths[0], denoising: 0.65, seed: 123 },
@@ -161,5 +168,60 @@ assert.ok(s2.command.includes('-Name "shorekeeper"'))
 assert.equal(fs.readdirSync(outDir).length, before)
 console.log('sd_script(i2i):', s.command)
 console.log('sd_script(t2i):', s2.command)
+
+// 8) 真跑一遍可复现脚本：用 powershell.exe（PS5.1 语义）执行——
+//    a) .ps1 必须带 UTF-8 BOM，否则 PS5.1 按 GBK 读中文注释会直接语法错（坑13）
+//    b) -Seed 必须能吃 uint32（3845143617 > Int32.Max，用 [int] 会参数转换失败）
+const EXEC_SEED = 3845143617
+const beforeRun = fs.readdirSync(outDir)
+const s3 = await tools.get('sd_script').execute(
+  { prompt: '1girl, silver hair, masterpiece', seed: EXEC_SEED, steps: 8, name: 'scriptrun' },
+  exec,
+)
+assert.ok(s3.command.includes(`-Seed ${EXEC_SEED}`), `命令必须携带 uint32 seed：${s3.command}`)
+const run = spawnSync(`${s3.command} -NoOpen`, { shell: true, encoding: 'utf8', timeout: 180000 })
+assert.equal(run.status, 0, `sd-direct.ps1 执行失败（status=${run.status}）\nstdout:\n${run.stdout}\nstderr:\n${run.stderr}`)
+const made = fs.readdirSync(outDir).filter((f) => /^scriptrun_\d{3}\.png$/.test(f) && !beforeRun.includes(f))
+assert.equal(made.length, 1, `脚本应产出一张 scriptrun_XXX.png，实际：${JSON.stringify(made)}`)
+console.log('script ran:', path.join(outDir, made[0]))
+
+// 9) sd_models：结构 + 画质诊断（新装只有 SD1.5 base 时必须给 qualityHint，模型正常的机器不给）
+const m = JSON.parse(await tools.get('sd_models').execute({ section: 'all' }, exec))
+assert.ok(Array.isArray(m.checkpoints) && m.checkpoints.length > 0, 'checkpoints 必须非空')
+assert.ok(m.options && 'sd_model_checkpoint' in m.options, '必须返回当前生效选项')
+const baseOnly = m.checkpoints.every((t) => /v1-5-pruned|v1-5\.ckpt|v1-4|sd-v1-/i.test(String(t)))
+if (baseOnly) {
+  assert.ok(
+    typeof m.qualityHint === 'string' && m.qualityHint.includes('install-sd.ps1'),
+    '只有 base 模型时必须返回 qualityHint 并指向 install-sd.ps1',
+  )
+} else {
+  assert.equal(m.qualityHint, undefined, '模型正常的环境不该返回 qualityHint')
+}
+console.log('sd_models:', m.options, '| qualityHint:', m.qualityHint ? '有' : '无')
+
+// 10) 蒙版重绘：maskBox 自动造蒙版 → 真跑一次 → 脚本必须带 -Mask
+const inpaint = await tools.get('sd_inpaint').execute(
+  {
+    image: a.paths[0],
+    maskBox: '160,40,200,200',
+    prompt: 'pink flower crown, pink roses, masterpiece, best quality',
+    denoisingStrength: 0.7,
+    steps: 12,
+    summary: '蒙版测试',
+  },
+  exec,
+)
+assert.equal(inpaint.script.mode, '蒙版重绘', '蒙版脚本标注应为【蒙版重绘】')
+assert.ok(inpaint.mask && inpaint.mask.includes('mask_box'), `maskBox 应生成蒙版文件，实际：${inpaint.mask}`)
+const maskBytes = fs.readFileSync(inpaint.mask)
+assert.equal(maskBytes.readUInt32BE(0), 0x89504e47, '生成的蒙版必须是合法 PNG')
+assert.ok(inpaint.script.command.includes('-Mask '), `蒙版脚本必须带 -Mask：${inpaint.script.command}`)
+assert.ok(inpaint.script.command.includes('-InitImage'), '蒙版脚本必须带 -InitImage')
+assert.ok(inpaint.script.command.includes('-MaskBlur'), '蒙版脚本应带 -MaskBlur 以便复现接缝效果')
+assert.ok(inpaint.selfCheck && inpaint.selfCheck.includes('接缝'), '蒙版重绘必须返回接缝自检提醒')
+assert.equal(fs.readdirSync(outDir).filter((f) => /^蒙版测试_\d{3}\.png$/.test(f)).length, 1, '蒙版重绘应产出一张图')
+console.log('inpaint:', inpaint.fileNames, '| mask =', inpaint.mask)
+console.log('script(ip):', inpaint.script.command)
 
 console.log('ACCEPTANCE OK')
