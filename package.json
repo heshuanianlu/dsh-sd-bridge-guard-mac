@@ -35,6 +35,9 @@
                     "test:catalog":  "node test-install-catalog.mjs",
                     "acceptance":  "node acceptance.mjs"
                 },
+    "devDependencies":  {
+                            "@deepseek-ai/schemastery":  "^3.18.4"
+                        },
     "license":  "MIT",
     "repository":  {
                        "type":  "git",

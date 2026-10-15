@@ -45,6 +45,10 @@ jobs:
         # 别用 npm@latest：npm 12 要求 node >= 22.22.2，会在 node 20/较早的 22 上 EBADENGINE
         run: npm install -g npm@11
 
+      - name: 装 dev 依赖（设置面板 schema 测试要用到宿主同款 schemastery）
+        # 本机跑测试时 schemastery 来自 DSH profile；CI 里没有宿主，得自己装一份（public npm 有）
+        run: npm install --no-audit --no-fund
+
       - name: 不出图的测试（不需要本机 SD）
         run: |
           node smoke-skill.mjs
