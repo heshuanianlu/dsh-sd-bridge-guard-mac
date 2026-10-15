@@ -22,7 +22,7 @@
 param(
     [string]$Otp = "",
     [string]$Token = "",
-    [string]$Tarball = "D:\DSWorkPlace\release\dsh-sd-bridge-guard-0.9.8.tgz",
+    [string]$Tarball = "D:\DSWorkPlace\release\dsh-sd-bridge-guard-0.9.9.tgz",
     [string]$PluginDir = "C:\Users\zhang\.dsh\profiles\desktop\node_modules\dsh-sd-bridge-guard",
     [switch]$DryRun
 )
@@ -34,7 +34,7 @@ function Write-Ok([string]$Text) { Write-Host "  [OK] $Text" -ForegroundColor Gr
 function Write-WarnNote([string]$Text) { Write-Host "  [!] $Text" -ForegroundColor Yellow }
 function Fail([string]$Text) { Write-Host "`n[FAIL] $Text" -ForegroundColor Red; exit 1 }
 
-$ver = "0.9.8"
+$ver = "0.9.9"
 $isTTY = $true
 try { $isTTY = -not [Console]::IsOutputRedirected } catch { $isTTY = $true }
 

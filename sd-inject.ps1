@@ -1,7 +1,9 @@
 ﻿# sd-inject.ps1 —— 本地提示词注入脚本（素体自检迭代 + 素体基底 + 参数表单）
 # 流程：素体自检迭代（只跑基底，换 seed + 面部修复重试到脸/手不崩；正向自动追加脸部细节词）
-#   → 出图参数表单（一次填完）：正向/负向提示词[基底已预填，多行文本框可直接改] / 迭代次数[默认32] / Denoising[可编辑，默认 0 = 文生图；填 0.3-0.9 = 拿素体成品做底图走图生图] / 比例[默认9:16] / 画风[默认二次元，图生图默认保持画风] / 画质[默认480p，最高2160p（4K）] / LoRA[可选，从 SD 拉取列表] / 取消退出
-#   → 最终出图：Denoising=0 走文生图（默认）；Denoising>0 且素体迭代有成品 → 图生图（-InitImage 素体 winning 图 + 表单 Denoising），最终图同样按迭代次数做脸/手质检迭代，取最高分那张
+#   → 出图参数表单（一次填完）：正向/负向提示词[基底已预填，多行文本框可直接改] / 迭代次数[默认32] / Denoising[可编辑，默认 0 = 文生图；填 0.3-0.9 = 图生图重绘幅度] / 底图[留空=素体成品，「最近」=输出目录最新一张，或填路径/点浏览选图] / 比例[默认9:16] / 画风[默认二次元，图生图默认保持画风] / 画质[默认480p，最高2160p（4K）] / LoRA[可选，从 SD 拉取列表] / 取消退出
+#   → 最终出图：拿到底图 + Denoising>0 → 图生图（-InitImage 底图 + -Denoising）；否则文生图。
+#     底图优先级：表单「底图」栏 > 素体自检迭代的 winning 图 > 现场补一张素体底图（质检不可用时素体也会出这一张）。
+#     最终图同样按迭代次数做脸/手质检迭代（质检不可用时出满 N 张让你自选），取最高分那张
 # 迭代产物全部写入系统临时目录（**不进工作区**），最终只把脸/手最高分的一张复制进 -OutDir，
 # 脚本退出（含取消/失败）时删除整个临时迭代目录——工作区里永远只有成品。
 # 全程本地运行（SD 与脸/手质检的视觉模型都在本机）。
@@ -39,6 +41,7 @@ param(
     [string]$Name = "inject",
     [string]$SdDirect = "",                            # sd-direct.ps1 路径；留空则取脚本同目录
     [string]$SdDir = "",
+    [string]$InitImage = "",                           # 底图（图生图用）：预填进表单「底图」栏；留空 = 用素体成品
     [switch]$NoOpen                                   # 加 -NoOpen 则跑完不自动打开这张图
 )
 
@@ -82,6 +85,40 @@ function Remove-IterTempDir {
     if ($script:IterTempDir -and (Test-Path -LiteralPath $script:IterTempDir)) {
         try { Remove-Item -LiteralPath $script:IterTempDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     }
+}
+
+# 把表单「底图」栏的原始输入解析成真实图片路径：
+#   空 → ''（交给上层决定用素体成品）；「最近/最新/上一张/last/latest」→ $OutDirPath 里最新的一张图；
+#   其余当路径处理（相对路径先按当前目录、再按 $OutDirPath 解析）。解析不到返回 '' 并说明原因。
+function Resolve-InitImagePath {
+    param([string]$Raw, [string]$OutDirPath)
+    $t = "$Raw"
+    if (-not $t) { return '' }
+    $t = $t.Trim().Trim('"')
+    if (-not $t) { return '' }
+    if ($t -match '^(最近|最新|上一张|前一张|上次|latest|last|recent|prev)$') {
+        $hit = @(Get-ChildItem -LiteralPath $OutDirPath -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp)$' } |
+            Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+        if ($hit) {
+            Write-Host "底图 = 输出目录里最新一张：$($hit.FullName)" -ForegroundColor DarkGray
+            return $hit.FullName
+        }
+        Write-Host "底图填了「$t」，但 $OutDirPath 里还没有可用图片 → 忽略底图" -ForegroundColor Yellow
+        return ''
+    }
+    $cand = $t
+    if (-not [System.IO.Path]::IsPathRooted($cand)) {
+        foreach ($base in @((Get-Location).Path, $OutDirPath)) {
+            $p2 = Join-Path $base $cand
+            if (Test-Path -LiteralPath $p2) { $cand = $p2; break }
+        }
+    }
+    if (Test-Path -LiteralPath $cand -PathType Leaf) {
+        try { return (Resolve-Path -LiteralPath $cand).Path } catch { return $cand }
+    }
+    Write-Host "底图路径不存在：$t → 忽略底图" -ForegroundColor Yellow
+    return ''
 }
 
 # 在工作区 $OutDir 里找一个「不覆盖已有文件」的落盘路径：按 <Name>_<序号:D3>.png 递增，
@@ -220,11 +257,12 @@ function Show-ParamForm {
         [string]$Positive,
         [string]$Negative,
         [string[]]$LoraList,
-        [string[]]$CheckpointList
+        [string[]]$CheckpointList,
+        [string]$InitImageDefault = ""
     )
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "sd-inject 出图参数"
-    $form.ClientSize = New-Object System.Drawing.Size(350, 606)
+    $form.ClientSize = New-Object System.Drawing.Size(350, 646)
     $form.FormBorderStyle = 'FixedDialog'
     $form.StartPosition = 'CenterScreen'
     $form.MaximizeBox = $false
@@ -256,7 +294,7 @@ function Show-ParamForm {
     $form.Controls.Add($txtNeg)
 
     # 1-7) 参数行（y 从 240 起，行距 40）
-    $labels = @('迭代次数：', 'Denoising：', '比例：', '画风：', '画质：', 'LoRA：', '模型：')
+    $labels = @('迭代次数：', 'Denoising：', '底图：', '比例：', '画风：', '画质：', 'LoRA：', '模型：')
     for ($i = 0; $i -lt $labels.Count; $i++) {
         $lb = New-Object System.Windows.Forms.Label
         $lb.Text = $labels[$i]
@@ -292,12 +330,35 @@ function Show-ParamForm {
     $lbDenoiseHint.SetBounds(120, (240 + 1 * 40 + 24), 220, 16)
     $form.Controls.Add($lbDenoiseHint)
 
+    # 2.5) 底图（图生图用）：留空 = 用素体自检迭代的成品；「最近」= 输出目录里最新一张；
+    #      也可以手填图片路径，或点「浏览…」选一张。填了底图 + Denoising > 0 就真的走图生图。
+    $txtInit = New-Object System.Windows.Forms.TextBox
+    $txtInit.Text = "$InitImageDefault"
+    $txtInit.SetBounds(120, (240 + 2 * 40), 120, 24)
+    $form.Controls.Add($txtInit)
+    $btnInitBrowse = New-Object System.Windows.Forms.Button
+    $btnInitBrowse.Text = '浏览…'
+    $btnInitBrowse.SetBounds(246, (240 + 2 * 40), 64, 24)
+    $btnInitBrowse.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Title = '选一张底图（图生图用）'
+        $ofd.Filter = '图片|*.png;*.jpg;*.jpeg;*.webp;*.bmp|所有文件|*.*'
+        if ($ofd.ShowDialog() -eq 'OK') { $txtInit.Text = $ofd.FileName }
+    })
+    $form.Controls.Add($btnInitBrowse)
+    $lbInitHint = New-Object System.Windows.Forms.Label
+    $lbInitHint.Text = '（留空=素体成品；「最近」=最新一张）'
+    $lbInitHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
+    $lbInitHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbInitHint.SetBounds(120, (240 + 2 * 40 + 24), 220, 16)
+    $form.Controls.Add($lbInitHint)
+
     # 3) 比例（只读下拉：常见比例）
     $cboRatio = New-Object System.Windows.Forms.ComboBox
     $cboRatio.DropDownStyle = 'DropDownList'
     foreach ($r in @('9:16', '1:1', '3:4', '4:3', '16:9', '2:3', '3:2', '21:9')) { $null = $cboRatio.Items.Add($r) }
     $cboRatio.SelectedIndex = 0   # 默认 9:16
-    $cboRatio.SetBounds(120, (240 + 2 * 40), 190, 24)
+    $cboRatio.SetBounds(120, (240 + 3 * 40), 190, 24)
     $form.Controls.Add($cboRatio)
 
     # 4) 画风（只读下拉：图生图默认「保持画风」，文生图默认「二次元」）
@@ -307,7 +368,7 @@ function Show-ParamForm {
     # 后面是通用画风；「釉彩调色盘」= 用户自调的本地 LoRA 画风（釉彩·麻袋调色盘）。
     foreach ($s in @('保持画风', '二次元', '写实二次元', '写实二次元·东亚脸', '彩色哥特', '釉彩调色盘', '国风', '赛博朋克', '写实', '厚涂', '水彩', '像素风')) { $null = $cboStyle.Items.Add($s) }
     if ($HasBaseImage) { $cboStyle.SelectedIndex = 0 } else { $cboStyle.SelectedIndex = 1 }
-    $cboStyle.SetBounds(120, (240 + 3 * 40), 190, 24)
+    $cboStyle.SetBounds(120, (240 + 4 * 40), 190, 24)
     $form.Controls.Add($cboStyle)
 
     # 画风联动：切换画风时，把该画风对应的正向/负向提示词**幂等写入**两个提示词框。
@@ -343,7 +404,7 @@ function Show-ParamForm {
     $cboQuality.DropDownStyle = 'DropDownList'
     foreach ($q in @('480p', '640p', '768p', '1024p', '1280p', '1440p', '2160p（4K）')) { $null = $cboQuality.Items.Add($q) }
     $cboQuality.SelectedIndex = 0   # 默认 480p
-    $cboQuality.SetBounds(120, (240 + 4 * 40), 190, 24)
+    $cboQuality.SetBounds(120, (240 + 5 * 40), 190, 24)
     $form.Controls.Add($cboQuality)
 
     # 6) LoRA（可编辑下拉：SD 在跑时自动拉取本机列表；留空 = 不用；格式「名称 x权重」如「xxx 0.8」）
@@ -352,14 +413,14 @@ function Show-ParamForm {
     $null = $cboLora.Items.Add('（不用 LoRA）')
     foreach ($l in $LoraList) { $null = $cboLora.Items.Add("$l 0.8") }
     $cboLora.SelectedIndex = 0
-    $cboLora.SetBounds(120, (240 + 5 * 40), 190, 24)
+    $cboLora.SetBounds(120, (240 + 6 * 40), 190, 24)
     $form.Controls.Add($cboLora)
     if ($LoraList.Count -eq 0) {
         $lbLoraHint = New-Object System.Windows.Forms.Label
         $lbLoraHint.Text = '（SD 未运行，拉不到列表；可手填「名称 权重」）'
         $lbLoraHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
         $lbLoraHint.ForeColor = [System.Drawing.Color]::Gray
-        $lbLoraHint.SetBounds(120, (240 + 5 * 40 + 26), 220, 18)
+        $lbLoraHint.SetBounds(120, (240 + 6 * 40 + 26), 220, 18)
         $form.Controls.Add($lbLoraHint)
     }
 
@@ -369,42 +430,42 @@ function Show-ParamForm {
     $null = $cboModel.Items.Add('（当前模型）')
     foreach ($m in $CheckpointList) { $null = $cboModel.Items.Add($m) }
     $cboModel.SelectedIndex = 0
-    $cboModel.SetBounds(120, (240 + 6 * 40), 190, 24)
+    $cboModel.SetBounds(120, (240 + 7 * 40), 190, 24)
     $form.Controls.Add($cboModel)
     if ($CheckpointList.Count -eq 0) {
         $lbModelHint = New-Object System.Windows.Forms.Label
         $lbModelHint.Text = '（SD 未运行，拉不到列表）'
         $lbModelHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
         $lbModelHint.ForeColor = [System.Drawing.Color]::Gray
-        $lbModelHint.SetBounds(120, (240 + 6 * 40 + 26), 220, 18)
+        $lbModelHint.SetBounds(120, (240 + 7 * 40 + 26), 220, 18)
         $form.Controls.Add($lbModelHint)
     }
 
     # 8) 命名（文本框，可留空：留空 = 用提示词总结 + 序号；自定义名重复时自动加序号递增）
     $lbName = New-Object System.Windows.Forms.Label
     $lbName.Text = '命名：'
-    $lbName.SetBounds(20, (240 + 7 * 40), 90, 22)
+    $lbName.SetBounds(20, (240 + 8 * 40), 90, 22)
     $form.Controls.Add($lbName)
     $txtName = New-Object System.Windows.Forms.TextBox
     $txtName.Text = ''
-    $txtName.SetBounds(120, (240 + 7 * 40), 190, 24)
+    $txtName.SetBounds(120, (240 + 8 * 40), 190, 24)
     $form.Controls.Add($txtName)
     $lbNameHint = New-Object System.Windows.Forms.Label
     $lbNameHint.Text = '（留空 = 自动总结提示词命名）'
     $lbNameHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
     $lbNameHint.ForeColor = [System.Drawing.Color]::Gray
-    $lbNameHint.SetBounds(120, (240 + 7 * 40 + 26), 220, 18)
+    $lbNameHint.SetBounds(120, (240 + 8 * 40 + 26), 220, 18)
     $form.Controls.Add($lbNameHint)
 
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text = '确定出图'
-    $btnOk.SetBounds(110, 564, 100, 30)
+    $btnOk.SetBounds(110, 604, 100, 30)
     $form.AcceptButton = $btnOk
     $form.Controls.Add($btnOk)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = '取消'
-    $btnCancel.SetBounds(220, 564, 100, 30)
+    $btnCancel.SetBounds(220, 604, 100, 30)
     $form.Controls.Add($btnCancel)
 
     $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
@@ -443,6 +504,7 @@ function Show-ParamForm {
         Lora    = $cboLora.Text.Trim()
         Model   = [string]$cboModel.SelectedItem
         Name    = $txtName.Text.Trim()
+        InitImg = $txtInit.Text.Trim()
     }
 }
 
@@ -550,32 +612,34 @@ function Test-FaceQuality {
 }
 
 function Invoke-BaseIterate {
-    # 素体迭代主流程：只跑 $BasePrompt，每轮换 seed；第 2 轮起开面部修复。
-    # 返回 @{ Path = 图路径; Seed = 实际 seed; Score = 脸/手得分 }；失败返回 $null。
+    # 素体迭代主流程：只跑 $BasePrompt，每轮换 seed；有视觉模型时逐轮质检，没有就只出一张。
+    # 返回 @{ Path = 图路径; Seed = 实际 seed; Score = 脸/手得分（没质检 = -1） }; 真出不了图才返回 $null。
     # 铁律：本函数不修改 $positive / $negative 的任何内容——不加词、不加替换词、不加安全词。
+    # 2026-10-15 修：质检不可用**不再直接 return $null**——那样图生图（Denoising > 0）会因为
+    # 「没有素体成品」被静默降级成文生图（用户实测：C 档根本用不了图生图）。现在照样出一张底图。
+    $vlmOk = $true
     if (-not (Test-VlmApi)) {
-        # 视觉质检不可用：不做无意义的迭代，保持老行为直接出一张
-        Write-Host "本地视觉模型不可用（$QwenBase），跳过素体自检迭代（可用 -NoIterate 显式关闭）" -ForegroundColor Yellow
-        return $null
-    }
-    if (-not $VlmModel -or ((Get-VlmCandidates) -notcontains $VlmModel)) {
+        Write-Host "本地视觉模型不可用（$QwenBase）→ 素体只出一张底图、不跑脸/手质检迭代（图生图底图照常可用）" -ForegroundColor Yellow
+        $vlmOk = $false
+    } elseif (-not $VlmModel -or ((Get-VlmCandidates) -notcontains $VlmModel)) {
         $vlm = Get-VlmCandidates | Where-Object { $_ -match 'vl|vision' } | Select-Object -First 1
         if (-not $vlm) {
-            Write-Host "本机没有视觉模型（vl/vision），跳过素体自检迭代；想用请先：ollama pull qwen3-vl:8b" -ForegroundColor Yellow
-            return $null
-        }
-        if ($vlm -ne $VlmModel) {
+            Write-Host "本机没有视觉模型（vl/vision）→ 素体只出一张底图、不跑脸/手质检迭代；想质检请先：ollama pull qwen3-vl:8b" -ForegroundColor Yellow
+            $vlmOk = $false
+        } elseif ($vlm -ne $VlmModel) {
             Write-Host "质检模型已回退到 '$vlm'（要固定用 '$VlmModel' 先执行：ollama pull $VlmModel）" -ForegroundColor Yellow
             $script:VlmModel = $vlm
         }
     }
     # 预热：发一条纯文本空问，把模型先加载进显存——否则首轮带图质检会撞冷启动超时（实测 >120s）
-    try {
-        $null = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post `
-            -Headers @{ "Content-Type" = "application/json; charset=utf-8"; "Authorization" = "Bearer $QwenApiKey" } `
-            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ model = $VlmModel; messages = @(@{ role = "user"; content = "1" }); stream = $false } | ConvertTo-Json -Depth 6))) `
-            -TimeoutSec 300
-    } catch { }
+    if ($vlmOk) {
+        try {
+            $null = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post `
+                -Headers @{ "Content-Type" = "application/json; charset=utf-8"; "Authorization" = "Bearer $QwenApiKey" } `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ model = $VlmModel; messages = @(@{ role = "user"; content = "1" }); stream = $false } | ConvertTo-Json -Depth 6))) `
+                -TimeoutSec 300
+        } catch { }
+    }
 
     Write-Host "素体自检迭代中..." -ForegroundColor Cyan
     $bestPath = ''
@@ -583,7 +647,7 @@ function Invoke-BaseIterate {
     $bestScore = -1
     $roundsUsed = 0
     $vlmEverWorked = $false
-    $giveUpVlm = $false
+    $giveUpVlm = (-not $vlmOk)   # 没质检 → 出完第一轮就收（当底图用）
     for ($round = 1; $round -le $IterateRounds; $round++) {
         $roundsUsed = $round
         $iterArgs = @(
@@ -892,7 +956,7 @@ $formPositive = $BasePrompt
 $formNegative = $BaseNegative
 if ($formPositive -and ($formPositive -notmatch ',\s*$')) { $formPositive = $formPositive.TrimEnd() + ", " }
 if ($formNegative -and ($formNegative -notmatch ',\s*$')) { $formNegative = $formNegative.TrimEnd() + ", " }
-$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints
+$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $InitImage
 # 表单里的提示词是最终值（基底 + 用户在表单里的修改/追加）
 $positive = $P.Pos
 $negative = $P.Neg
@@ -963,7 +1027,8 @@ if (-not $finalBaseName) { $finalBaseName = $Name }
 
 Write-Host ""
 $denoiseDesc = if ($P.Denoise -gt 0) { "Denoising $($P.Denoise)（图生图）" } else { "Denoising 0（文生图）" }
-Write-Host "出图参数：迭代 $($P.Rounds) 次 | $denoiseDesc | 比例 $($P.Ratio)（$($size.W)x$($size.H)） | 画风 $($P.Style) | 画质 $($P.Quality)$(if ($loraFragment) { " | LoRA $loraFragment" })$(if ($formCheckpoint) { " | 模型 $formCheckpoint" }) | 命名 $finalBaseName" -ForegroundColor Green
+$initDesc = if ("$($P.InitImg)") { "底图「$($P.InitImg)」" } else { "底图=素体成品" }
+Write-Host "出图参数：迭代 $($P.Rounds) 次 | $denoiseDesc | $initDesc | 比例 $($P.Ratio)（$($size.W)x$($size.H)） | 画风 $($P.Style) | 画质 $($P.Quality)$(if ($loraFragment) { " | LoRA $loraFragment" })$(if ($formCheckpoint) { " | 模型 $formCheckpoint" }) | 命名 $finalBaseName" -ForegroundColor Green
 Write-Host "正向: $positive" -ForegroundColor White
 Write-Host "负向: $negative" -ForegroundColor White
 
@@ -1017,7 +1082,7 @@ if ($P.Style -eq '彩色哥特' -and -not $formCheckpoint) {
 # 追加为空（表单里提示词与基底一致 + 无脸部词/LoRA 追加）+ 素体迭代已产出成品 + 参数全是默认形态（无比例/画质/画风调整）
 # + Denoising=0（用户没要求图生图）：不重复出图，直接收尾。
 # 注：Denoising>0 时**不**走这条捷径——用户明确要用素体图做底图重绘，必须真正出一轮图生图。
-$defaultsOnly = ($P.Ratio -eq '9:16' -and $P.Quality -eq '480p' -and $P.Style -in @('保持画风', '二次元') -and $P.Rounds -eq $paramFormRounds -and $P.Denoise -le 0)
+$defaultsOnly = ($P.Ratio -eq '9:16' -and $P.Quality -eq '480p' -and $P.Style -in @('保持画风', '二次元') -and $P.Rounds -eq $paramFormRounds -and $P.Denoise -le 0 -and -not "$($P.InitImg)")
 $promptsUntouched = ($positive -eq $formPositive.Trim() -and $negative -eq $formNegative.Trim())
 # 决策日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-decision.log
 if ($promptsUntouched -and $hasBaseImg -and $defaultsOnly) {
@@ -1050,23 +1115,42 @@ $finalNegative = $negative
 if ($positive -and ($positive -notmatch ',\s*$')) { $positive = $positive.TrimEnd() + ", " }
 if ($finalNegative -and ($finalNegative -notmatch ',\s*$')) { $finalNegative = $finalNegative.TrimEnd() + ", " }
 
-# 最终出图：Denoising 表单值说了算（2026-10-15 解锁）。
-#   - Denoising = 0（默认）→ 文生图（txt2img），用完整的 $positive（表单提示词 + 脸部词 + LoRA）。
-#     不拿素体图做底图的原因：denoising 会强烈保留素体裸基底的内容，用户填的提示词被稀释得几乎看不见（实测根因）。
-#   - Denoising > 0 → 图生图（img2img）：底图 = 素体自检迭代的 winning 图，重绘幅度 = 表单值。
-#     用户自己选就按用户选的来：0.3-0.5 贴底图微调、≥0.7 基本重画；力度与提示词稀释都交由用户权衡。
-$finalInit = ""
+# 最终出图：底图 + Denoising 决定走不走图生图（2026-10-15 第二轮修：C 档实测「填了 Denoising 还是文生图」）。
+#   底图优先级：表单「底图」栏（路径 /「最近」/ 浏览选图） > 素体自检迭代的 winning 图 > 现场补一张素体底图。
+#   只要最终拿到一张底图、且 Denoising > 0（或填了底图没填 Denoising → 按图生图默认 0.55），就走图生图。
+$initRaw = ''
+if ($P.ContainsKey('InitImg')) { $initRaw = "$($P.InitImg)" }
+$finalInit = Resolve-InitImagePath -Raw $initRaw -OutDirPath $OutDir
 $finalDenoise = 0.0
-if ($P.Denoise -gt 0) {
+if ($finalInit) {
+    $finalDenoise = [double]$P.Denoise
+    if ($finalDenoise -le 0) {
+        $finalDenoise = 0.55
+        Write-Host "表单填了底图但 Denoising 是 0 → 按图生图默认 0.55 用（免得等于不重绘）" -ForegroundColor DarkGray
+    }
+    Write-Host "最终出图走图生图：底图 = $finalInit（denoising = $finalDenoise）" -ForegroundColor Cyan
+} elseif ($P.Denoise -gt 0) {
     if ($baseWin -and (Test-Path -LiteralPath $baseWin.Path)) {
         $finalInit = $baseWin.Path
-        $finalDenoise = $P.Denoise
+        $finalDenoise = [double]$P.Denoise
         Write-Host "最终出图走图生图：底图 = 素体成品（seed=$($baseWin.Seed)），denoising = $finalDenoise" -ForegroundColor Cyan
+    } elseif ($NoIterate) {
+        Write-Host "没有底图可选：本次传了 -NoIterate（不跑素体），要图生图请在表单「底图」栏填路径或「最近」" -ForegroundColor Yellow
     } else {
-        Write-Host "表单填了 Denoising $($P.Denoise)，但素体迭代没有可用成品（-NoIterate 或迭代失败）→ 本次仍走文生图" -ForegroundColor Yellow
+        # 素体阶段没产出（异常路径）→ 现场补一张底图，否则用户填的 Denoising 形同虚设
+        Write-Host "没有可用底图 → 现场补一张素体底图（单轮出图）…" -ForegroundColor Cyan
+        $fallbackBase = Invoke-BaseIterate
+        if ($fallbackBase -and (Test-Path -LiteralPath $fallbackBase.Path)) {
+            $finalInit = $fallbackBase.Path
+            $finalDenoise = [double]$P.Denoise
+            if (-not $baseWin) { $baseWin = $fallbackBase }
+            Write-Host "底图就位：$finalInit（denoising = $finalDenoise）" -ForegroundColor Cyan
+        } else {
+            Write-Host "底图仍不可用 → 本次回落文生图（Denoising 不生效）" -ForegroundColor Yellow
+        }
     }
 } else {
-    Write-Host "最终出图走文生图（Denoising 0，不用素体底图）" -ForegroundColor DarkGray
+    Write-Host "最终出图走文生图（Denoising 0 + 未填底图）" -ForegroundColor DarkGray
 }
 $finalWin = Invoke-FinalIterate -InitImage $finalInit -Denoising $finalDenoise -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint
 
