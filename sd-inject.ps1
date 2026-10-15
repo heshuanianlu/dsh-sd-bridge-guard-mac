@@ -178,13 +178,19 @@ function Remove-IterTempDir {
 
 # 把表单「底图」栏的原始输入解析成真实图片路径：
 #   空 → ''（交给上层决定用素体成品）；「最近/最新/上一张/last/latest」→ $OutDirPath 里最新的一张图；
-#   其余当路径处理（相对路径先按当前目录、再按 $OutDirPath 解析）。解析不到返回 '' 并说明原因。
+#   其余当路径处理（相对路径先按当前目录、再按 $OutDirPath 解析）。
+# 解析失败时把原因写进 $script:LastInitFail（调用方据此决定是「明确报错」还是「回落最近一张」），
+# 并返回 ''。**不再默默换一张图**：调用方只要拿到显式底图（对话提交或表单填的），解析不了就必须报错
+# ——「底图不生效还被换成别的图」就是 2026-10-15 那个故障的根因。
 function Resolve-InitImagePath {
     param([string]$Raw, [string]$OutDirPath)
+    $script:LastInitFail = ''
     $t = "$Raw"
     if (-not $t) { return '' }
-    $t = $t.Trim().Trim('"')
+    $t = $t.Trim().Trim('"', "'", '`')
     if (-not $t) { return '' }
+
+    # ① 关键词：最近 / 最新 / 上一张 / latest …
     if ($t -match '^(最近|最新|上一张|前一张|上次|latest|last|recent|prev)$') {
         $hit = @(Get-ChildItem -LiteralPath $OutDirPath -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp)$' } |
@@ -193,10 +199,49 @@ function Resolve-InitImagePath {
             Write-Host "底图 = 输出目录里最新一张：$($hit.FullName)" -ForegroundColor DarkGray
             return $hit.FullName
         }
-        Write-Host "底图填了「$t」，但 $OutDirPath 里还没有可用图片 → 忽略底图" -ForegroundColor Yellow
+        $script:LastInitFail = "输出目录 $OutDirPath 里还没有可用图片"
         return ''
     }
-    $cand = $t
+
+    # ② 附件/哈希形态：对话可能把「图片 sha256:xxxx」「xxxx.png [8a34ca32]」这类引用直接传进来。
+    #    先剥掉方括号/括号里的哈希装饰，再把裸哈希拿去已落盘的目录里找同名文件。
+    $clean = $t
+    $clean = $clean -replace '[\s\[\(（【]+(sha256:|sha1:)?[0-9a-fA-F]{8,64}[\s\]\)）】]*$', ''   # 尾巴上的哈希装饰
+    $clean = $clean -replace '^(图片|图像|image|attachment|附件)\s*[:：]?\s*', ''                 # 前缀里的说明词
+    $clean = $clean -replace '^(sha256|sha1)\s*[:：]\s*', ''
+    $clean = $clean.Trim()
+    $bareHash = ''
+    if ($clean -match '^[0-9a-fA-F]{8,64}$') { $bareHash = $clean }
+    elseif ($t -match '(sha256|sha1)\s*[:：]\s*([0-9a-fA-F]{8,64})') { $bareHash = $Matches[2] }
+
+    if ($bareHash) {
+        $roots = @()
+        if ($OutDirPath) { $roots += $OutDirPath; $roots += (Join-Path (Split-Path -Parent $OutDirPath) 'ref') }
+        try { $roots += (Join-Path $env:USERPROFILE '.dsh\attachments') } catch { }
+        foreach ($r in $roots) {
+            if (-not $r -or -not (Test-Path -LiteralPath $r)) { continue }
+            $hit = @(Get-ChildItem -LiteralPath $r -Recurse -File -Depth 3 -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp)$' -and $_.FullName -match [regex]::Escape($bareHash) } |
+                Select-Object -First 1)
+            if ($hit.Count -gt 0) {
+                Write-Host "底图 = 按哈希 '$bareHash' 找到：$($hit[0].FullName)" -ForegroundColor DarkGray
+                return $hit[0].FullName
+            }
+        }
+        $script:LastInitFail = "「$t」是哈希/附件引用，不是文件路径；已在输出目录、ref、DSH 附件目录里找过，没有匹配的图片"
+        return ''
+    }
+
+    # ③ 从字符串里抠出真正的路径（对话常把说明文字和路径混在一起）
+    # 先抠「带图片后缀」的路径；再退一步抠任意 Windows 路径 token（DSH 附件是**无后缀**的图片文件，
+    # 形如 ...\.dsh\attachments\v1\objects\bd\bd863a…，只认 .png/.jpg 会漏掉它）。
+    $cand = $clean
+    $m = [regex]::Match($clean, '[A-Za-z]:\\[^\r\n"''<>|]+?\.(png|jpg|jpeg|webp|bmp)', 'IgnoreCase')
+    if (-not $m.Success) { $m = [regex]::Match($clean, '[A-Za-z]:\\[^\s\r\n"''<>|]+', 'IgnoreCase') }
+    if (-not $m.Success) { $m = [regex]::Match($clean, '(\\\\|\.\.?/)[^\s\r\n"'']+', 'IgnoreCase') }
+    if ($m.Success) { $cand = $m.Value.Trim() }
+
+    # ④ 相对路径：先按当前目录、再按输出目录解析
     if (-not [System.IO.Path]::IsPathRooted($cand)) {
         foreach ($base in @((Get-Location).Path, $OutDirPath)) {
             $p2 = Join-Path $base $cand
@@ -206,7 +251,7 @@ function Resolve-InitImagePath {
     if (Test-Path -LiteralPath $cand -PathType Leaf) {
         try { return (Resolve-Path -LiteralPath $cand).Path } catch { return $cand }
     }
-    Write-Host "底图路径不存在：$t → 忽略底图" -ForegroundColor Yellow
+    $script:LastInitFail = "底图路径不存在：$cand"
     return ''
 }
 
@@ -461,11 +506,27 @@ function New-RegionMask {
     if (-not $s) { return '' }
     $invert = $false
     if ($s -match '反选|invert') { $invert = $true; $s = ($s -replace '反选', '') -replace 'invert', '' }
-    $shape = ''
-    if ($s -match '上半|脸|face|head') { $shape = 'upper' }
-    elseif ($s -match '下半|衣服|服装|clothes|outfit|body') { $shape = 'lower' }
-    elseif ($s -match '中间|主体|center|centre') { $shape = 'center' }
-    elseif ($s -match '四周|背景|background|bg|边缘') { $shape = 'ring' }
+    # 精确坐标框（对话可以据此提交任意区域）：box:x,y,w,h（0-1 归一化）或 boxpx:x,y,w,h（像素）
+    $mBox = [regex]::Match($s, 'box(px)?\s*[:：]\s*([0-9]*\.?[0-9]+)\s*[,，]\s*([0-9]*\.?[0-9]+)\s*[,，]\s*([0-9]*\.?[0-9]+)\s*[,，]\s*([0-9]*\.?[0-9]+)')
+    if ($mBox.Success) {
+        $isPx = ($mBox.Groups[1].Value -eq 'px')
+        $v1 = [double]$mBox.Groups[2].Value; $v2 = [double]$mBox.Groups[3].Value
+        $v3 = [double]$mBox.Groups[4].Value; $v4 = [double]$mBox.Groups[5].Value
+        if ($isPx) { $rx = [int]$v1; $ry = [int]$v2; $rw = [int]$v3; $rh = [int]$v4 }
+        else { $rx = [int]($W * $v1); $ry = [int]($H * $v2); $rw = [int]($W * $v3); $rh = [int]($H * $v4) }
+        # 夹到图像范围内（越界框会让 A1111 把蒙版贴到奇怪的位置）
+        if ($rx -lt 0) { $rx = 0 }; if ($ry -lt 0) { $ry = 0 }
+        if ($rx -ge $W) { $rx = $W - 8 }; if ($ry -ge $H) { $ry = $H - 8 }
+        if ($rw -lt 8) { $rw = 8 }; if ($rh -lt 8) { $rh = 8 }
+        if (($rx + $rw) -gt $W) { $rw = $W - $rx }
+        if (($ry + $rh) -gt $H) { $rh = $H - $ry }
+        $rects += @{ X = $rx; Y = $ry; Wd = $rw; Ht = $rh }
+        $shape = 'box'
+    }
+    if (-not $shape -and ($s -match '上半|脸|face|head')) { $shape = 'upper' }
+    elseif (-not $shape -and ($s -match '下半|衣服|服装|clothes|outfit|body')) { $shape = 'lower' }
+    elseif (-not $shape -and ($s -match '中间|主体|center|centre')) { $shape = 'center' }
+    elseif (-not $shape -and ($s -match '四周|背景|background|bg|边缘')) { $shape = 'ring' }
     if (-not $shape) { return '' }
 
     Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
@@ -474,12 +535,13 @@ function New-RegionMask {
     $black = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Black)
     $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
     $g.Clear([System.Drawing.Color]::Black)
-    $rects = @()
+    if ($shape -eq 'box') { $rects = $rects }   # box 分支已经在上面算好矩形了
     switch ($shape) {
         # 区域框刻意收窄：铺满整幅会把背景/头发一起重画（实测那样出来的是糊块）
         'upper'  { $rects += @{ X = [int]($W * 0.25); Y = [int]($H * 0.04); Wd = [int]($W * 0.5); Ht = [int]($H * 0.32) } }
         'lower'  { $rects += @{ X = [int]($W * 0.2); Y = [int]($H * 0.45); Wd = [int]($W * 0.6); Ht = [int]($H * 0.5) } }
         'center' { $rects += @{ X = [int]($W * 0.22); Y = [int]($H * 0.18); Wd = [int]($W * 0.56); Ht = [int]($H * 0.66) } }
+        'box'    { }
         'ring'   {
             $band = [int]($W * 0.18)
             $rects += @{ X = 0; Y = 0; Wd = $W; Ht = $band }
@@ -535,8 +597,13 @@ function Merge-ConsistencyPrompt {
             $keep += $t
         }
     }
+    # 排序策略：**替换**动作 → 用户新指令在前（它是本次要改的东西）；**整体一致** → 参考图的词在前
+    # （保证出来的图与原图一致；用户额外加的词跟在后面）。
     $merged = "$UserPos"
-    if ($keep.Count -gt 0) { $merged = (($merged.TrimEnd(',', ' ') + ', ' + ($keep -join ', '))) }
+    if ($keep.Count -gt 0) {
+        if ($conflict) { $merged = ($UserPos.TrimEnd(',', ' ') + ', ' + ($keep -join ', ')) }
+        else { $merged = (($keep -join ', ') + ', ' + $UserPos.TrimEnd(',', ' ')) }
+    }
     if ($conflict) { Write-Host "一致：已剔除参考图里与「$Target」冲突的标签 $($keep.Count) 个保留 / 原 $((($RefPos -split ',').Count)) 个" -ForegroundColor DarkGray }
     return ($merged -replace '(\s*,\s*)+', ', ').Trim()
 }
@@ -1619,8 +1686,25 @@ if ($finalNegative) { $finalNegative = (($finalNegative -replace '(\s*,\s*)+', '
 #        （画风天然一致；这正是「换个衣服结果画风也变了」的正解）
 $mode = "$($P.Mode)"
 $maskSpecRaw = "$($P.Mask)"
-$initRaw = "$($P.InitImg)"
-$refPath = Resolve-InitImagePath -Raw $initRaw -OutDirPath $OutDir
+$formInitRaw = "$($P.InitImg)"
+$paramInitRaw = "$InitImage"
+# 只要「对话提交」或「表单填写」给了底图，就算显式指定 —— 解析不了必须报错，
+# 绝不能默默换成「输出目录最新一张」（那正是「底图不生效、图生图和原图没关系」的根因）。
+$initRaw = if ($formInitRaw) { $formInitRaw } else { $paramInitRaw }
+$refPath = ''
+if ($mode -eq '图生图' -and $initRaw) {
+    $refPath = Resolve-InitImagePath -Raw $initRaw -OutDirPath $OutDir
+    if (-not $refPath) {
+        Write-Host "错误：底图没能解析成文件 —— $script:LastInitFail" -ForegroundColor Red
+        Write-Host "      收到的是：$initRaw" -ForegroundColor DarkGray
+        Write-Host "      请传**图片文件路径**（例：D:\pics\ref.png）；「底图」栏也可以填「最近」用输出目录最新一张。" -ForegroundColor Yellow
+        Write-Host "      提示：附件哈希（sha256:…）不是文件路径，不能直接当底图。" -ForegroundColor DarkGray
+        Remove-IterTempDir
+        exit 1
+    }
+    $rsz = Get-ImageSizePx -Path $refPath
+    Write-Host "底图已解析：$refPath（$($rsz.W)x$($rsz.H)）" -ForegroundColor DarkGray
+}
 $finalInit = ""
 $finalDenoise = 0.0
 $finalMask = ""
@@ -1628,16 +1712,16 @@ $inpaintFill = 0
 $branchTag = "C-0 文生图"
 
 if ($mode -eq '图生图' -and -not $refPath) {
-    # 图生图没给底图 → 自动退到「输出目录最新一张」；再没有就明确报错，不默默改成文生图
-    $refPath = Resolve-InitImagePath -Raw '最近' -OutDirPath $OutDir
-    if ($refPath) {
-        Write-Host "图生图：表单没填底图 → 自动用输出目录最新一张：$refPath" -ForegroundColor DarkGray
-    } else {
-        Write-Host "错误：选了「图生图」但没有可用底图（表单「底图」留空，输出目录里也没有图片）。" -ForegroundColor Red
-        Write-Host "      请填底图路径 / 点「浏览…」选一张，或先出一张图再重试。" -ForegroundColor Yellow
-        Remove-IterTempDir
-        exit 1
-    }
+    # 2026-10-15 事故根因（用户反馈「图生图和原图完全没关系」）：
+    # 以前底图留空会**静默**去拿「输出目录最新一张」——结果经常抓到一个无关文件
+    # （表单截图、别的会话的产物、上一轮的放大图），出图当然和用户心里的原图毫无关系。
+    # 现在**不再猜**：没底图就停下来问清楚；只有显式填「最近」时才用最新一张。
+    Write-Host "错误：选了「图生图」但没有底图（表单「底图」栏是空的，-InitImage 也没传）。" -ForegroundColor Red
+    Write-Host "      请三选一：① 填图片完整路径（如 D:\pics\ref.png）；② 点右边「浏览…」选一张；" -ForegroundColor Yellow
+    Write-Host "                ③ 填「最近」= 明确表示要用输出目录里最新的一张图。" -ForegroundColor Yellow
+    Write-Host "      也可以改选「文生图」——那样根本不需要底图。" -ForegroundColor DarkGray
+    Remove-IterTempDir
+    exit 1
 }
 
 if ($mode -eq '文生图') {
@@ -1721,9 +1805,8 @@ if ($mode -eq '文生图') {
             if (Test-Path -LiteralPath $mp) { $finalMask = $mp } else { Write-Host "蒙版图不存在：$maskSpec → 改为按区域生成" -ForegroundColor Yellow }
         }
         if (-not $finalMask) {
-            $refSize = Get-ImageSizePx -Path $refPath
             $maskOut = Join-Path $script:IterTempDir 'region-mask.png'
-            $finalMask = New-RegionMask -Spec $maskSpec -W $refSize.W -H $refSize.H -OutPath $maskOut
+            $finalMask = New-RegionMask -Spec $maskSpec -W $size.W -H $size.H -OutPath $maskOut
             if (-not $finalMask) { Write-Host "蒙版区域认不出（$maskSpec）→ 退回整图重绘" -ForegroundColor Yellow }
         }
     }
@@ -1733,17 +1816,59 @@ if ($mode -eq '文生图') {
         $branchTag = "C-1b 图生图·替换$(if ($replaceTarget) { "（$replaceTarget）" })"
         $finalDenoise = [double]$P.Denoise
         if ($finalDenoise -lt 0.55) { $finalDenoise = 0.75 }   # 蒙版内要盖住旧内容，太小的 denoising 换不掉
-        $inpaintFill = 0                                       # 填充模式：换新衣服/新背景用（实测 fill=2 潜空间噪声会在蒙版区留噪点）
-        # 蒙版重绘按参考图原生尺寸走，保证未蒙版区域像素级保留
+        $inpaintFill = 0                                       # 填充模式（实测 fill=2 潜空间噪声会在蒙版区留噪点）
+        # 出图尺寸 = 参考图原生尺寸（对齐到 8 的倍数）；蒙版**按这个尺寸**生成，两者必须一致，
+        # 否则 A1111 缩放蒙版时区域会错位（用户反馈的「蒙版位置有问题」）。
         $refSize = Get-ImageSizePx -Path $refPath
-        $size = @{ W = [int]([Math]::Floor($refSize.W / 8) * 8); H = [int]([Math]::Floor($refSize.H / 8) * 8) }
-        Write-Host "[决策 C-1b] 蒙版重绘：蒙版=$finalMask（denoising=$finalDenoise，填充=噪声，尺寸=$($size.W)x$($size.H)）" -ForegroundColor Cyan
+        $w2 = [int]([Math]::Floor($refSize.W / 8) * 8)
+        $h2 = [int]([Math]::Floor($refSize.H / 8) * 8)
+        $mx = [Math]::Max($w2, $h2)
+        if ($mx -gt 1536) {
+            $k = 1536.0 / $mx
+            $w2 = [int]([Math]::Floor(($refSize.W * $k) / 8) * 8)
+            $h2 = [int]([Math]::Floor(($refSize.H * $k) / 8) * 8)
+        }
+        if ($w2 -ge 64 -and $h2 -ge 64) { $size = @{ W = $w2; H = $h2 } }
+        # 蒙版与出图尺寸对齐：用户给的蒙版图尺寸不符时按最近邻缩放（保证区域位置不漂）
+        try {
+            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+            $mb = [System.Drawing.Bitmap]::FromFile($finalMask)
+            if ($mb.Width -ne $size.W -or $mb.Height -ne $size.H) {
+                $scaled = New-Object System.Drawing.Bitmap($size.W, $size.H)
+                $g2 = [System.Drawing.Graphics]::FromImage($scaled)
+                $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+                $g2.DrawImage($mb, 0, 0, $size.W, $size.H)
+                $g2.Dispose()
+                $mb.Dispose()
+                $fixed = Join-Path $script:IterTempDir 'region-mask-scaled.png'
+                $scaled.Save($fixed, [System.Drawing.Imaging.ImageFormat]::Png)
+                $scaled.Dispose()
+                Write-Host "蒙版尺寸已对齐：$($finalMask) → $($size.W)x$($size.H)" -ForegroundColor DarkGray
+                $finalMask = $fixed
+            } else { $mb.Dispose() }
+        } catch { }
+        Write-Host "[决策 C-1b] 蒙版重绘：蒙版=$finalMask（denoising=$finalDenoise，填充=填充模式，尺寸=$($size.W)x$($size.H)）" -ForegroundColor Cyan
         Write-Host "            未蒙版区域按原图保留 → 画风不会跟着换衣服一起变" -ForegroundColor DarkGray
     } else {
         $branchTag = 'C-1a 图生图·一致'
         $finalDenoise = [double]$P.Denoise
         if ($finalDenoise -le 0) { $finalDenoise = 0.45 }
-        Write-Host "[决策 C-1a] 图生图：底图=$finalInit，denoising=$finalDenoise（0.4-0.5 贴底图保画风）" -ForegroundColor Cyan
+        if ($finalDenoise -gt 0.65) {
+            Write-Host "一致模式：denoising $finalDenoise 偏大（会把原图洗掉 → 实测就是「和原图没关系」）→ 收敛到 0.65；要大改请用「替换 + 蒙版」" -ForegroundColor Yellow
+            $finalDenoise = 0.65
+        }
+        # 尺寸跟着**参考图走**（原来用表单比例/画质，会把 1024x1024 压成 480x853 → 构图和原图对不上）
+        $refSize = Get-ImageSizePx -Path $finalInit
+        $w2 = [int]([Math]::Floor($refSize.W / 8) * 8)
+        $h2 = [int]([Math]::Floor($refSize.H / 8) * 8)
+        $mx = [Math]::Max($w2, $h2)
+        if ($mx -gt 1536) {
+            $k = 1536.0 / $mx
+            $w2 = [int]([Math]::Floor(($refSize.W * $k) / 8) * 8)
+            $h2 = [int]([Math]::Floor(($refSize.H * $k) / 8) * 8)
+        }
+        if ($w2 -ge 64 -and $h2 -ge 64) { $size = @{ W = $w2; H = $h2 } }
+        Write-Host "[决策 C-1a] 图生图：底图=$finalInit（原图 $($refSize.W)x$($refSize.H)），denoising=$finalDenoise，出图尺寸=$($size.W)x$($size.H)" -ForegroundColor Cyan
     }
 }
 Write-Host "最终出图：$branchTag" -ForegroundColor Cyan

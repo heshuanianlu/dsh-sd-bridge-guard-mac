@@ -566,6 +566,26 @@ assert.ok(/\$applyModeLock = \{/.test(injectPs1) && /\$txtInit\.Enabled = -not \
 assert.ok(/文生图：不需要蒙版，已锁定/.test(injectPs1) && /文生图：不需要底图，已锁定/.test(injectPs1), '锁定状态必须有明确提示文案')
 
 // ---------------------------------------------------------------------------
+// 图生图「和原图没关系 / 底图不生效 / 蒙版位置错」三连修（2026-10-15 事故回归）：
+// ① 显式给了底图但解析失败 → 必须明确报错，不许默默换成输出目录最新一张；
+// ② 底图解析要能吃下附件/哈希形态（对话常把 "图片 sha256:…"、"xxx.png [8a34ca32]" 传进来）；
+// ③ C-1a 出图尺寸必须跟参考图走（原来用表单比例/画质会把 1024x1024 压成 480x853 → 构图对不上），
+//    且 denoising 过高要收敛（否则把原图洗掉 = 「和原图没关系」）；
+// ④ 蒙版必须按**最终出图尺寸**生成，尺寸不符要缩放对齐（否则区域错位）。
+// ---------------------------------------------------------------------------
+assert.ok(/底图没能解析成文件/.test(injectPs1) && /不是文件路径，不能直接当底图/.test(injectPs1), '显式底图解析失败必须明确报错（不许静默回落）')
+assert.ok(/\$script:LastInitFail/.test(injectPs1), '解析失败原因必须回传（用于报错与日志）')
+assert.ok(/sha256:/.test(injectPs1) && /8,64/.test(injectPs1), '底图解析必须能剥掉哈希/附件装饰')
+assert.ok(/attachments/.test(injectPs1), '底图解析要能在 DSH 附件目录里按哈希找图')
+assert.ok(injectPs1.includes('[A-Za-z]:\\') && injectPs1.includes('-replace'), '底图解析要能从说明文字里抠出无后缀的附件路径')
+assert.ok(/\$refSize = Get-ImageSizePx -Path \$finalInit/.test(injectPs1), 'C-1a 必须按参考图原生尺寸出图')
+assert.ok(/一致模式：denoising/.test(injectPs1) && /\$finalDenoise = 0\.65/.test(injectPs1), '一致模式 denoising 过高必须收敛')
+assert.ok(/box\(px\)\?/.test(injectPs1), '蒙版必须支持精确坐标框 box:/boxpx:')
+assert.ok(/region-mask-scaled\.png/.test(injectPs1), '蒙版尺寸与出图尺寸不符时必须缩放对齐')
+assert.ok(/if \(\$conflict\) \{ \$merged = \(\$UserPos/.test(injectPs1), '替换任务：用户新指令在前')
+assert.ok(/else \{ \$merged = \(\(\$keep -join/.test(injectPs1), '一致任务：参考图词在前（保证与原图一致）')
+
+// ---------------------------------------------------------------------------
 // 文档必须写清的两件事（用户明确要求）：本地模型评估链 + 触发话术（0.9.7）
 // ---------------------------------------------------------------------------
 const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8')
