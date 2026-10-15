@@ -1844,10 +1844,13 @@ if ($mode -eq '文生图') {
     # 蒙版（C-1b）：显式填了就用；填「无」但检测到替换动作 → 按目标自动选区域
     $maskSpec = $maskSpecRaw
     $autoPathUsedForClothes = $false
+    # 「自动」是**关键字**，不是区域名：必须先把它从区域名里摘出去，否则后面会当成「认不出的区域」→
+    # 退回整图重绘（2026-10-15 实测事故：用户选自动 → 日志「蒙版区域认不出 → 退回整图重绘」→ 整张图重画）。
     $autoMask = ($maskSpec -match '^自动' -or $maskSpec -eq 'auto' -or $maskSpec -eq '')
-    if ($maskSpec -match '^无' -or $maskSpec -eq '') { $maskSpec = '' }
+    if ($autoMask) { $maskSpec = '' }
+    if ($maskSpec -match '^无') { $maskSpec = '' }
     # 自动抠图：按这张参考图的内容现生成（换衣服→衣服/身体；换背景→人以外；换脸→人脸区）
-    if ($autoMask -and -not $maskSpec) {
+    if ($autoMask) {
         $autoTarget = if ($replaceTarget) { $replaceTarget } else { '衣服' }
         if ($replaceTarget -eq '未指定') { $autoTarget = '主体' }
         $autoOut = Join-Path $script:IterTempDir 'auto-mask.png'
@@ -1858,7 +1861,12 @@ if ($mode -eq '文生图') {
             if ($autoTarget -eq '衣服') { $autoPathUsedForClothes = $true }
             Write-Host "自动蒙版就绪：$($script:AutoMaskNote)" -ForegroundColor Cyan
         } else {
-            Write-Host "自动蒙版没成功（$($script:AutoMaskNote)）→ 退回按区域重绘" -ForegroundColor Yellow
+            Write-Host "自动蒙版没成功：$($script:AutoMaskNote)" -ForegroundColor Red
+            Write-Host "      不会退回整图重绘（那会把背景/姿势一起换掉，等于废掉这张参考图）。请改用：" -ForegroundColor Yellow
+            Write-Host "      ① 蒙版填精确框 box:x,y,w,h（0-1 归一化）或 boxpx:x,y,w,h（像素）；② 直接填一张蒙版图路径；" -ForegroundColor Yellow
+            Write-Host "      ③ 或把蒙版改成一个区域名（上半（脸）/下半（衣服）/中间（主体）/四周（背景））。" -ForegroundColor Yellow
+            Remove-IterTempDir
+            exit 1
         }
     }
     if (-not $finalMask -and -not $maskSpec -and $replaceTarget) {

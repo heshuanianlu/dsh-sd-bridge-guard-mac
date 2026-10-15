@@ -360,7 +360,28 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     cv2.imwrite(args.out, mask_full)
-
+    # 蒙版叠加预览：把重绘区半透明染色盖回原图（验收蒙版准不准就看这张，不用靠生成结果猜）。
+    try:
+        overlay = img_bgr.copy()
+        m3 = (mask_full > 127)
+        tint = np.zeros_like(img_bgr)
+        tint[:, :, 2] = 255          # BGR：红
+        overlay[m3] = (0.45 * tint[m3] + 0.55 * overlay[m3]).astype(np.uint8)
+        edge = cv2.morphologyEx((m3.astype(np.uint8)) * 255, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+        overlay[edge > 0] = (255, 255, 255)
+        ov_path = os.path.splitext(os.path.abspath(args.out))[0] + "_overlay.png"
+        cv2.imwrite(ov_path, overlay)
+        result["overlay"] = ov_path
+    except Exception as e:
+        notes.append(f"叠加预览生成失败：{type(e).__name__}")
+    # 重绘区包围盒（便于判断「是不是又罩住整张图了」）
+    try:
+        ys, xs = np.where(mask_full > 127)
+        if len(ys):
+            result["bbox"] = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+            result["bbox_ratio"] = round(float((xs.max() - xs.min()) * (ys.max() - ys.min()) / (H * W)), 3)
+    except Exception:
+        pass
     result["ok"] = True
     result["mask"] = os.path.abspath(args.out)
     result["boxes"] = len(boxes)
