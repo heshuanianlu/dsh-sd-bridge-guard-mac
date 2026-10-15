@@ -554,6 +554,16 @@ assert.ok(/\[string\]\$Mask = ""/.test(injectPs1) && /"-Mask", "`"\$Mask`"", "-I
 assert.ok(/\$inpaintFill = 0\s+# 填充模式/.test(injectPs1), '蒙版重绘默认必须用 fill=0 填充（实测 fill=2 潜空间噪声会在蒙版区留噪点）')
 assert.ok(injectPs1.includes('决策 C-0') && injectPs1.includes('C-1a') && injectPs1.includes('C-1b'), '脚本必须打印决策分支（C-0 / C-1a / C-1b）')
 assert.ok(c.includes('C-1b') && c.includes('蒙版重绘'), '技能正文必须写明决策树与蒙版重绘分支')
+// 对话判断任务类型 + 提交蒙版区域（v0.9.13）：工具参数 → 命令/启动器 → 表单预置；文生图锁底图/蒙版
+assert.ok(/task: \{/.test(bridgeSrc) && /refImage: \{/.test(bridgeSrc) && /mask: \{/.test(bridgeSrc), 'sd_inject 必须有 task / refImage / mask 三个参数（由对话判断后提交）')
+assert.ok(/'文生图', '图生图'/.test(bridgeSrc), 'task 参数必须是「文生图 / 图生图」枚举')
+assert.ok(/parts\.push\('-Mode'/.test(bridgeSrc) && /parts\.push\('-MaskSpec'/.test(bridgeSrc) && /parts\.push\('-InitImage'/.test(bridgeSrc), '生成的命令必须带上 -Mode / -InitImage / -MaskSpec')
+assert.ok(/paramPairs\.push\('-Mode'/.test(bridgeSrc) && /paramPairs\.push\('-MaskSpec'/.test(bridgeSrc), '启动器必须带上 -Mode / -MaskSpec')
+assert.ok(c.includes('对话要自己判断任务类型') && c.includes('refImage'), '技能正文必须要求对话自己判断任务类型并提交 refImage/mask')
+assert.ok(/\[string\]\$Mode = ""/.test(injectPs1) && /\[string\]\$MaskSpec = ""/.test(injectPs1), 'sd-inject.ps1 必须接受 -Mode / -MaskSpec（对话提交的任务类型与蒙版区域）')
+assert.ok(/ModeDefault \$Mode -MaskDefault \$MaskSpec/.test(injectPs1), '表单必须用对话提交的 Mode/MaskSpec 预置')
+assert.ok(/\$applyModeLock = \{/.test(injectPs1) && /\$txtInit\.Enabled = -not \$isTxt/.test(injectPs1) && /\$cboMask\.Enabled = -not \$isTxt/.test(injectPs1), '文生图必须锁定「底图」与「蒙版」两个控件')
+assert.ok(/文生图：不需要蒙版，已锁定/.test(injectPs1) && /文生图：不需要底图，已锁定/.test(injectPs1), '锁定状态必须有明确提示文案')
 
 // ---------------------------------------------------------------------------
 // 文档必须写清的两件事（用户明确要求）：本地模型评估链 + 触发话术（0.9.7）

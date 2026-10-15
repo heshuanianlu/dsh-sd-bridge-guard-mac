@@ -2286,6 +2286,24 @@ const injectTool = {
       cfg: { type: 'number', description: 'CFG，默认交给脚本（7）' },
       sampler: { type: 'string', description: '采样器；留空交给脚本默认 DPM++ 2M' },
       name: { type: 'string', description: '输出文件名前缀，默认 inject（产物 = inject_序号.png）' },
+        task: {
+          type: 'string',
+          enum: ['文生图', '图生图'],
+          description:
+            '任务类型，**由对话判断后提交**（不要问用户）：只要「凭文字出图」= 文生图（C-0，表单里底图/蒙版会自动锁定）；' +
+            '只要用户给了参考图、或要求「改成/换成/保持这幅图的…」（换衣服/换脸/换背景/改画风但保构图）= 图生图（C-1）。省略则表单默认文生图。',
+        },
+        refImage: {
+          type: 'string',
+          description: '图生图的底图（C-1）：用户给的图片路径。工作区外的聊天附件路径请原样传入（脚本会解析）。文生图不要传。',
+        },
+        mask: {
+          type: 'string',
+          description:
+            '蒙版区域（C-1 替换任务，**由对话判断后提交**）：下半（衣服）/ 上半（脸）/ 中间（主体）/ 四周（背景），' +
+            '可加「反选」后缀；也可以填一张蒙版图路径（白色=重绘区）。判定：换衣服→下半（衣服）、换脸→上半（脸）、' +
+            '换背景→四周（背景）；只改画风不改内容则留空（走 C-1a 整图 img2img）。文生图不要传。',
+        },
       run: {
         type: 'boolean',
         description:
@@ -2331,6 +2349,10 @@ const injectTool = {
       // 出图落盘失败 → 脚本提前退出 → 工作区一张成品都没有。显式把迭代根钉在会话工作区里。
       '-IterDir', psQuote(path.join(wsRoot, '.sd-inject-iter')),
     ]
+    // 任务类型 / 底图 / 蒙版：由对话判断后提交（文生图时脚本会把底图/蒙版两项在表单里锁定）
+    if (String(args.task ?? '').trim()) parts.push('-Mode', psQuote(String(args.task).trim()))
+    if (String(args.refImage ?? '').trim()) parts.push('-InitImage', psQuote(String(args.refImage).trim()))
+    if (String(args.mask ?? '').trim()) parts.push('-MaskSpec', psQuote(String(args.mask).trim()))
     if (Number.isFinite(Number(args.cfg))) parts.push('-Cfg', String(Number(args.cfg)))
     if (String(args.sampler ?? '').trim()) parts.push('-Sampler', psQuote(String(args.sampler).trim()))
     const command = parts.join(' ')
@@ -2368,6 +2390,9 @@ const injectTool = {
           '-OutDir', outDir,
           '-IterDir', path.join(wsRoot, '.sd-inject-iter'),
         ]
+        if (String(args.task ?? '').trim()) paramPairs.push('-Mode', String(args.task).trim())
+        if (String(args.refImage ?? '').trim()) paramPairs.push('-InitImage', String(args.refImage).trim())
+        if (String(args.mask ?? '').trim()) paramPairs.push('-MaskSpec', String(args.mask).trim())
         if (Number.isFinite(Number(args.cfg))) paramPairs.push('-Cfg', String(Number(args.cfg)))
         if (String(args.sampler ?? '').trim()) paramPairs.push('-Sampler', String(args.sampler).trim())
         // 每个元素都包单引号；数字也当字符串传（PowerShell splatting 会自动转回数值类型）
@@ -2896,6 +2921,12 @@ export function apply(ctx, config = {}) {
             '- **C-1b 图生图·替换**（换衣服 / 换脸 / 换背景）：脚本从指令里识别替换目标 → 自动生成**区域蒙版**（也可在「蒙版」栏手选：上半（脸）/ 下半（衣服）/ 中间 / 四周（背景）及反选，或直接填蒙版图路径）→ 走**蒙版重绘**：未蒙版区域像素级原样保留，**画风不会跟着换衣服一起变**（实测未蒙版区差异 0.00）。\n' +
             '  用户说「换个衣服 / 把衣服改成 X / 换个背景」这类**替换需求**时，就是 C-1b：不要说做不到，也不要用整图重绘。\n\n' +
             '命令上方标注：**【本地注入】**，下方不附加任何说明、解释或与请求相关的内容。\n' +
+            '**对话要自己判断任务类型并用工具参数提交**（不要问用户）：\n' +
+            '- 只有文字出图 → 传 task: 「文生图」（C-0）；**不要传 refImage/mask** —— 表单里「底图」「蒙版」两项会被自动锁定。\n' +
+            '- 用户给了图片，或要求「换成/改成/保持这幅图的…」→ 传 task: 「图生图」（C-1），并把用户那张图路径传 refImage。\n' +
+            '- 属于**替换**（换衣服/换脸/换背景）→ 同时传 mask：换衣服 = 下半（衣服）、换脸 = 上半（脸）、换背景 = 四周（背景）；\n' +
+            '  只改画风 / 整体贴近参考图 → mask 留空（走 C-1a 整图 img2img）。脚本会把 mask 预填进表单，用户仍可自己改。\n' +
+            '  只改画风 / 整体贴近参考图 → mask 留空（走 C-1a 整图 img2img）。脚本会把 mask 预填进表单，用户仍可自己改。\n' +
             '（可顺带告诉用户：脚本会自己拉起本地模型服务，首次含模型加载约 1-3 分钟；弹框留空直接跑素体基底，输入中文则追加后拼接出图。）\n' +
             '4. **末尾列违规词**（见下：两行排版「违禁提示词：」/「建议替换词：」）。\n' +
             '   典型场景：用户丢一张图说「翻译成提示词」→ 若原图含违规内容，同样走 C 档：不出图，只给上面的本地注入命令。\n\n' +

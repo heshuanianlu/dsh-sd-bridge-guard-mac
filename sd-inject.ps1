@@ -43,7 +43,9 @@ param(
     [string]$Name = "inject",
     [string]$SdDirect = "",                            # sd-direct.ps1 路径；留空则取脚本同目录
     [string]$SdDir = "",
-    [string]$InitImage = "",                           # 底图（图生图用）：预填进表单「底图」栏；留空 = 用素体成品
+    [string]$InitImage = "",                           # 底图（图生图用）：预填进表单「底图」栏；留空 = 用最近一张
+    [string]$Mode = "",                                # 任务类型（由对话判断后提交）：文生图 / 图生图；留空 = 表单默认（文生图）
+    [string]$MaskSpec = "",                            # 蒙版区域（C-1 替换用，对话提交）：上半（脸）/下半（衣服）/中间（主体）/四周（背景）及反选，或蒙版图路径
     [string]$IterDir = "",                             # 迭代中间图目录（必须可写）：留空 = <工作区>\.sd-inject-iter → 脚本目录 → 系统 temp
     [switch]$NoOpen                                   # 加 -NoOpen 则跑完不自动打开这张图
 )
@@ -637,7 +639,9 @@ function Show-ParamForm {
         [string[]]$LoraList,
         [string[]]$CheckpointList,
         [string]$InitImageDefault = "",
-        [string]$CurrentModel = ""
+        [string]$CurrentModel = "",
+        [string]$ModeDefault = "",
+        [string]$MaskDefault = ""
     )
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "sd-inject 出图参数"
@@ -685,7 +689,9 @@ function Show-ParamForm {
     $cboMode = New-Object System.Windows.Forms.ComboBox
     $cboMode.DropDownStyle = 'DropDownList'
     foreach ($m in @('文生图', '图生图')) { $null = $cboMode.Items.Add($m) }
+    # 任务类型由**对话判断后提交**（-Mode）：文生图 / 图生图；留空时默认文生图
     $cboMode.SelectedIndex = 0
+    if ("$ModeDefault" -eq '图生图') { $cboMode.SelectedIndex = 1 }
     $cboMode.SetBounds(120, (240 + 0 * 40), 190, 24)
     $form.Controls.Add($cboMode)
     $lbModeHint = New-Object System.Windows.Forms.Label
@@ -722,10 +728,12 @@ function Show-ParamForm {
     $cboMask.DropDownStyle = 'DropDown'
     foreach ($v in @('无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）', '上半（脸）反选', '四周（背景）反选')) { $null = $cboMask.Items.Add($v) }
     $cboMask.Text = '无（整图重绘）'
+    if ($MaskDefault) { $cboMask.Text = $MaskDefault }   # 蒙版区域由对话提交（C-1 替换时）
     $cboMask.SetBounds(120, (240 + 2 * 40), 190, 24)
     $form.Controls.Add($cboMask)
     $lbMaskHint = New-Object System.Windows.Forms.Label
     $lbMaskHint.Text = '（白色=重绘区；也可填蒙版图路径）'
+    $lbMaskLockHint = $lbMaskHint   # 文生图时改写成锁定提示（下面 applyModeLock 里用）
     $lbMaskHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
     $lbMaskHint.ForeColor = [System.Drawing.Color]::Gray
     $lbMaskHint.SetBounds(120, (240 + 2 * 40 + 24), 220, 16)
@@ -853,7 +861,29 @@ function Show-ParamForm {
 
     # 模式联动：切到「图生图」→ 默认画风「一致（自动检测参考图）」+ Denoising 0.45；
     #            切回「文生图」→ 默认画风「二次元」+ Denoising 0（不用底图）。
+    # 文生图 = 不需要底图与蒙版 → 这两个控件**锁定**（灰掉、不可编辑）；图生图时解锁。
+    # 蒙版值在锁定时记下来，切回图生图自动还原（不会因为切一下模式就把对话提交的区域丢掉）。
+    $script:maskKept = $cboMask.Text
+    $applyModeLock = {
+        $isTxt = ([string]$cboMode.SelectedItem -eq '文生图')
+        $txtInit.Enabled = -not $isTxt
+        $btnInitBrowse.Enabled = -not $isTxt
+        $cboMask.Enabled = -not $isTxt
+        if ($isTxt) {
+            if ($cboMask.Text -and $cboMask.Text -notmatch '^无') { $script:maskKept = $cboMask.Text }
+            $cboMask.Text = '无（整图重绘）'
+            $cboMask.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+            $lbMaskLockHint.Text = '（文生图：不需要蒙版，已锁定）'
+            $lbInitHint.Text = '（文生图：不需要底图，已锁定）'
+        } else {
+            if ($script:maskKept -and $script:maskKept -notmatch '^无') { $cboMask.Text = $script:maskKept }
+            $cboMask.BackColor = [System.Drawing.Color]::White
+            $lbMaskLockHint.Text = '（白色=重绘区；也可填蒙版图路径）'
+            $lbInitHint.Text = '（留空=最近一张；或填路径）'
+        }
+    }
     $cboMode.Add_SelectedIndexChanged({
+        try { & $applyModeLock } catch { }
         $st = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
         if ([string]$cboMode.SelectedItem -eq '图生图') {
             if ([string]$cboStyle.SelectedItem -ne '一致（自动检测参考图）') { $cboStyle.SelectedIndex = 0 }
@@ -863,6 +893,9 @@ function Show-ParamForm {
             $cboDenoise.Text = '0（文生图·不用底图）'
         }
     })
+
+    # 构造完成先套一次锁定（初始模式可能是对话提交的）
+    try { & $applyModeLock } catch { }
 
     # 初始档位也要注入一次（SelectedIndex 是在挂事件之前设的，不补这一下默认档就没有词）
     try {
@@ -1386,7 +1419,7 @@ $formPositive = $BasePrompt
 $formNegative = $BaseNegative
 if ($formPositive -and ($formPositive -notmatch ',\s*$')) { $formPositive = $formPositive.TrimEnd() + ", " }
 if ($formNegative -and ($formNegative -notmatch ',\s*$')) { $formNegative = $formNegative.TrimEnd() + ", " }
-$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $InitImage -CurrentModel $sdCurrentModel
+$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $InitImage -CurrentModel $sdCurrentModel -ModeDefault $Mode -MaskDefault $MaskSpec
 # 表单里的提示词是最终值（基底 + 用户在表单里的修改/追加）
 $positive = $P.Pos
 $negative = $P.Neg
