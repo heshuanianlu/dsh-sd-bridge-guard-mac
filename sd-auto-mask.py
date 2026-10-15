@@ -27,7 +27,8 @@ TARGET_LABELS = {
     # YOLO-World 实测：多词一起喂会互相稀释（命中率骤降），必须**单词逐个试**。
     # 下面按「野外命中率」排序，命中即停（最多取 2 个词的结果）。
     "衣服": ["dress", "jacket", "coat", "uniform", "kimono", "sweater", "hoodie",
-             "shirt", "skirt", "pants", "shorts", "clothing", "clothes"],
+             "swimsuit", "swimwear", "bodysuit", "leotard", "wetsuit", "jumpsuit",
+             "shirt", "skirt", "pants", "shorts", "raincoat", "cape", "clothing", "clothes", "outfit"],
     "脸": ["face", "head"],
     "背景": ["person"],
     "主体": ["person"],
@@ -42,8 +43,27 @@ SILHOUETTE_FALLBACK = {
 }
 
 
+def _write_png(path, img):
+    """非 ASCII 路径安全写盘（cv2.imwrite 在中文路径下会静默失败）。"""
+    import cv2   # 模块级没 import，函数里必须自己拿（否则 NameError 被吞掉 → 静默不写盘）
+    try:
+        ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".png", img)
+        if ok:
+            buf.tofile(path)
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(cv2.imwrite(path, img))
+    except Exception:
+        return False
+
 def find_file(roots, patterns, min_mb=0.5):
-    """在 roots 下按 patterns 找文件（限制递归深度，避免扫全盘）。"""
+    """在 roots 下按 patterns 找文件（限制递归深度，避免扫全盘）。
+
+    排序规则：**先按 patterns 的先后顺序**（前面的模式优先），同一模式内再按体积降序。
+    这样 sam_vit_l 就真的会优先于 sam_vit_h（否则 7.9G 显存 + A1111 常驻必然 OOM）。
+    """
     import fnmatch
     hits = []
     for root in roots:
@@ -54,18 +74,18 @@ def find_file(roots, patterns, min_mb=0.5):
             if dirpath.count(os.sep) - base_depth > 6:
                 dirnames[:] = []
                 continue
-            for fn in filenames:
-                for pat in patterns:
+            for pi, pat in enumerate(patterns):
+                for fn in filenames:
                     if fnmatch.fnmatch(fn.lower(), pat.lower()):
                         p = os.path.join(dirpath, fn)
                         try:
                             if os.path.getsize(p) >= min_mb * 1024 * 1024:
-                                hits.append(p)
+                                hits.append((pi, p))
                         except OSError:
                             pass
-    # 大的优先（真权重优先于指针文件）
-    hits.sort(key=lambda p: -os.path.getsize(p))
-    return hits
+    # 先按模式顺序（vit_l 优先于 vit_h），同一模式内大的优先（真权重优先于 LFS 指针）
+    hits.sort(key=lambda x: (x[0], -os.path.getsize(x[1])))
+    return [p for _, p in hits]
 
 
 def main():
@@ -84,8 +104,11 @@ def main():
     ap.add_argument("--allow-silhouette", action="store_true", help="允许人物剪影兜底（默认关：会把身体一起重画）")
     ap.add_argument("--fill-sheer", action="store_true", help="衣服：大核闭运算补全薄纱/透视布料（有上限保护）")
     ap.add_argument("--sheer-scale", type=float, default=0.05, help="薄纱补全的闭运算半径系数（相对最长边）")
+    ap.add_argument("--no-shoulder-guard", action="store_true", help="关闭「衣服不能落在肩线以上」约束（诊断用）")
+    ap.add_argument("--grow", action="store_true", help="衣服：颜色一致性生长（默认关；守岸人那张实测会长进薄纱/浅色头发）")
+    ap.add_argument("--sam-side", type=int, default=1024, help="SAM 在多大分辨率上分割（默认 1024，省显存；蒙版会放回原尺寸）")
     ap.add_argument("--points", default="", help="SAM 点提示（图像像素坐标）：x,y;x,y …；给了就跳过检测直接点选")
-    ap.add_argument("--max-words", type=int, default=5, help="逐词检测最多试几个词（命中即停）")
+    ap.add_argument("--max-words", type=int, default=10, help="逐词检测最多试几个词（命中即停）")
     args = ap.parse_args()
 
     result = {"ok": False, "engine": "", "boxes": 0, "coverage": 0.0,
@@ -105,9 +128,20 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
-    img_bgr = cv2.imread(args.image, cv2.IMREAD_COLOR)
+    # Windows 中文/非 ASCII 路径：cv2.imread 直接失败（OpenCV 老限制）→ np.fromfile + imdecode
+    img_bgr = None
+    try:
+        buf = np.fromfile(args.image, dtype=np.uint8)
+        img_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    except Exception as e:
+        result["notes"] = f"参考图读取异常：{type(e).__name__}"
     if img_bgr is None:
-        result["notes"] = "参考图读不出来（格式不支持？）"
+        try:
+            img_bgr = cv2.imread(args.image, cv2.IMREAD_COLOR)
+        except Exception:
+            pass
+    if img_bgr is None:
+        result["notes"] = "参考图读不出来（路径含中文？格式不支持？）"
         print(json.dumps(result, ensure_ascii=False))
         return 0
     H, W = img_bgr.shape[:2]
@@ -228,6 +262,49 @@ def main():
             for fy in (0.62, 0.78, 0.90):
                 for fx in (0.5, 0.33, 0.67):
                     garment_points.append([[cx + (fx - 0.5) * bw, y1 + fy * bh]])
+    # 人物框：衣服蒙版必须落在**肩线以下**（否则会把头发/头顶当成衣服 —— 实测「头发+披风」被整块涂红）
+    person_box = None
+    person_mask_for_points = None
+    person_box = None
+    if args.target == "衣服":
+        seg_ms = find_file([args.sd_dir or ""], ["*person*yolov8*-seg.pt"], min_mb=1)
+        if seg_ms:
+            try:
+                from ultralytics import YOLO
+                pm_ = YOLO(seg_ms[0])
+                pr_ = pm_.predict(img_bgr, conf=0.25, verbose=False)[0]
+                if pr_.masks is not None and len(pr_.masks.data):
+                    _pmask = np.zeros((H, W), dtype=np.uint8)
+                    for _mm in pr_.masks.data:
+                        _arr = (_mm.cpu().numpy() > 0.5).astype(np.uint8) * 255
+                        _pmask = np.maximum(_pmask, cv2.resize(_arr, (W, H), interpolation=cv2.INTER_NEAREST))
+                    # 用**检测框**（含头/头发）当基准：person-seg 的掩膜通常不含头发，
+                    # 拿掩膜上沿当「人物上沿」会把正常衣服误判成「在头上」（实测两图被误杀）。
+                    if pr_.boxes is not None and len(pr_.boxes):
+                        _b = pr_.boxes.xyxy.cpu().numpy()
+                        person_box = (int(_b[:, 1].min()), int(_b[:, 3].max()))
+                    else:
+                        _ys, _ = np.where(_pmask > 127)
+                        if len(_ys):
+                            person_box = (int(_ys.min()), int(_ys.max()))
+                    person_mask_for_points = _pmask
+                del pm_
+            except Exception:
+                pass
+
+    # 衣服：再补一路「人物剪影取点」——按人物轮廓逐行取中线，落在躯干/腿部，
+    # 不依赖 YOLO 框（框不准时点会落到头发上，实测会把头发+披风当衣服）。
+    if args.target == "衣服" and person_mask_for_points is not None:
+        _ys4, _ = np.where(person_mask_for_points > 127)
+        if len(_ys4):
+            _top, _bot = int(_ys4.min()), int(_ys4.max())
+            _h = max(1, _bot - _top)
+            for _f in (0.30, 0.42, 0.55, 0.68, 0.80, 0.90):
+                _y = min(H - 1, int(_top + _f * _h))
+                _rowxs = np.where(person_mask_for_points[_y] > 127)[0]
+                if len(_rowxs):
+                    garment_points.append([[float(int(_rowxs.mean())), float(_y)]])
+
     if args.points.strip():
         pts = []
         for part in args.points.split(";"):
@@ -242,7 +319,7 @@ def main():
     sam_path = args.sam
     if not sam_path:
         sd = args.sd_dir or ""
-        found = find_file([sd], ["sam_vit_h*.pth", "sam_vit_l*.pth", "sam_vit_b*.pth", "mobile_sam*.pt"], min_mb=50)
+        found = find_file([sd], ["sam_vit_l*.pth", "sam_vit_b*.pth", "sam_vit_h*.pth", "mobile_sam*.pt"], min_mb=50)
         sam_path = found[0] if found else ""
     if pre_mask is not None:
         mask_full = pre_mask
@@ -261,48 +338,81 @@ def main():
             else:
                 kind = "vit_l"
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            # 在缩小图上分割，掩膜再放回原尺寸：省显存（A1111 常驻时 7.9G 卡很容易 OOM），也快得多。
+            # 蒙版最终会被插件缩放到出图尺寸，所以这里降分辨率不影响最终精度。
+            work_scale = min(1.0, float(args.sam_side) / max(H, W))
+            img_work = cv2.resize(img_bgr, None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA) if work_scale < 1 else img_bgr
             sam = sam_model_registry[kind](checkpoint=sam_path).to(device)
             predictor = SamPredictor(sam)
-            predictor.set_image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            predictor.set_image(cv2.cvtColor(img_work, cv2.COLOR_BGR2RGB))
+            def _back(m):
+                a = (m.astype(np.uint8)) * 255
+                if work_scale < 1:
+                    a = cv2.resize(a, (W, H), interpolation=cv2.INTER_LINEAR)
+                    a = ((a > 127).astype(np.uint8)) * 255
+                return a
+            def _sc(v):
+                return v * work_scale
             if garment_points:
                 # 衣服：**把全部候选点当成一次正样本**喂给 SAM（多点比单点稳），在它给的 3 张候选里
                 # 挑「最紧但仍是织物级」的那张：
                 #   太紧（<3%）= 只切到布片，改了等于没改；
                 #   太松（>32%）= 整个人，重绘会把身体/姿势一起重画（实测角色直接转身）。
-                # 绝不把所有点的掩膜并起来。先试「只点」，再试「点+框」。
+                # 绝不把所有点的掩膜并起来。候选顺序：只点 → 点+框 → 框内多点（应对贴身穿搭/紧身衣）。
                 best = None
                 best_cov = 9.9
                 best_tag = ""
-                tries = [("只点", None)]
+                cand_sets = [np.array(garment_points[0]) * work_scale]
                 if boxes:
-                    tries.append(("点+框", boxes[0]))
-                for tag, box in tries:
-                    try:
-                        kw = {"point_coords": np.array(garment_points[0]),
-                              "point_labels": np.ones(len(garment_points[0]), dtype=int),
-                              "multimask_output": True}
-                        if box is not None:
-                            kw["box"] = np.array(box)
-                        m, _, _ = predictor.predict(**kw)
-                    except Exception:
-                        continue
-                    for cand in m:
-                        arr = (cand.astype(np.uint8)) * 255
-                        cov = float((arr > 127).mean())
-                        if 0.03 <= cov <= 0.32 and cov < best_cov:
-                            best_cov = cov
-                            best = arr
-                            best_tag = tag
+                    bx = boxes[0]
+                    cand_sets.append(np.array([[bx[0] * work_scale, bx[1] * work_scale],
+                                               [(bx[0] + bx[2]) / 2 * work_scale, (bx[1] + bx[3]) / 2 * work_scale]]))
+                    cand_sets.append(np.array([[(bx[0] + bx[2]) / 2 * work_scale, (bx[1] + bx[3]) / 2 * work_scale]]))
+                tries = []
+                for ci, cs in enumerate(cand_sets):
+                    tries.append((f"点集{ci + 1}", cs, None))
+                if boxes:
+                    tries.append(("点+框", cand_sets[0], boxes[0]))
+                for tag, pts_w, box in tries:
+                    for mm_out in (True, False):
+                        try:
+                            kw = {"point_coords": pts_w,
+                                  "point_labels": np.ones(len(pts_w), dtype=int),
+                                  "multimask_output": mm_out}
+                            if box is not None:
+                                x1, y1, x2, y2 = box
+                                kw["box"] = np.array([x1 * work_scale, y1 * work_scale, x2 * work_scale, y2 * work_scale])
+                            m, _, _ = predictor.predict(**kw)
+                        except Exception:
+                            continue
+                        arrs = m if m.ndim == 3 else [m]
+                        for cand in arrs:
+                            cov = float((cand > 0).mean())
+                            if not (0.02 <= cov <= 0.34):
+                                continue
+                            arr_full = _back(cand)
+                            # 硬约束：衣服不可能在头顶 —— 蒙版上沿若高于「人物上沿 + 8% 身高」就丢掉
+                            if person_box is not None and not args.no_shoulder_guard:
+                                _m = cv2.resize(arr_full, (W, H), interpolation=cv2.INTER_NEAREST)
+                                _ys3, _ = np.where(_m > 127)
+                                if len(_ys3):
+                                    top_limit = person_box[0] + 0.08 * (person_box[1] - person_box[0])
+                                    if float(_ys3.min()) < top_limit:
+                                        continue
+                            if cov < best_cov:
+                                best_cov = cov
+                                best = arr_full
+                                best_tag = tag + ("（多候选）" if mm_out else "")
                 if best is not None:
                     mask_full = best
-                    notes.append(f"衣服：{best_tag} 挑出织物级掩膜（覆盖 {best_cov:.1%}，3%-32% 区间取最紧）")
+                    notes.append(f"衣服：{best_tag} 挑出织物级掩膜（覆盖 {best_cov:.1%}）")
                 else:
                     notes.append("衣服：点提示没给出织物级掩膜（要么过小、要么罩住整个人）→ 请改用 box: 精确框或蒙版图")
             else:
                 for bx in boxes:
                     x1, y1, x2, y2 = bx
-                    m, _, _ = predictor.predict(box=np.array([x1, y1, x2, y2]), multimask_output=False)
-                    mask_full = np.maximum(mask_full, (m[0] if m.ndim == 3 else m).astype(np.uint8) * 255)
+                    m, _, _ = predictor.predict(box=np.array([x1 * work_scale, y1 * work_scale, x2 * work_scale, y2 * work_scale]), multimask_output=False)
+                    mask_full = np.maximum(mask_full, _back(m[0] if m.ndim == 3 else m))
             sam_used = True
             notes.append(f"SAM({kind}) 分割完成")
             del sam
@@ -341,6 +451,33 @@ def main():
     # ---------- ③ 后处理：闭运算补洞 → 膨胀 → 羽化 ----------
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, k)
+    # 颜色一致性生长：SAM 常只切到衣服的一小块布片（<6%）。用 LAB 颜色距离把**与这块同色、
+    # 且与之连通**的区域并进来 —— 同一件衣服颜色一致，皮肤/头发/背景颜色不同，所以不会越界。
+    # 有上限：生长后不得超 32%，且至少长出 1.5 倍才采用。
+    try:
+        _cov0 = float((mask_full > 127).mean())
+        if args.grow and args.target == "衣服" and 0 < _cov0 < 0.06:
+            _lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            _ys5, _xs5 = np.where(mask_full > 127)
+            if len(_ys5):
+                _mean = _lab[_ys5, _xs5].mean(axis=0)
+                _dist = np.linalg.norm(_lab - _mean, axis=2)
+                _similar = (_dist < 30).astype(np.uint8) * 255
+                _n, _labels = cv2.connectedComponents(_similar, connectivity=8)
+                _keep = [int(v) for v in np.unique(_labels[mask_full > 127]) if v != 0]
+                if _keep:
+                    _grown = np.isin(_labels, _keep).astype(np.uint8) * 255
+                    if person_mask_for_points is not None:
+                        _grown = cv2.bitwise_and(_grown, person_mask_for_points)
+                    _cov1 = float((_grown > 127).mean())
+                    if _cov1 >= _cov0 * 1.5 and _cov1 <= 0.32:
+                        mask_full = _grown
+                        notes.append(f"颜色一致性生长：{_cov0:.1%} → {_cov1:.1%}")
+                    else:
+                        notes.append(f"颜色生长幅度不合适（{_cov0:.1%} → {_cov1:.1%}）→ 保持原蒙版")
+    except Exception:
+        pass
+
     # 只留最大连通块（去掉蝴蝶/花点等误检碎块；碎块会让无关区域被重画）
     try:
         n_lab, labels, stats, _ = cv2.connectedComponentsWithStats((mask_full > 127).astype(np.uint8), connectivity=8)
@@ -364,7 +501,7 @@ def main():
             before = float((mask_full > 127).mean())
             closed = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, kk)
             after = float((closed > 127).mean())
-            if after <= max(0.22, before * 2.2):
+            if after <= min(0.30, max(0.20, before * 1.8)):
                 mask_full = closed
                 notes.append(f"已补全薄纱区（{before:.1%} → {after:.1%}）")
             else:
@@ -379,7 +516,7 @@ def main():
         mask_full = cv2.GaussianBlur(mask_full, (args.feather * 2 + 1, args.feather * 2 + 1), 0)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    cv2.imwrite(args.out, mask_full)
+    _write_png(args.out, mask_full)
     # 蒙版叠加预览：把重绘区半透明染色盖回原图（验收蒙版准不准就看这张，不用靠生成结果猜）。
     try:
         overlay = img_bgr.copy()
@@ -390,7 +527,7 @@ def main():
         edge = cv2.morphologyEx((m3.astype(np.uint8)) * 255, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
         overlay[edge > 0] = (255, 255, 255)
         ov_path = os.path.splitext(os.path.abspath(args.out))[0] + "_overlay.png"
-        cv2.imwrite(ov_path, overlay)
+        _write_png(ov_path, overlay)
         result["overlay"] = ov_path
     except Exception as e:
         notes.append(f"叠加预览生成失败：{type(e).__name__}")
