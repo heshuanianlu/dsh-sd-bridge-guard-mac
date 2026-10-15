@@ -24,7 +24,8 @@
                   "README.md",
                   "CHANGELOG.md",
                   "LICENSE",
-                  "docs/"
+                  "docs/",
+                  "publish-npm.ps1"
               ],
     "scripts":  {
                     "test":  "node smoke-skill.mjs \u0026\u0026 node test-install-record.mjs \u0026\u0026 node test-settings.mjs \u0026\u0026 node test-install-catalog.mjs",
