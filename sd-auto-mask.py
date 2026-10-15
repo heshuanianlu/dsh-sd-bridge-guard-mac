@@ -35,7 +35,9 @@ TARGET_LABELS = {
 INVERT_TARGETS = {"背景"}
 # 找不到服饰词时：用「人物轮廓」兜底（按这张图里人的实际形状取躯干/腿部，而不是固定矩形）
 SILHOUETTE_FALLBACK = {
-    "衣服": (0.14, 0.55, 1.00, 1.00),   # (裁剪上界, 裁剪下界, 左右留白, 右留白) 相对人物框的比例
+    # 只在 --allow-silhouette 显式开启时才用「人物剪影 ∩ 躯干带」兜底。默认**禁止**：
+    # 衣服蒙版一旦退化成身体剪影，重绘会把整个躯干重画（实测角色直接转身，等于换人）。
+    "衣服": (0.14, 0.55, 1.00, 1.00),
     "脸": (0.00, 0.42, 0.30, 0.70),
 }
 
@@ -74,11 +76,13 @@ def main():
     ap.add_argument("--sd-dir", default="")
     ap.add_argument("--sam", default="", help="指定 SAM 权重路径（留空自动找）")
     ap.add_argument("--boxes", default="", help="可选：手工框 x1,y1,x2,y2[;x1,y1,x2,y2]（跳过 YOLO-World）")
-    ap.add_argument("--box-threshold", type=float, default=0.25)
-    ap.add_argument("--max-side", type=int, default=1600, help="检测时的最长边上限（加速）")
+    ap.add_argument("--box-threshold", type=float, default=0.03, help="检测阈值（YOLO-World 用低阈值才容易命中服饰词）")
+    ap.add_argument("--max-side", type=int, default=2048, help="检测最长边（实测 1600 会漏检服饰，2048 才稳）")
     ap.add_argument("--dilate", type=int, default=8, help="蒙版外扩像素（接缝更自然）")
     ap.add_argument("--feather", type=int, default=4, help="羽化半径像素")
     ap.add_argument("--no-invert", action="store_true")
+    ap.add_argument("--allow-silhouette", action="store_true", help="允许人物剪影兜底（默认关：会把身体一起重画）")
+    ap.add_argument("--points", default="", help="SAM 点提示（图像像素坐标）：x,y;x,y …；给了就跳过检测直接点选")
     ap.add_argument("--max-words", type=int, default=5, help="逐词检测最多试几个词（命中即停）")
     args = ap.parse_args()
 
@@ -179,7 +183,7 @@ def main():
                 notes.append(f"人脸模型失败：{type(e).__name__}")
 
     # 衣服/脸兜底：用「人物轮廓」定位（按这张图里人的实际形状，而不是固定矩形）
-    if not boxes and args.target in SILHOUETTE_FALLBACK:
+    if not boxes and args.target in SILHOUETTE_FALLBACK and args.allow_silhouette:
         sd = args.sd_dir or ""
         seg_models = find_file([sd], ["*person*yolov8*-seg.pt"], min_mb=1)
         person_mask = None
@@ -210,6 +214,26 @@ def main():
             notes.append(f"按人物轮廓兜底（取人物剪影 y {band[0]}-{band[1]} 区段）")
             result["engine"] = "person-seg 轮廓（跟随人物剪影）"
 
+    # 衣服专用：YOLO-World 的 dress 框往往罩住整个人 → 直接 box-prompt 会把整个人重画（实测角色转身）。
+    # 改成在该框的**下半部**取几个点做 SAM 点提示，然后**取最紧的那个掩膜**（衣服只是一块织物，不该是整个人）。
+    garment_points = []
+    if args.target == "衣服" and boxes:
+        for bx in boxes:
+            x1, y1, x2, y2 = bx
+            cx = (x1 + x2) / 2.0
+            bw = x2 - x1
+            bh = y2 - y1
+            for fy in (0.62, 0.78, 0.90):
+                for fx in (0.5, 0.33, 0.67):
+                    garment_points.append([[cx + (fx - 0.5) * bw, y1 + fy * bh]])
+    if args.points.strip():
+        pts = []
+        for part in args.points.split(";"):
+            vals = [float(v) for v in part.replace("，", ",").split(",") if v.strip()]
+            if len(vals) == 2:
+                pts.append(vals)
+        if pts:
+            garment_points = [pts]      # 手动点：只跑一次，不做「取最紧」筛选
     # ---------- ② 用 SAM 把框变成精细蒙版 ----------
     mask_full = np.zeros((H, W), dtype=np.uint8)
     sam_used = False
@@ -221,7 +245,7 @@ def main():
     if pre_mask is not None:
         mask_full = pre_mask
         sam_used = True   # 已由轮廓兜底给出蒙版，跳过 SAM
-    elif sam_path and os.path.isfile(sam_path) and boxes:
+    elif sam_path and os.path.isfile(sam_path) and (boxes or garment_points):
         try:
             import torch
             from segment_anything import sam_model_registry, SamPredictor
@@ -238,10 +262,45 @@ def main():
             sam = sam_model_registry[kind](checkpoint=sam_path).to(device)
             predictor = SamPredictor(sam)
             predictor.set_image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-            for bx in boxes:
-                x1, y1, x2, y2 = bx
-                m, _, _ = predictor.predict(box=np.array([x1, y1, x2, y2]), multimask_output=False)
-                mask_full = np.maximum(mask_full, (m[0] if m.ndim == 3 else m).astype(np.uint8) * 255)
+            if garment_points:
+                # 衣服：**把全部候选点当成一次正样本**喂给 SAM（多点比单点稳），在它给的 3 张候选里
+                # 挑「最紧但仍是织物级」的那张：
+                #   太紧（<3%）= 只切到布片，改了等于没改；
+                #   太松（>32%）= 整个人，重绘会把身体/姿势一起重画（实测角色直接转身）。
+                # 绝不把所有点的掩膜并起来。先试「只点」，再试「点+框」。
+                best = None
+                best_cov = 9.9
+                best_tag = ""
+                tries = [("只点", None)]
+                if boxes:
+                    tries.append(("点+框", boxes[0]))
+                for tag, box in tries:
+                    try:
+                        kw = {"point_coords": np.array(garment_points[0]),
+                              "point_labels": np.ones(len(garment_points[0]), dtype=int),
+                              "multimask_output": True}
+                        if box is not None:
+                            kw["box"] = np.array(box)
+                        m, _, _ = predictor.predict(**kw)
+                    except Exception:
+                        continue
+                    for cand in m:
+                        arr = (cand.astype(np.uint8)) * 255
+                        cov = float((arr > 127).mean())
+                        if 0.03 <= cov <= 0.32 and cov < best_cov:
+                            best_cov = cov
+                            best = arr
+                            best_tag = tag
+                if best is not None:
+                    mask_full = best
+                    notes.append(f"衣服：{best_tag} 挑出织物级掩膜（覆盖 {best_cov:.1%}，3%-32% 区间取最紧）")
+                else:
+                    notes.append("衣服：点提示没给出织物级掩膜（要么过小、要么罩住整个人）→ 请改用 box: 精确框或蒙版图")
+            else:
+                for bx in boxes:
+                    x1, y1, x2, y2 = bx
+                    m, _, _ = predictor.predict(box=np.array([x1, y1, x2, y2]), multimask_output=False)
+                    mask_full = np.maximum(mask_full, (m[0] if m.ndim == 3 else m).astype(np.uint8) * 255)
             sam_used = True
             notes.append(f"SAM({kind}) 分割完成")
             del sam
@@ -280,6 +339,16 @@ def main():
     # ---------- ③ 后处理：闭运算补洞 → 膨胀 → 羽化 ----------
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, k)
+    # 只留最大连通块（去掉蝴蝶/花点等误检碎块；碎块会让无关区域被重画）
+    try:
+        n_lab, labels, stats, _ = cv2.connectedComponentsWithStats((mask_full > 127).astype(np.uint8), connectivity=8)
+        if n_lab > 2:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            keep = 1 + int(np.argmax(areas))
+            mask_full = np.where(labels == keep, 255, 0).astype(np.uint8)
+            notes.append(f"已只留最大连通块（原 {n_lab - 1} 块）")
+    except Exception:
+        pass
     if args.dilate > 0:
         k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.dilate * 2 + 1, args.dilate * 2 + 1))
         mask_full = cv2.dilate(mask_full, k2)

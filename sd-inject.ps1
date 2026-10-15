@@ -1843,6 +1843,7 @@ if ($mode -eq '文生图') {
 
     # 蒙版（C-1b）：显式填了就用；填「无」但检测到替换动作 → 按目标自动选区域
     $maskSpec = $maskSpecRaw
+    $autoPathUsedForClothes = $false
     $autoMask = ($maskSpec -match '^自动' -or $maskSpec -eq 'auto' -or $maskSpec -eq '')
     if ($maskSpec -match '^无' -or $maskSpec -eq '') { $maskSpec = '' }
     # 自动抠图：按这张参考图的内容现生成（换衣服→衣服/身体；换背景→人以外；换脸→人脸区）
@@ -1854,6 +1855,7 @@ if ($mode -eq '文生图') {
         $autoPath = New-AutoMaskFromImage -ImagePath $refPath -Target $autoTarget -OutPath $autoOut -Dilate 8 -Feather 4
         if ($autoPath) {
             $finalMask = $autoPath
+            if ($autoTarget -eq '衣服') { $autoPathUsedForClothes = $true }
             Write-Host "自动蒙版就绪：$($script:AutoMaskNote)" -ForegroundColor Cyan
         } else {
             Write-Host "自动蒙版没成功（$($script:AutoMaskNote)）→ 退回按区域重绘" -ForegroundColor Yellow
@@ -1886,7 +1888,13 @@ if ($mode -eq '文生图') {
         $branchTag = "C-1b 图生图·替换$(if ($replaceTarget) { "（$replaceTarget）" })"
         $finalDenoise = [double]$P.Denoise
         if ($finalDenoise -lt 0.55) { $finalDenoise = 0.75 }   # 蒙版内要盖住旧内容，太小的 denoising 换不掉
-        $inpaintFill = 0                                       # 填充模式（实测 fill=2 潜空间噪声会在蒙版区留噪点）
+        # 实测经验（2026-10-15）：**自动抠图给的衣服蒙版**已经贴着织物，denoising 一上 0.75-0.8 就会把
+        # 躯干/姿势一起重画（用户看到的就是「换件衣服整个人都变了」）。这类蒙版收敛到 0.6：
+        #   0.55-0.6 = 换版型/改动明显但姿势脸都保住；0.7+ = 换得彻底、但姿势可能变。
+        if ($autoPathUsedForClothes -and $finalDenoise -gt 0.62) {
+            Write-Host "衣服重绘：denoising $finalDenoise 偏大（会把姿势/身体一起重画）→ 收敛到 0.6；要大改请手动填 0.7+ 或在提示词里写清" -ForegroundColor Yellow
+            $finalDenoise = 0.6
+        }        $inpaintFill = 0                                       # 填充模式（实测 fill=2 潜空间噪声会在蒙版区留噪点）
         # 出图尺寸 = 参考图原生尺寸（对齐到 8 的倍数）；蒙版**按这个尺寸**生成，两者必须一致，
         # 否则 A1111 缩放蒙版时区域会错位（用户反馈的「蒙版位置有问题」）。
         $refSize = Get-ImageSizePx -Path $refPath
