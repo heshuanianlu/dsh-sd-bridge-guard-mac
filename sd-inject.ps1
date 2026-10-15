@@ -615,19 +615,91 @@ function Merge-ConsistencyPrompt {
 
 # 找 SD 自带的 python（能 import cv2/torch/ultralytics 的那个）
 function Find-SdPython {
-    $cands = @()
+    # 找一个**真的能用**的 python（必须能 import cv2 / numpy —— 上次真机失败就是挑到了没有 cv2 的系统 python）。
+    if ($script:SdPythonCache) { return $script:SdPythonCache }
+    $cands = New-Object System.Collections.Generic.List[string]
+
+    function Add-Cand([string]$p) { if ($p -and (Test-Path -LiteralPath $p)) { $cands.Add($p) } }
+
+    # ① 显式 -SdDir（若调用方给了）
     if ($SdDir) {
-        $cands += (Join-Path $SdDir 'python\python.exe')
-        $cands += (Join-Path $SdDir 'venv\Scripts\python.exe')
-        $cands += (Join-Path $SdDir '.venv\Scripts\python.exe')
+        Add-Cand (Join-Path $SdDir 'python\python.exe')
+        Add-Cand (Join-Path $SdDir 'venv\Scripts\python.exe')
+        Add-Cand (Join-Path $SdDir '.venv\Scripts\python.exe')
     }
-    foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
-    $cmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    $cmd = Get-Command python3 -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
+
+    # ② 从正在跑的 SD API 反推 SD 根目录：**优先用 sd-models 的完整模型路径**（最可靠）
+    if (-not $script:SdRootProbed) {
+        $script:SdRootProbed = $true
+        # ① /sdapi/v1/sd-models：filename 形如 D:\SD.4.8\models\Stable-diffusion\x.safetensors
+        foreach ($ep in @('sd-models', 'loras')) {
+            if ($script:SdRoot) { break }
+            try {
+                $list = Invoke-RestMethod "http://127.0.0.1:$SdPort/sdapi/v1/$ep" -TimeoutSec 12
+                foreach ($it in @($list)) {
+                    $p = ""
+                    if ($it.filename) { $p = "$($it.filename)" } elseif ($it.path) { $p = "$($it.path)" }
+                    if (-not $p) { continue }
+                    $m = [regex]::Match($p, '^(.*)\\models\\', 'IgnoreCase')
+                    if ($m.Success) { $script:SdRoot = $m.Groups[1].Value; break }
+                }
+            } catch { }
+        }
+        # ② cmd-flags 的 ckpt_dir（不少版本是空的，只当次要手段）
+        if (-not $script:SdRoot) {
+            try {
+                $flags = Invoke-RestMethod "http://127.0.0.1:$SdPort/sdapi/v1/cmd-flags" -TimeoutSec 8
+                $cd = "$($flags.ckpt_dir)"
+                if ($cd) {
+                    $root = Split-Path (Split-Path $cd -Parent) -Parent
+                    if ($root -and (Test-Path -LiteralPath $root)) { $script:SdRoot = $root }
+                }
+            } catch { }
+        }
+        # ③ 扫盘兜底：不设数量上限（上次就是被「前 60 个」截掉了 SD.4.8），只限深度 1
+        if (-not $script:SdRoot) {
+            foreach ($drv in @('D:\', 'E:\', 'C:\', 'F:\')) {
+                if (Test-Path -LiteralPath $drv) {
+                    $dirs = @()
+                    try { $dirs = Get-ChildItem -LiteralPath $drv -Directory -ErrorAction SilentlyContinue } catch { }
+                    foreach ($d in $dirs) {
+                        $hasWebui = (Test-Path -LiteralPath (Join-Path $d.FullName 'webui.py')) -or (Test-Path -LiteralPath (Join-Path $d.FullName 'launch.py'))
+                        $hasPy = Test-Path -LiteralPath (Join-Path $d.FullName 'python\python.exe')
+                        if ($hasWebui -and $hasPy) { $script:SdRoot = $d.FullName; break }
+                    }
+                }
+                if ($script:SdRoot) { break }
+            }
+        }
+    }
+    if ($script:SdRoot) {
+        Add-Cand (Join-Path $script:SdRoot 'python\python.exe')
+        Add-Cand (Join-Path $script:SdRoot 'venv\Scripts\python.exe')
+        Add-Cand (Join-Path $script:SdRoot '.venv\Scripts\python.exe')
+    }
+
+    # ④ 系统 python 兜底（最后才试）
+    foreach ($n in @('python', 'python3', 'py')) {
+        $cmd = Get-Command $n -ErrorAction SilentlyContinue
+        if ($cmd) { Add-Cand $cmd.Source }
+    }
+
+    # ⑤ 逐个实测：能 import cv2 + numpy 才算数
+    $tried = @()
+    foreach ($c in $cands) {
+        $tried += $c
+        try {
+            $null = & $c -c "import cv2, numpy" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $script:SdPythonCache = $c
+                return $c
+            }
+        } catch { }
+    }
+    $script:SdPythonFail = ($tried -join ' | ')
     return ''
 }
+
 
 # 生成自动蒙版：成功返回蒙版路径，失败返回 '' 并把原因写进 $script:AutoMaskNote
 function New-AutoMaskFromImage {
@@ -650,7 +722,13 @@ function New-AutoMaskFromImage {
     if (-not $py) { $script:AutoMaskNote = '找不到可用的 python（SD 目录下 python\python.exe）'; return '' }
     $args = @($helper, '--image', $ImagePath, '--target', $Target, '--out', $OutPath, '--dilate', "$Dilate", '--feather', "$Feather")
     if ($Target -eq '衣服') { $args += '--fill-sheer' }   # 补薄纱/透视布料（有 2.2 倍与 22% 双上限保护）
-    if ($SdDir) { $args += @('--sd-dir', $SdDir) }
+    # 权重/模型都靠这个根目录：-SdDir 为空时必须用探测出来的 SD 根（否则报「没找到 YOLO-World 权重」）
+    $sdRootForHelper = $SdDir
+    if (-not $sdRootForHelper) {
+        $null = Find-SdPython          # 顺带完成一次探测，$script:SdRoot 会被填上
+        $sdRootForHelper = $script:SdRoot
+    }
+    if ($sdRootForHelper) { $args += @('--sd-dir', $sdRootForHelper) }
     $out = ''
     try { $out = & $py @args 2>$null | Select-Object -Last 1 } catch { $script:AutoMaskNote = "抠图脚本调用失败：$($_.Exception.Message)"; return '' }
     if (-not $out) { $script:AutoMaskNote = '抠图脚本没有输出'; return '' }

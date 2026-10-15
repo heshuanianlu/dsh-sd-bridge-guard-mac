@@ -662,3 +662,18 @@ assert.ok(/已扣除脸区/.test(autoMaskPy), '最终蒙版必须减去脸区（
 assert.ok(/已补全薄纱区/.test(autoMaskPy), '薄纱/透视布料补全必须存在')
 assert.ok(/--no-shoulder-guard/.test(autoMaskPy) && /--grow/.test(autoMaskPy), '肩线守卫与颜色生长开关必须存在')
 console.log('GARMENT-V2 SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 真机 bug（2026-10-15，用户截图）：预生成蒙版时报 `缺少 cv2/numpy: No module named 'cv2'`。
+// 根因：$SdDir 在预生成阶段是空的 → Find-SdPython 退到系统 python（没有 cv2）；且 --sd-dir 也没传，
+// 抠图器接着报「没找到 YOLO-World 权重」。修：候选 python 逐个实测 import cv2/numpy；
+// SD 根用 /sdapi/v1/sd-models 的模型路径反推（cmd-flags 的 ckpt_dir 常为空）；扫盘不再限前 60 个目录。
+// ---------------------------------------------------------------------------
+assert.ok(/import cv2, numpy/.test(injectPs1) && /能 import cv2 \+ numpy 才算数/.test(injectPs1), 'Find-SdPython 必须实测 python 能否 import cv2/numpy')
+assert.ok(/sdapi\/v1\/\$ep/.test(injectPs1) && /'sd-models', 'loras'/.test(injectPs1), 'SD 根必须用 sd-models/loras 的模型路径反推')
+assert.ok(/SdRootProbed/.test(injectPs1), 'SD 根探测必须只做一次（缓存）')
+assert.ok(/\$sdRootForHelper = \$SdDir/.test(injectPs1) && /--sd-dir', \$sdRootForHelper/.test(injectPs1), '抠图器必须拿到探测出的 SD 根（否则找不到 YOLO-World 权重）')
+assert.ok(/Get-ChildItem -LiteralPath \$drv -Directory -ErrorAction SilentlyContinue/.test(injectPs1), '扫盘兜底不得限制目录数量（上次被「前 60 个」截掉了 SD.4.8）')
+assert.ok(/蒙版没画出来/.test(injectPs1) && /缺少抠图脚本|找不到可用的 python/.test(injectPs1), '抠图失败必须给出可读原因')
+console.log('SD-PY-DETECT SMOKE OK')
