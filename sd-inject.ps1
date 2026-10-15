@@ -4,8 +4,10 @@
 #   → 最终出图：拿到底图 + Denoising>0 → 图生图（-InitImage 底图 + -Denoising）；否则文生图。
 #     底图优先级：表单「底图」栏 > 素体自检迭代的 winning 图 > 现场补一张素体底图（质检不可用时素体也会出这一张）。
 #     最终图同样按迭代次数做脸/手质检迭代（质检不可用时出满 N 张让你自选），取最高分那张
-# 迭代产物全部写入系统临时目录（**不进工作区**），最终只把脸/手最高分的一张复制进 -OutDir，
-# 脚本退出（含取消/失败）时删除整个临时迭代目录——工作区里永远只有成品。
+# 迭代产物写在「可写的迭代根」下的独立子目录（默认 <OutDir 的父目录>\.sd-inject-iter\iter-<随机>，
+# 可用 -IterDir 指定，见 坑34）：以前固定写系统 temp，在 DSH workspace-write 沙箱下会被 ACL 拒写，
+# 出图落盘失败 → 脚本提前退出 → 工作区一张成品都没有。工作区优先即天然可写。
+# 最终只把脸/手最高分的一张复制进 -OutDir；脚本退出（含取消/失败）时删除本次迭代子目录——工作区里只留成品。
 # 全程本地运行（SD 与脸/手质检的视觉模型都在本机）。
 # 用法：
 #   .\sd-inject.ps1                                    # 基底 + 表单直接跑
@@ -42,6 +44,7 @@ param(
     [string]$SdDirect = "",                            # sd-direct.ps1 路径；留空则取脚本同目录
     [string]$SdDir = "",
     [string]$InitImage = "",                           # 底图（图生图用）：预填进表单「底图」栏；留空 = 用素体成品
+    [string]$IterDir = "",                             # 迭代中间图目录（必须可写）：留空 = <工作区>\.sd-inject-iter → 脚本目录 → 系统 temp
     [switch]$NoOpen                                   # 加 -NoOpen 则跑完不自动打开这张图
 )
 
@@ -53,12 +56,8 @@ try {
     $null = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/sdapi/v1/interrupt" -Method Post -TimeoutSec 5
     Write-Host "已清空 SD 卡死任务（interrupt）" -ForegroundColor DarkGray
 } catch { }
-# 2) 清理残留的 sd-inject 迭代临时目录（上次运行中断遗留的）
-Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -Filter "sd-inject-iter-*" -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch { }
-    }
-Write-Host "已清理旧迭代临时目录" -ForegroundColor DarkGray
+# 2) 残留迭代目录的清理挪到「迭代根确定之后」（见下方 坑34 段）——旧版固定扫系统 temp，
+#    现在迭代根优先落在工作区，得先知道根在哪才能扫对地方。
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -74,16 +73,104 @@ if (-not (Test-Path -LiteralPath $SdDirect)) {
     exit 1
 }
 
-# ---- 迭代临时目录：所有中间图都写这里（不进工作区），退出时整体删除 ----
-$script:IterTempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sd-inject-iter-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+# ---- 迭代临时目录：**必须落在可写的地方**（坑34，外部用户实测反馈）----
+# 旧行为：固定用 [System.IO.Path]::GetTempPath()。但 DSH 的 workspace-write 沙箱 ACL 只放行
+# 「会话工作区」，而插件是用 cmd start 拉起**独立窗口**跑的（不经过会被改写 TMP/TEMP 的受限子进程），
+# 于是 GetTempPath() 指向不可写的用户 temp → sd-direct.ps1 落盘被拒 → 非 0 退出 →
+# sd-inject 直接 exit 1 → 三处 Copy-Item 全在迭代**之后**、永远执行不到 → 工作区一张成品都没有
+# （只有 SD 自己的 outputs 目录里看得见）。现在改为「工作区优先 + 逐级兜底 + 全不可写就明确报错」。
+function Test-DirWritable {
+    # 真写一个探针文件再删：只看 Test-Path 会把「存在但被 ACL 拒写」当成可用（这正是坑34 的误判来源）
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { $null = New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop }
+        $probe = Join-Path $Path (".write-probe-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        [System.IO.File]::WriteAllText($probe, 'ok')
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch { return $false }
+}
+
+function Resolve-IterRoot {
+    # 按顺序挑第一个真的可写的候选目录；全不可写返回 ''（由调用方明确报错，不静默）
+    param([string[]]$Candidates)
+    foreach ($c in $Candidates) {
+        if (-not $c) { continue }
+        if (Test-DirWritable $c) { return $c }
+        Write-Host "迭代目录不可写，跳过：$c" -ForegroundColor DarkYellow
+    }
+    return ''
+}
+
+# OutDir 先探一次：不可写的话最后那几下 Copy-Item 必然失败，与其让用户等十几分钟才看到
+# 「工作区什么都没有」，不如现在就把原因说清楚。
+if (-not (Test-DirWritable $OutDir)) {
+    Write-Host "错误：输出目录不可写：$OutDir" -ForegroundColor Red
+    Write-Host "      DSH 的 workspace-write 沙箱只允许写会话工作区，请把 -OutDir 指到工作区内（例如 <工作区>\SD-Picture）。" -ForegroundColor Yellow
+    exit 1
+}
+
+# 迭代根候选：① -IterDir 显式指定 ② <OutDir 的父目录>\.sd-inject-iter（正常就是会话工作区）
+#             ③ $PSScriptRoot\.sd-inject-iter ④ 系统 temp（旧行为，最后兜底）
+# 加固：系统 temp 用 try/catch + 多来源兜底求值——[System.IO.Path]::GetTempPath() 在个别受限宿主/
+#       沙箱下会返回空字符串，直接喂给 Join-Path 会在 $ErrorActionPreference='Stop'（启动器就是 Stop）
+#       下抛「参数 Path 为空」的致命异常，把整条兜底链打断。
+$sysTemp = ''
+try { $sysTemp = [System.IO.Path]::GetTempPath() } catch { }
+if (-not $sysTemp) { try { $sysTemp = "$env:TEMP" } catch { } }
+if (-not $sysTemp) { try { $sysTemp = "$env:TMP" } catch { } }
+if (-not $sysTemp) { try { $sysTemp = "$env:USERPROFILE\AppData\Local\Temp" } catch { } }
+
+$iterCandidates = @()
+if ($IterDir) { $iterCandidates += $IterDir }
+if ($OutDir) { try { $iterCandidates += (Join-Path (Split-Path -Parent $OutDir) '.sd-inject-iter') } catch { } }
+if ($PSScriptRoot) { try { $iterCandidates += (Join-Path $PSScriptRoot '.sd-inject-iter') } catch { } }
+if ($sysTemp) { try { $iterCandidates += (Join-Path $sysTemp 'sd-inject-iter') } catch { } }
+$iterCandidates = @($iterCandidates | Where-Object { $_ } | Select-Object -Unique)
+
+$script:IterRoot = Resolve-IterRoot -Candidates $iterCandidates
+if (-not $script:IterRoot) {
+    Write-Host "错误：找不到可写的迭代目录，已尝试：" -ForegroundColor Red
+    foreach ($c in $iterCandidates) { Write-Host "      $c" -ForegroundColor DarkGray }
+    Write-Host "      请把 -OutDir 指到会话工作区内，或用 -IterDir 指定一个可写目录。" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "迭代目录：$($script:IterRoot)" -ForegroundColor DarkGray
+
+# 清理上次中断残留的迭代目录（新根 + 旧版 temp 根都扫一遍，避免留垃圾）
+# 加固：候选目录可能压根不存在（例如 -IterDir 给了个不可写的 Z:\ 候选）——先 Test-Path 再扫，
+# 整段再包 try/catch，免得在 $ErrorActionPreference='Stop'（启动器里就是 Stop）下把清理失败升级成流程中断。
+foreach ($root in $iterCandidates) {
+    if (-not $root) { continue }
+    try { if (-not (Test-Path -LiteralPath $root)) { continue } } catch { continue }
+    foreach ($pat in @('iter-*', 'sd-inject-iter-*')) {
+        try {
+            Get-ChildItem -LiteralPath $root -Directory -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+                try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        } catch { }
+    }
+}
+
+# 每次运行一个独立子目录（所有中间图都写这里，退出时整体删除；根目录留着复用）
+$script:IterTempDir = Join-Path $script:IterRoot ("iter-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $null = New-Item -ItemType Directory -Path $script:IterTempDir -Force
-# 清理兜底：正常退出、Ctrl+C、进程被杀（ finally 由 exit 触发）都尽量删掉临时目录
+# 清理兜底：正常退出、Ctrl+C、进程被杀（ finally 由 exit 触发）都尽量删掉本次临时目录
 $script:IterTempCleaned = $false
 function Remove-IterTempDir {
     if ($script:IterTempCleaned) { return }
     $script:IterTempCleaned = $true
     if ($script:IterTempDir -and (Test-Path -LiteralPath $script:IterTempDir)) {
         try { Remove-Item -LiteralPath $script:IterTempDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    # 根目录空了就顺手收掉（工作区里不留空壳目录）
+    if ($script:IterRoot -and (Test-Path -LiteralPath $script:IterRoot)) {
+        try {
+            if (@(Get-ChildItem -LiteralPath $script:IterRoot -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                Remove-Item -LiteralPath $script:IterRoot -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
     }
 }
 

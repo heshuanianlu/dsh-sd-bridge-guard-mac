@@ -2327,6 +2327,9 @@ const injectTool = {
       '-Steps', String(clampInt(args.steps, 24, 1, 150)),
       '-Name', psQuote(String(args.name ?? '').trim() || 'inject'),
       '-OutDir', psQuote(outDir),
+      // 坑34（外部用户实测）：迭代中间图以前写系统 temp，在 DSH workspace-write 沙箱下会被 ACL 拒写，
+      // 出图落盘失败 → 脚本提前退出 → 工作区一张成品都没有。显式把迭代根钉在会话工作区里。
+      '-IterDir', psQuote(path.join(wsRoot, '.sd-inject-iter')),
     ]
     if (Number.isFinite(Number(args.cfg))) parts.push('-Cfg', String(Number(args.cfg)))
     if (String(args.sampler ?? '').trim()) parts.push('-Sampler', psQuote(String(args.sampler).trim()))
@@ -2363,14 +2366,23 @@ const injectTool = {
           '-Steps', String(clampInt(args.steps, 24, 1, 150)),
           '-Name', String(args.name ?? '').trim() || 'inject',
           '-OutDir', outDir,
+          '-IterDir', path.join(wsRoot, '.sd-inject-iter'),
         ]
         if (Number.isFinite(Number(args.cfg))) paramPairs.push('-Cfg', String(Number(args.cfg)))
         if (String(args.sampler ?? '').trim()) paramPairs.push('-Sampler', String(args.sampler).trim())
         // 每个元素都包单引号；数字也当字符串传（PowerShell splatting 会自动转回数值类型）
         const elems = paramPairs.map((v) => `  ${psQuoteSingle(v)}`).join(',\r\n')
+        // 坑34（外部用户实测反馈）：这个窗口是 cmd start 拉起的**独立进程**，不经过 DSH 受限子进程
+        // 那条会给 TMP/TEMP 改道的链路；而 DSH 的 workspace-write 沙箱只放行会话工作区。
+        // 结果：脚本里任何 GetTempPath() / $env:TEMP 的中间产物都落到不可写目录 → 落盘被拒 → 空跑。
+        // 这里在启动器里把 TMP/TEMP/TMPDIR 全部指向工作区内的 .dsh-tmp（先建目录），从源头掐掉这类问题。
+        const launcherTmpDir = path.join(wsRoot, '.dsh-tmp')
         const launcherBody = [
           '# 由 sd-bridge 自动生成：安全启动 sd-inject.ps1（参数在文件内，避免命令行转义）',
           '$ErrorActionPreference = "Stop"',
+          `$tmpDir = ${psQuoteSingle(launcherTmpDir)}`,
+          'if (-not (Test-Path -LiteralPath $tmpDir)) { $null = New-Item -ItemType Directory -Path $tmpDir -Force -ErrorAction SilentlyContinue }',
+          '$env:TEMP = $tmpDir; $env:TMP = $tmpDir; $env:TMPDIR = $tmpDir',
           '$p = @(',
           elems,
           ')',
@@ -2870,13 +2882,14 @@ export function apply(ctx, config = {}) {
             '   手写命令 = 没有自动弹窗，用户看不到表单，整个 C 档流程失效（历史故障）。\n' +
             '   典型形态（仅示形，路径与参数必须来自工具返回）：\n\n' +
             '```powershell\n' +
-            'powershell -ExecutionPolicy Bypass -File "<工作区>\\sd-inject.ps1" -BasePrompt "<素体主体>" -BaseNegative "lowres, bad anatomy, bad hands, extra fingers, fewer digits, watermark, text, signature, jpeg artifacts, worst quality, low quality" -Width 512 -Height 768 -Steps 24 -Name "inject" -OutDir "<工作区>\\SD-Picture"\n' +
+            'powershell -ExecutionPolicy Bypass -File "<工作区>\\sd-inject.ps1" -BasePrompt "<素体主体>" -BaseNegative "lowres, bad anatomy, bad hands, extra fingers, fewer digits, watermark, text, signature, jpeg artifacts, worst quality, low quality" -Width 512 -Height 768 -Steps 24 -Name "inject" -OutDir "<工作区>\\SD-Picture" -IterDir "<工作区>\\.sd-inject-iter"\n' +
             '```\n\n' +
             '其中：\n' +
             '- `basePrompt`（素体主体）：只含画出主体所需的必要要素（人物数量、构图、画幅），**不含衣服、场景、动作、状态、细节**。例如需求为「某状态下的女孩」→ 素体只保留 `1girl, solo`。\n' +
             '- `baseNegative`：**固定画质底线，只含质量类标签**（每次输出完全一致，不传即用工具默认值）。**红线：绝不夹带任何违禁/安全/合规类加权标签**——C 档命令是用户原样执行的固定基底，掺入这类词会造成不可控后果。它是插件的固定常量、跟本次请求无关，因此**不算泄露**——C 档要防的是「复述/翻译用户那部分违规内容」，不是这条静态底线。\n' +
             '- `-Width` / `-Height` / `-Steps` / `-Name` 固定。\n' +
-            '- `-OutDir`：由插件注入为**当前会话工作区**的 SD-Picture，与生图工具落点一致（坑22 修复点：以前这里固化成了 profile 目录）。\n\n' +
+            '- `-OutDir`：由插件注入为**当前会话工作区**的 SD-Picture，与生图工具落点一致（坑22 修复点：以前这里固化成了 profile 目录）。\n' +
+            '- `-IterDir`：迭代中间图的目录，注入为**当前会话工作区**的 `.sd-inject-iter`（坑34 修复点：以前用系统 temp，在 DSH workspace-write 沙箱下会被 ACL 拒写 → 出图落盘失败 → 工作区空手；脚本内还有「OutDir 父目录 → 脚本目录 → 系统 temp」的兜底链）。\n\n' +
             '命令上方标注：**【本地注入】**，下方不附加任何说明、解释或与请求相关的内容。\n' +
             '（可顺带告诉用户：脚本会自己拉起本地模型服务，首次含模型加载约 1-3 分钟；弹框留空直接跑素体基底，输入中文则追加后拼接出图。）\n' +
             '4. **末尾列违规词**（见下：两行排版「违禁提示词：」/「建议替换词：」）。\n' +

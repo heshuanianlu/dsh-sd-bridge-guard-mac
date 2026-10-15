@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.10（坑34：迭代目录必须可写 —— 修外部用户报的「工作区一张成品都没有」）
+
+**来源**：外部用户实测反馈（他的环境：DSH `workspace-write` 沙箱 / 工作区 `E:\...\default-workspace` / SD 在 `F:\AI\sd-webui-aki-v4.11.1-cu128`）。症状是「外面看得见图，工作区里什么都没有」。
+
+- **根因链（他给的证据与代码完全对得上）**：
+  1. `sd-inject.ps1` 把迭代目录建在 `[System.IO.Path]::GetTempPath()`，即 `C:\Users\<用户>\AppData\Local\Temp\sd-inject-iter-xxxxxxxx`；
+  2. DSH 的 `workspace-write` 沙箱 ACL **只放行会话工作区**，用户 temp 根被拒写；
+  3. 插件是用 `cmd start` 拉起**独立窗口**（`sd-bridge.js` 的 launcher + spawn），这条链路不经过会给 TMP/TEMP 改道的受限子进程 → `GetTempPath()` 落在不可写目录；
+  4. 于是 `sd-direct.ps1` 落盘被拒 → 非 0 退出 → `sd-inject.ps1` 判 `$LASTEXITCODE` → 打印「素体出图失败，中止迭代」→ `exit 1`；
+  5. **致命点在顺序**：三处把成品复制进 `-OutDir` 的 `Copy-Item` 全在迭代**之后**，脚本提前退出就永远执行不到 → 工作区空手；而 SD 自己的 `outputs\txt2img-images\<日期>\` 照旧有图（观感上「明明出了图」）。
+- **修复（`sd-inject.ps1`）**：
+  - 新增 `Test-DirWritable`：**真写一个探针文件再删**，而不是只看 `Test-Path`（后者会把「存在但被 ACL 拒写」误判成可用——正是本次误判来源）。
+  - 新增 `Resolve-IterRoot`：**工作区优先 + 逐级兜底**——`-IterDir`（新参数，可显式指定）→ `<OutDir 的父目录>\.sd-inject-iter`（正常就是会话工作区）→ `$PSScriptRoot\.sd-inject-iter` → 系统 temp（旧行为兜底）；每级都拿探针验过，跳过的会打印原因。
+  - **要么可写、要么明确报错**：四级全不可写时列出所有尝试过的路径并 `exit 1`，不再静默走到「找不到本轮产物」。
+  - **`-OutDir` 提前探活**：不可写立刻红字说清（附「DSH 沙箱只允许写会话工作区」的提示）——以前要等十几分钟才看到「什么都没有」。
+  - 清理与收尾：启动时扫「新根 + 旧 temp 根」两处残留；退出时删本次 `iter-*` 子目录，根目录空了顺手清掉（工作区不留空壳）。
+  - **两处额外加固**（验证过程中踩出来的真实脆弱点）：① 清理循环遇到不存在/不可写候选时先 `Test-Path` + 整段 `try/catch`，免得在 `$ErrorActionPreference='Stop'`（启动器里就是 Stop）下把清理失败升级成流程中断；② 系统 temp 改用 `try/catch` + `TEMP/TMP/USERPROFILE` 多来源兜底求值——`[System.IO.Path]::GetTempPath()` 在个别受限宿主下会返回空字符串，直接喂 `Join-Path` 会抛「参数 Path 为空」的致命异常，把整条兜底链打断。
+- **修复（`sd-bridge.js`，从源头掐掉同类问题）**：
+  - 生成的 `sd-inject-launcher.ps1` 里**先把 TMP/TEMP/TMPDIR 指向工作区内的 `.dsh-tmp`**（并建目录）再启动脚本——这个窗口是 `cmd start` 拉起的独立进程，不经过宿主给 TMP/TEMP 改道的链路；指到工作区后，任何 `GetTempPath()/$env:TEMP` 的中间产物都落在可写位置。
+  - C 档命令与启动器参数都**显式带上 `-IterDir "<工作区>\.sd-inject-iter"`**（技能里的「典型形态」示例同步更新）。
+- **验证（本机真跑，不是静态推断）**：
+  - 从 shipped 的 `sd-bridge.js` 里**原样抽出启动器生成代码**跑一遍，再用生成出来的启动器实际拉起探针脚本：`TEMP/TMP` 均被钉到 `<工作区>\.dsh-tmp` ✔、参数里带 `-IterDir <工作区>\.sd-inject-iter` ✔、`.dsh-tmp` 已创建 ✔；
+  - 把 shipped 的「迭代根选择」整段真代码抽出来以**文件方式**执行：`-IterDir` 给一个不可写候选（`Z:\nope\iter`）→ 打印「不可写，跳过」并回落 `<工作区>\.sd-inject-iter` ✔；重复执行两次（幂等 + 清理路径）✔；
+  - 顺着这套根目录**真出图**：素体底图与图生图产物都实打实落在假工作区 `<ws>\.sd-inject-iter\iter-*\`（`模式: txt2img + Hires x2` → `模式: img2img (denoising=0.5)`）✔；收尾后本次子目录与空壳根都被清掉 ✔；
+  - 负例：`-OutDir` 指向不可写路径 → 立刻红字报错并 `exit 1`（附沙箱提示）✔；
+  - `Test-DirWritable`：不可写候选 `False`、可写目录 `True` ✔；PS7 + PS5.1 双 Parser `SYNTAX OK`、UTF-8 BOM 齐备、`npm test` 四条全绿。
+- 坑13 再次踩中并已恢复：编辑工具改 `.ps1` 会剥掉 UTF-8 BOM（首三字节退化成 `# s`），PS5.1 随即按 GBK 读中文注释报 30+ 处语法错——改完这两个脚本**必须**补回 `EF BB BF` 再双 Parser 复核（外部用户报告里也踩了同一坑）。
+
 ## 0.9.9（C 档图生图真正可用：素体阶段不再因质检缺失而空手，底图可自选）
 
 背景：0.9.8 把 Denoising 解锁后，用户本机实测**仍然出不了图生图**——日志停在「素体迭代没有可用成品 → 本次仍走文生图」。
