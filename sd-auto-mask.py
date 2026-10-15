@@ -292,6 +292,24 @@ def main():
             except Exception:
                 pass
 
+
+    # 脸禁区：衣服蒙版绝不许盖到脸（否则「换衣服」会顺手把脸重画 —— 实测多件合一曾把整张脸吞进去）。
+    face_box = None
+    if args.target == "衣服":
+        _fm = find_file([args.sd_dir or ""], ["face_yolov8*.pt", "*face*.pt"], min_mb=0.5)
+        if _fm:
+            try:
+                from ultralytics import YOLO
+                _fmod = YOLO(_fm[0])
+                _fp = _fmod.predict(img_bgr, conf=0.3, verbose=False)[0]
+                if _fp.boxes is not None and len(_fp.boxes):
+                    _fb = _fp.boxes.xyxy.cpu().numpy()
+                    face_box = (float(_fb[:, 0].min()), float(_fb[:, 1].min()),
+                                float(_fb[:, 2].max()), float(_fb[:, 3].max()))
+                del _fmod
+            except Exception:
+                pass
+
     # 衣服：再补一路「人物剪影取点」——按人物轮廓逐行取中线，落在躯干/腿部，
     # 不依赖 YOLO 框（框不准时点会落到头发上，实测会把头发+披风当衣服）。
     if args.target == "衣服" and person_mask_for_points is not None:
@@ -362,6 +380,7 @@ def main():
                 best = None
                 best_cov = 9.9
                 best_tag = ""
+                parts = []          # 合格零件（每件 ≤18%、过肩线守卫）→ 最后并成整套
                 cand_sets = [np.array(garment_points[0]) * work_scale]
                 if boxes:
                     bx = boxes[0]
@@ -391,6 +410,15 @@ def main():
                             if not (0.02 <= cov <= 0.34):
                                 continue
                             arr_full = _back(cand)
+                            if face_box is not None:
+                                _fx1, _fy1, _fx2, _fy2 = face_box
+                                _pw2 = 0.06 * (_fx2 - _fx1); _ph2 = 0.06 * (_fy2 - _fy1)
+                                _gx1 = max(0, int(_fx1 - _pw2)); _gy1 = max(0, int(_fy1 - _ph2))
+                                _gx2 = min(W, int(_fx2 + _pw2)); _gy2 = min(H, int(_fy2 + _ph2))
+                                _facepx = int((arr_full[_gy1:_gy2, _gx1:_gx2] > 127).sum())
+                                _tot = int((arr_full > 127).sum()) or 1
+                                if _facepx / float(_tot) > 0.08:
+                                    continue      # 这块压到脸了，不是衣服
                             # 硬约束：衣服不可能在头顶 —— 蒙版上沿若高于「人物上沿 + 8% 身高」就丢掉
                             if person_box is not None and not args.no_shoulder_guard:
                                 _m = cv2.resize(arr_full, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -399,6 +427,8 @@ def main():
                                     top_limit = person_box[0] + 0.08 * (person_box[1] - person_box[0])
                                     if float(_ys3.min()) < top_limit:
                                         continue
+                            if cov <= 0.18 and all(float((p > 127).mean()) != cov or True for p in parts):
+                                parts.append(arr_full)
                             if cov < best_cov:
                                 best_cov = cov
                                 best = arr_full
@@ -406,6 +436,16 @@ def main():
                 if best is not None:
                     mask_full = best
                     notes.append(f"衣服：{best_tag} 挑出织物级掩膜（覆盖 {best_cov:.1%}）")
+                    # 多件合一：把各合格零件并起来（水手服=衬衫+裙+领结、大衣=大衣+围巾）。
+                    # 只有在并集不超 30% 时才采用 —— 超了就退回单件，避免把身体一起吞进来。
+                    if len(parts) >= 2:
+                        _u = np.zeros_like(best)
+                        for _p in parts:
+                            _u = np.maximum(_u, _p)
+                        _uc = float((_u > 127).mean())
+                        if 0.02 <= _uc <= 0.30 and _uc > float((best > 127).mean()) * 1.08:
+                            mask_full = _u
+                            notes.append(f"多件合一：{len(parts)} 件 → 并集覆盖 {_uc:.1%}")
                 else:
                     notes.append("衣服：点提示没给出织物级掩膜（要么过小、要么罩住整个人）→ 请改用 box: 精确框或蒙版图")
             else:
@@ -451,6 +491,43 @@ def main():
     # ---------- ③ 后处理：闭运算补洞 → 膨胀 → 羽化 ----------
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, k)
+    # 行内连通桥接：同一件衣服常被 SAM 拆成几块（水手服只抠到领结、大衣只抠到一节围巾）。
+    # 做法：逐行取蒙版的最左/最右，若这一段的宽度不超过「该行人物宽度」的 70%，就把这段填满。
+    # 只在人物剪影内填，且总覆盖不得超 32%（超了退回原蒙版）——不会吞掉整幅或背景。
+    try:
+        if args.target == "衣服" and (mask_full > 127).any():
+            _before = float((mask_full > 127).mean())
+            _bridged = mask_full.copy()
+            _rows = np.where((mask_full > 127).any(axis=1))[0]
+            if len(_rows):
+                _r0, _r1 = int(_rows.min()), int(_rows.max())
+                for _y in range(_r0, _r1 + 1):
+                    _xs = np.where(mask_full[_y] > 127)[0]
+                    if len(_xs) < 2:
+                        continue
+                    _xl, _xr = int(_xs.min()), int(_xs.max())
+                    _span = _xr - _xl + 1
+                    if person_mask_for_points is not None:
+                        _pxs = np.where(person_mask_for_points[_y] > 127)[0]
+                        if len(_pxs) == 0:
+                            continue
+                        _pw = int(_pxs.max()) - int(_pxs.min()) + 1
+                        if _span > 0.70 * _pw:
+                            continue
+                    else:
+                        if _span > 0.70 * W:
+                            continue
+                    _bridged[_y, _xl:_xr + 1] = 255
+            _after = float((_bridged > 127).mean())
+            if _after <= 0.32 and (_after > _before or _after < 0.32):
+                if abs(_after - _before) > 1e-6:
+                    mask_full = _bridged
+                    notes.append(f"行内连通桥接：{_before:.1%} → {_after:.1%}")
+            else:
+                notes.append(f"桥接后过大（{_after:.1%}）→ 保持原蒙版")
+    except Exception:
+        pass
+
     # 颜色一致性生长：SAM 常只切到衣服的一小块布片（<6%）。用 LAB 颜色距离把**与这块同色、
     # 且与之连通**的区域并进来 —— 同一件衣服颜色一致，皮肤/头发/背景颜色不同，所以不会越界。
     # 有上限：生长后不得超 32%，且至少长出 1.5 倍才采用。
@@ -477,6 +554,23 @@ def main():
                         notes.append(f"颜色生长幅度不合适（{_cov0:.1%} → {_cov1:.1%}）→ 保持原蒙版")
     except Exception:
         pass
+
+    # 脸禁区兜底：无论前面怎么合并，最终把脸从蒙版里减掉（衣领贴着下巴也不会碰脸）。
+    if face_box is not None:
+        try:
+            _fx1, _fy1, _fx2, _fy2 = face_box
+            _pw3 = 0.06 * (_fx2 - _fx1); _ph3 = 0.06 * (_fy2 - _fy1)
+            _gx1b = max(0, int(_fx1 - _pw3)); _gy1b = max(0, int(_fy1 - _ph3))
+            _gx2b = min(W, int(_fx2 + _pw3)); _gy2b = min(H, int(_fy2 + _ph3))
+            _bf = float((mask_full > 127).mean())
+            _tmp2 = mask_full.copy()
+            _tmp2[_gy1b:_gy2b, _gx1b:_gx2b] = 0
+            _af = float((_tmp2 > 127).mean())
+            if _af > 0.005:
+                mask_full = _tmp2
+                notes.append(f"已扣除脸区（{_bf:.1%} → {_af:.1%}）")
+        except Exception:
+            pass
 
     # 只留最大连通块（去掉蝴蝶/花点等误检碎块；碎块会让无关区域被重画）
     try:

@@ -648,3 +648,17 @@ assert.ok(/if \(\$Mode -eq '图生图' -and \$preInitPath\)/.test(injectPs1), '�
 assert.ok(/elseif \(\$mspec -match '\^box'\)/.test(injectPs1), '精确框 box: 必须原样锁定（不再画）')
 assert.ok(/MaskDefault \$\(if \(\$preMaskText\)/.test(injectPs1), '表单蒙版默认值必须优先用对话画好的蒙版')
 console.log('PREDRAW+LOCK SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 服装蒙版再训练（2026-10-15，第三批图）：多件合一 + 行内桥接 + 脸禁区。
+// 现象：水手服只抠到领结、大衣只抠到一节围巾；多件合一时曾把整张脸吞进去（换衣服顺手重画脸）。
+// ---------------------------------------------------------------------------
+assert.ok(/parts = \[\]/.test(autoMaskPy) && /多件合一/.test(autoMaskPy), '必须有「多件合一」（各合格零件并集，上限 30%）')
+assert.ok(/行内连通桥接/.test(autoMaskPy), '必须有行内连通桥接（把同一件衣服被拆开的部分补成整块）')
+assert.ok(/face_box = None/.test(autoMaskPy) && /face_yolov8/.test(autoMaskPy), '必须检测人脸框（脸禁区基准）')
+assert.ok(/_facepx \/ float\(_tot\) > 0\.08/.test(autoMaskPy), '压到脸的候选必须被丢弃（>8% 重叠）')
+assert.ok(/已扣除脸区/.test(autoMaskPy), '最终蒙版必须减去脸区（兜底）')
+assert.ok(/已补全薄纱区/.test(autoMaskPy), '薄纱/透视布料补全必须存在')
+assert.ok(/--no-shoulder-guard/.test(autoMaskPy) && /--grow/.test(autoMaskPy), '肩线守卫与颜色生长开关必须存在')
+console.log('GARMENT-V2 SMOKE OK')
