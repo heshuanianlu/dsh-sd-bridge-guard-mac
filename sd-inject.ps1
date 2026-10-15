@@ -67,6 +67,8 @@ Add-Type -AssemblyName System.Drawing
 # OutDir 默认 = 脚本所在目录下的 SD-Picture（与 sd-direct.ps1 / 工具落点保持一致，
 # 不受用户运行时的当前目录影响）；用户显式传了 -OutDir 则照用。
 if ($OutDir -eq "") { $OutDir = Join-Path $PSScriptRoot "SD-Picture" }
+# 控制台按 UTF-8 输出：否则 PS5.1 老窗口里中文进度会变乱码（本脚本大量中文日志）
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 if ($SdDirect -eq "") {
     $SdDirect = Join-Path $PSScriptRoot "sd-direct.ps1"
 }
@@ -729,8 +731,41 @@ function New-AutoMaskFromImage {
         $sdRootForHelper = $script:SdRoot
     }
     if ($sdRootForHelper) { $args += @('--sd-dir', $sdRootForHelper) }
-    $out = ''
-    try { $out = & $py @args 2>$null | Select-Object -Last 1 } catch { $script:AutoMaskNote = "抠图脚本调用失败：$($_.Exception.Message)"; return '' }
+    # 逐行实时转发抠图进度（用户能看见在算），并加硬超时（默认 240 秒）防止真卡死
+    $outFile = Join-Path $env:TEMP ("automask-" + [Guid]::NewGuid().ToString('N') + ".log")
+    $errFile = "$outFile.err"
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $py -ArgumentList $args -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $deadline = (Get-Date).AddSeconds(240)
+        $shown = 0
+        while (-not $proc.HasExited) {
+            Start-Sleep -Milliseconds 500
+            $lines = @()
+            if (Test-Path -LiteralPath $errFile) { $lines = @(Get-Content -LiteralPath $errFile -Encoding UTF8 -ErrorAction SilentlyContinue) }   # 必须按 UTF8 读，否则中文进度变乱码
+            while ($shown -lt $lines.Count) {
+                $ln = "$($lines[$shown])".Trim()
+                if ($ln) { Write-Host "  $ln" -ForegroundColor DarkGray }
+                $shown++
+            }
+            if ((Get-Date) -gt $deadline) {
+                try { $proc.Kill() } catch { }
+                $script:AutoMaskNote = '抠图超时（240 秒）已中止'
+                Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
+                return ''
+            }
+        }
+        $raw = @()
+        if (Test-Path -LiteralPath $outFile) { $raw = @(Get-Content -LiteralPath $outFile -Encoding UTF8 -ErrorAction SilentlyContinue) }   # JSON 是 UTF8，按 GBK 读会把中文读成乱码导致解析失败
+        $out = "$(($raw | Where-Object { $_ -like '{*' } | Select-Object -Last 1))".Trim()
+    } catch {
+        $script:AutoMaskNote = "抠图脚本调用失败：$($_.Exception.Message)"
+        Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
+        return ''
+    } finally {
+        Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
+    }
     if (-not $out) { $script:AutoMaskNote = '抠图脚本没有输出'; return '' }
     $json = $null
     try { $json = $out | ConvertFrom-Json } catch { $script:AutoMaskNote = "抠图输出解析失败：$out"; return '' }

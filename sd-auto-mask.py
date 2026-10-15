@@ -111,6 +111,8 @@ def main():
     ap.add_argument("--max-words", type=int, default=10, help="逐词检测最多试几个词（命中即停）")
     args = ap.parse_args()
 
+
+    print("[抠图] 开始（加载检测模型约 10-20 秒，请稍候…）", file=sys.stderr, flush=True)
     result = {"ok": False, "engine": "", "boxes": 0, "coverage": 0.0,
               "mask": "", "labels": [], "notes": ""}
     notes = []
@@ -129,6 +131,8 @@ def main():
         return 0
 
     # Windows 中文/非 ASCII 路径：cv2.imread 直接失败（OpenCV 老限制）→ np.fromfile + imdecode
+
+    print("[抠图] 读取参考图…", file=sys.stderr, flush=True)
     img_bgr = None
     try:
         buf = np.fromfile(args.image, dtype=np.uint8)
@@ -169,6 +173,8 @@ def main():
         world_weights = find_file(roots, ["*world*.pt"], min_mb=1)
         if world_weights:
             try:
+
+                print("[抠图] YOLO-World 文字提示检测中…", file=sys.stderr, flush=True)
                 from ultralytics import YOLO
                 scale = min(1.0, args.max_side / max(H, W))
                 im = cv2.resize(img_bgr, None, fx=scale, fy=scale) if scale < 1 else img_bgr
@@ -362,6 +368,8 @@ def main():
             img_work = cv2.resize(img_bgr, None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA) if work_scale < 1 else img_bgr
             sam = sam_model_registry[kind](checkpoint=sam_path).to(device)
             predictor = SamPredictor(sam)
+
+            print("[抠图] SAM 分割中…", file=sys.stderr, flush=True)
             predictor.set_image(cv2.cvtColor(img_work, cv2.COLOR_BGR2RGB))
             def _back(m):
                 a = (m.astype(np.uint8)) * 255
@@ -491,6 +499,8 @@ def main():
     # ---------- ③ 后处理：闭运算补洞 → 膨胀 → 羽化 ----------
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, k)
+
+    print("[抠图] 后处理（桥接/扣脸/薄纱/羽化）…", file=sys.stderr, flush=True)
     # 行内连通桥接：同一件衣服常被 SAM 拆成几块（水手服只抠到领结、大衣只抠到一节围巾）。
     # 做法：逐行取蒙版的最左/最右，若这一段的宽度不超过「该行人物宽度」的 70%，就把这段填满。
     # 只在人物剪影内填，且总覆盖不得超 32%（超了退回原蒙版）——不会吞掉整幅或背景。
