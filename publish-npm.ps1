@@ -22,7 +22,7 @@
 param(
     [string]$Otp = "",
     [string]$Token = "",
-    [string]$Tarball = "D:\DSWorkPlace\release\dsh-sd-bridge-guard-0.9.14.tgz",
+    [string]$Tarball = "",                                  # 留空 = 自动取插件目录里最新的 dsh-sd-bridge-guard-*.tgz
     [string]$PluginDir = "C:\Users\zhang\.dsh\profiles\desktop\node_modules\dsh-sd-bridge-guard",
     [switch]$DryRun
 )
@@ -46,8 +46,21 @@ if (-not $isTTY) { Write-WarnNote "输出被重定向（非交互终端）：npm
 Write-Step "0/5 环境检查"
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Fail "找不到 npm（先装 Node.js 并确保在 PATH 里）" }
 Write-Ok ("npm " + (npm -v))
+if (-not $Tarball) {
+    # 自动挑最新的包：优先插件目录（npm pack 的落点），其次 release 目录
+    $cands = @()
+    foreach ($dir in @((Split-Path -Parent $MyInvocation.MyCommand.Path), 'D:\DSWorkPlace\release', 'D:\DSWorkPlace')) {
+        if ($dir -and (Test-Path -LiteralPath $dir)) {
+            $cands += @(Get-ChildItem -LiteralPath $dir -Filter 'dsh-sd-bridge-guard-*.tgz' -File -ErrorAction SilentlyContinue)
+        }
+    }
+    if ($cands.Count -gt 0) {
+        $Tarball = ($cands | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+        Write-Ok ("自动选中最新 tarball：" + $Tarball)
+    }
+}
 if (-not (Test-Path -LiteralPath $Tarball)) {
-    Fail "找不到 tarball：$Tarball`n       先在插件目录跑 npm pack，或改 -Tarball 指向你的包"
+    Fail "找不到 tarball（-Tarball 留空也没自动找到）：先在插件目录跑 npm pack"
 }
 $tb = Get-Item -LiteralPath $Tarball
 Write-Ok ("tarball: " + $tb.FullName + "（" + [math]::Round($tb.Length / 1KB, 1) + " KB）")
