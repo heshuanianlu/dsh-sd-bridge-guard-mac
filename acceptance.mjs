@@ -137,8 +137,8 @@ assert.ok(e2.script.command.includes(`-InitImage "${e2.source}"`), '脚本必须
 assert.ok(!e2.script.command.includes(tmpRef), '脚本不得再引用临时路径')
 fs.rmSync(tmpRef, { force: true })
 
-// 6c) sd_script 同样固化 B 档参考图
-const tmpRef2 = path.join(os.tmpdir(), 'chat-attachment-b-tier.png')
+// 6c) sd_script 同样固化参考图
+const tmpRef2 = path.join(os.tmpdir(), 'chat-attachment-script.png')
 fs.copyFileSync(a.paths[0], tmpRef2)
 const sB = await tools.get('sd_script').execute({ prompt: '1girl, white sheet', initImage: tmpRef2 }, exec)
 assert.ok(sB.command.includes(`-InitImage "${refDir}${path.sep}`), `sd_script 应固化参考图，实际：${sB.command}`)
@@ -146,8 +146,12 @@ assert.ok(!sB.command.includes(tmpRef2))
 assert.ok(fs.existsSync(/-InitImage "([^"]+)"/.exec(sB.command)[1]))
 fs.rmSync(tmpRef2, { force: true })
 
-// 7) sd_script：B 档（明显违规）只出脚本不生图——纯命令生成，不碰 SD
-assert.deepEqual([...tools.keys()], ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_models', 'sd_server'])
+// 7) sd_script / sd_script_b / sd_inject：只出脚本不生图——纯命令生成，不碰 SD
+//    （C 档 · 完全拒绝不再走这两个工具，改由 sd_inject 生成 sd-inject.ps1 本地注入命令）
+assert.deepEqual(
+  [...tools.keys()],
+  ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_script_b', 'sd_inject', 'sd_models', 'sd_server'],
+)
 const before = fs.readdirSync(outDir).length
 const s = await tools.get('sd_script').execute(
   { prompt: '1girl, white sheet, soft light, masterpiece', initImage: a.paths[0], denoising: 0.65, seed: 123 },
@@ -168,6 +172,84 @@ assert.ok(s2.command.includes('-Name "shorekeeper"'))
 assert.equal(fs.readdirSync(outDir).length, before)
 console.log('sd_script(i2i):', s.command)
 console.log('sd_script(t2i):', s2.command)
+
+// 7b) sd_script_b：双版本逐位置对齐（纯命令生成，不碰 SD）——prompt 保序留正向、original 的差异词进负向
+const sbTool = tools.get('sd_script_b')
+assert.ok(sbTool, 'sd_script_b missing')
+const sb = await sbTool.execute(
+  {
+    originalPrompt: '1girl, white sheet, soft light, masterpiece',
+    prompt: '1girl, blue silk sheet, soft light, masterpiece',
+    negativePrompt: 'lowres',
+    initImage: a.paths[0],
+    denoising: 0.7,
+    seed: 123,
+  },
+  exec,
+)
+assert.equal(sb.generatesImage, false)
+assert.equal(sb.positivePrompt, '1girl, blue silk sheet, soft light, masterpiece', '当前版本（prompt）必须保序留正向')
+assert.equal(sb.negativePrompt, 'white sheet, lowres', 'original 的差异词 + negativePrompt 必须进负向')
+assert.ok(sb.command.startsWith(`powershell -ExecutionPolicy Bypass -File "${directPs1}"`))
+assert.ok(sb.command.includes('-Negative "white sheet, lowres"'), sb.command)
+assert.ok(!sb.command.includes('\n') && !sb.command.includes('& '))
+assert.equal(sb.mode, '图生图')
+const sb2 = await sbTool.execute({ originalPrompt: '', prompt: '1girl, silver hair', name: 'dualbase' }, exec)
+assert.equal(sb2.positivePrompt, '1girl, silver hair', '只传 prompt 时退化为全部保留正向')
+assert.equal(sb2.mode, '文生图')
+assert.ok(!sb2.command.includes('-Negative'), sb2.command)
+
+// 7c) sd_script_b 蒙版重绘：maskBox 现场造蒙版，模式与参数跟 sd_inpaint 对齐（纯命令生成，不碰 SD）
+const sbMask = await sbTool.execute(
+  {
+    originalPrompt: '1girl, white sheet, masterpiece',
+    prompt: '1girl, white sheet, masterpiece',
+    initImage: a.paths[0],
+    maskBox: '64,64,128,96',
+  },
+  exec,
+)
+assert.equal(sbMask.mode, '蒙版重绘')
+assert.ok(fs.existsSync(sbMask.mask), `maskBox 生成的蒙版必须落盘：${sbMask.mask}`)
+assert.ok(sbMask.mask.startsWith(refDir + path.sep), `maskBox 生成的蒙版应在 ref\\ 下：${sbMask.mask}`)
+assert.equal(sbMask.mask.endsWith('.png'), true)
+assert.ok(sbMask.command.includes('-Mask "') && sbMask.command.includes('-InitImage'), sbMask.command)
+assert.ok(
+  sbMask.command.includes('-MaskBlur 4') && sbMask.command.includes('-InpaintFill 0') && sbMask.command.includes('-InpaintPadding 32'),
+  sbMask.command,
+)
+assert.ok(sbMask.asMarkdown.startsWith('【蒙版重绘】\n```powershell'))
+await assert.rejects(
+  () => sbTool.execute({ originalPrompt: 'a', prompt: 'a', maskBox: '1,1,4,4' }, exec),
+  /必须同时给 initImage/,
+)
+// sd_script_b（含蒙版模式）同样不落任何新图
+assert.equal(fs.readdirSync(outDir).length, before)
+console.log('sd_script_b(t2i):', sb2.command)
+console.log('sd_script_b(mask):', sbMask.command)
+
+// 7d) 坑22 回归：C 档命令由 sd_inject 在**调用时**生成，脚本路径与 -OutDir 都必须落在
+//     会话工作区（outDir 的父目录）；此前技能里固化的是 apply 时的 process.cwd()——
+//     DSH 宿主进程目录（profile 目录），用户跑它就把图存进了 profile\SD-Picture。
+const injectTool = tools.get('sd_inject')
+assert.ok(injectTool, 'sd_inject missing')
+const injBase = fs.readdirSync(outDir).length
+const inj = await injectTool.execute({ basePrompt: '1girl, solo, upper body, simple background' }, exec)
+assert.equal(inj.mode, '本地注入')
+assert.equal(inj.generatesImage, false, 'sd_inject 不得生图')
+assert.equal(inj.scriptPath, path.join(ws, 'sd-inject.ps1'))
+assert.ok(inj.command.startsWith(`powershell -ExecutionPolicy Bypass -File "${path.join(ws, 'sd-inject.ps1')}"`), inj.command)
+assert.ok(inj.command.includes(`-OutDir "${outDir}"`), `C 档命令必须显式注入工作区 -OutDir：${inj.command}`)
+assert.ok(inj.command.includes('-BasePrompt "1girl, solo, upper body, simple background"'), inj.command)
+assert.ok(inj.command.includes('-BaseNegative "lowres'), inj.command)
+assert.ok(
+  !inj.command.includes('(nsfw:1.6)') && !inj.command.includes('nudity'),
+  `-BaseNegative 只能含画质底线，不得夹带违禁/安全类标签（用户红线）：${inj.command}`,
+)
+assert.ok(inj.asMarkdown.startsWith('【本地注入】\n```powershell'))
+assert.ok(!inj.command.includes('profiles'), `C 档命令不得指向 profile 目录：${inj.command}`)
+assert.equal(fs.readdirSync(outDir).length, injBase, 'sd_inject 只出命令，不落任何图')
+console.log('sd_inject(C 档):', inj.command)
 
 // 8) 真跑一遍可复现脚本：用 powershell.exe（PS5.1 语义）执行——
 //    a) .ps1 必须带 UTF-8 BOM，否则 PS5.1 按 GBK 读中文注释会直接语法错（坑13）

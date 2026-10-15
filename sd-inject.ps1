@@ -1,0 +1,1096 @@
+﻿# sd-inject.ps1 —— 本地提示词注入脚本（素体自检迭代 + 素体基底 + 参数表单）
+# 流程：素体自检迭代（只跑基底，换 seed + 面部修复重试到脸/手不崩；正向自动追加脸部细节词）
+#   → 出图参数表单（一次填完）：正向/负向提示词[基底已预填，多行文本框可直接改] / 迭代次数[默认32] / Denoising[默认0.7] / 比例[默认9:16] / 画风[默认二次元，图生图默认保持画风] / 画质[默认480p，最高2160p（4K）] / LoRA[可选，从 SD 拉取列表] / 取消退出
+#   → 最终出图：有素体成品走图生图（-InitImage + Denoising），最终图同样按迭代次数做脸/手质检迭代，取最高分那张
+# 迭代产物全部写入系统临时目录（**不进工作区**），最终只把脸/手最高分的一张复制进 -OutDir，
+# 脚本退出（含取消/失败）时删除整个临时迭代目录——工作区里永远只有成品。
+# 全程本地运行（SD 与脸/手质检的视觉模型都在本机）。
+# 用法：
+#   .\sd-inject.ps1                                    # 基底 + 表单直接跑
+#   .\sd-inject.ps1 -BasePrompt "1girl, solo, portrait" -Width 512 -Height 768 -Name "inject" -NoOpen
+# 跨机器说明：
+#   - 脸/手质检走本地视觉模型（-VlmModel，默认 qwen3-vl:8b，Ollama OpenAI 兼容端点 -QwenBase）；
+#     接口没起来时质检自动跳过，不阻塞出图。
+#   - 脸部细节词（-FaceBoostTags）自动追加进正向提示词，提升脸部质量；不想加传 ""。
+#   - LoRA 在表单里选（SD 在跑时自动拉取本机列表）；只作用于最终出图（素体迭代先于表单）。
+#   - -SdDirect 不传时取本脚本同目录的 sd-direct.ps1；-OutDir 不传时存到「脚本所在目录\SD-Picture」
+#     （不受运行时的当前目录影响，保证与 sd-bridge 工具的落点一致）。
+#   - 素体自检迭代（默认开）：出图前先用基底提示词试跑，换 seed 重试 + 面部修复，直到脸/手质检过关
+#     （本地视觉模型打分）或到轮数上限；期间**只改 seed / 面部修复 / 脸部细节词，不改用户提示词**。
+#     `-NoIterate` 关闭（直接出一张，老行为）；`-IterateRounds N` 调轮数（默认 3）。
+
+param(
+    [string]$BasePrompt = "1girl, solo",
+    [string]$BaseNegative = "lowres, bad anatomy, bad hands, extra fingers, fewer digits, watermark, text, signature, jpeg artifacts, worst quality, low quality",
+    [string]$FaceBoostTags = "detailed face, beautiful detailed eyes, perfect face, detailed skin",   # 脸部细节词：自动追加进正向（用户要求）
+    [string]$QwenBase = "http://127.0.0.1:11434/v1",   # 本地视觉质检接口（OpenAI 兼容）
+    [string]$QwenApiKey = "ollama",                    # API Key（Ollama 任意非空即可）
+    [int]$IterateRounds = 3,                           # 素体自检迭代轮数上限（每轮换 seed + 面部修复，脸部过关即停）
+    [switch]$NoIterate,                                # 加 -NoIterate 则跳过素体自检迭代，直接出一张（老行为）
+    [string]$VlmModel = "qwen3-vl:8b",                 # 脸部质检用的本地视觉模型（留空 "" = 自动挑本机 vl/vision 模型）
+    [int]$SdPort = 7860,                               # SD API 端口（拉取 LoRA 列表用）
+    [int]$Width = 512,
+    [int]$Height = 768,
+    [int]$Steps = 24,
+    [double]$Cfg = 7,
+    [string]$Sampler = "DPM++ 2M",
+    [long]$Seed = -1,                                  # [long]：SD 的 seed 是 uint32（坑14）
+    [string]$OutDir = "",
+    [string]$Name = "inject",
+    [string]$SdDirect = "",                            # sd-direct.ps1 路径；留空则取脚本同目录
+    [string]$SdDir = "",
+    [switch]$NoOpen                                   # 加 -NoOpen 则跑完不自动打开这张图
+)
+
+# 启动诊断日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-start.log
+
+# ---- 清除旧进程/卡死任务（脚本执行最前面，用户要求）----
+# 1) 清空 SD 队列里卡死的 job（上次面部修复卡 100% 的残留会阻塞后续出图）
+try {
+    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/sdapi/v1/interrupt" -Method Post -TimeoutSec 5
+    Write-Host "已清空 SD 卡死任务（interrupt）" -ForegroundColor DarkGray
+} catch { }
+# 2) 清理残留的 sd-inject 迭代临时目录（上次运行中断遗留的）
+Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Directory -Filter "sd-inject-iter-*" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+Write-Host "已清理旧迭代临时目录" -ForegroundColor DarkGray
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# OutDir 默认 = 脚本所在目录下的 SD-Picture（与 sd-direct.ps1 / 工具落点保持一致，
+# 不受用户运行时的当前目录影响）；用户显式传了 -OutDir 则照用。
+if ($OutDir -eq "") { $OutDir = Join-Path $PSScriptRoot "SD-Picture" }
+if ($SdDirect -eq "") {
+    $SdDirect = Join-Path $PSScriptRoot "sd-direct.ps1"
+}
+if (-not (Test-Path -LiteralPath $SdDirect)) {
+    Write-Host "错误：找不到 sd-direct.ps1：$SdDirect" -ForegroundColor Red
+    exit 1
+}
+
+# ---- 迭代临时目录：所有中间图都写这里（不进工作区），退出时整体删除 ----
+$script:IterTempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sd-inject-iter-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$null = New-Item -ItemType Directory -Path $script:IterTempDir -Force
+# 清理兜底：正常退出、Ctrl+C、进程被杀（ finally 由 exit 触发）都尽量删掉临时目录
+$script:IterTempCleaned = $false
+function Remove-IterTempDir {
+    if ($script:IterTempCleaned) { return }
+    $script:IterTempCleaned = $true
+    if ($script:IterTempDir -and (Test-Path -LiteralPath $script:IterTempDir)) {
+        try { Remove-Item -LiteralPath $script:IterTempDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+# 在工作区 $OutDir 里找一个「不覆盖已有文件」的落盘路径：按 <Name>_<序号:D3>.png 递增，
+# 避免每次运行都从 inject_001 开始、用 -Force 覆盖上一次的成品（用户反馈：图片被覆盖）。
+function Get-UniqueOutPath {
+    param([string]$BaseName = "inject")
+    if (-not (Test-Path -LiteralPath $OutDir)) { $null = New-Item -ItemType Directory -Path $OutDir -Force }
+    $idx = 1
+    do {
+        $cand = Join-Path $OutDir ("{0}_{1:D3}.png" -f $BaseName, $idx)
+        $idx++
+    } while (Test-Path -LiteralPath $cand)
+    return $cand
+}
+
+# 从正向提示词总结一个简短文件名（取前几个英文标签，转成文件名安全的词）
+function Summarize-PromptName {
+    param([string]$Prompt)
+    if (-not $Prompt) { return "inject" }
+    # 去掉 LoRA 片段 <lora:...>、权重括号、特殊字符，取前 3 个词
+    $clean = $Prompt -replace '<lora:[^>]+>', ''
+    $clean = $clean -replace '[()\[\]:]', ' '
+    $words = @($clean -split '[,\s]+' | Where-Object { $_ -and $_ -match '^[a-zA-Z0-9_-]+$' })
+    if ($words.Count -eq 0) { return "inject" }
+    $summary = ($words | Select-Object -First 3) -join '_'
+    if ($summary.Length -gt 40) { $summary = $summary.Substring(0, 40) }
+    return $summary
+}
+
+# 坑24：PS5.1 / .NET Framework 在响应头没写 charset 时按 Latin-1(28591) 解码 UTF-8 正文，
+# UTF-8 的中文会变成「å°å¥³」这种双重编码文本。检测到 Latin-1 扩展字符就按原字节还原一次；
+# 纯 ASCII（正常情况下的英文标签）原样返回，不做任何改动。
+function Repair-Utf8Mojibake {
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    if ($Text -notmatch '[\u0080-\u00FF]') { return $Text }
+    try {
+        $bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($Text)
+        $fixed = [System.Text.Encoding]::UTF8.GetString($bytes)
+        return $fixed
+    } catch {
+        return $Text
+    }
+}
+
+# SD API 是否就绪（能回 200 才算；弹表单前预热/拉列表都用它判）
+function Test-SdApiReady {
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$SdPort/sdapi/v1/options" -Method Get -TimeoutSec 5 -UseBasicParsing
+        return ($r.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+# 从本机 SD API 拉取 LoRA 列表（SD 没开返回空数组，表单里显示「（无）」）
+# 坑24：SD 的 API 响应头不带 charset，PS5.1 按 Latin-1 解码 → 中文 LoRA 名乱码，逐个修复
+function Get-SdLoras {
+    $loras = @()
+    try {
+        $r = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/sdapi/v1/loras" -Method Get -TimeoutSec 5
+        if ($r) { $loras = @($r | ForEach-Object { Repair-Utf8Mojibake ([string]$_.name) }) }
+    } catch { }
+    return $loras
+}
+
+# 从本机 SD API 拉取 checkpoint 列表（同样要修乱码）
+function Get-SdCheckpoints {
+    $cps = @()
+    try {
+        $r = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/sdapi/v1/sd-models" -Method Get -TimeoutSec 5
+        if ($r) { $cps = @($r | ForEach-Object { Repair-Utf8Mojibake ([string]$_.title) }) }
+    } catch { }
+    return $cps
+}
+
+# LoRA 片段：<lora:名称:权重>；名称带 .safetensors 后缀时保留原样（SD 两种都认）
+function Format-LoraFragment {
+    param([string]$LoraName, [double]$Weight)
+    if (-not $LoraName) { return "" }
+    return "<lora:$LoraName`:$Weight>"
+}
+
+# 画风 → 正/负向提示词映射：返回 @{ Pos = 正向画风词; Neg = 负向画风词 }（均可能为空串）。
+# 这是「写实二次元」等画风在 C 档弹表单时，写进两个提示词框的画风描述词（合规描述词，非违规词）。
+function Get-StylePrompt {
+    param([string]$Style)
+    $pos = ""; $neg = ""
+    switch ($Style) {
+        '写实'     {
+            $pos = "RAW photo, photorealistic, natural skin texture, skin pores, film grain, soft natural lighting, depth of field, shot on Canon EOS R5, 85mm f1.8, highly detailed, 8k uhd"
+            $neg = "(cartoon, anime, 3d render, cgi, painting, illustration:1.3), (airbrushed, smooth skin, plastic skin, doll:1.2)"
+        }
+        '写实二次元' {
+            # 半写实·现代 CG 插画脸（十轮迭代实测配方）：动漫底子往写实靠。
+            # LoRA semirealisticanime 权重 0.6 是平衡点（0.45 脸崩、0.8 御姐化/跑真人照片）。
+            # 立体感靠「体积光包」（第 11-13 轮实测：平光=纸片感），但**不锁金色**——
+            # 光色交给场景词决定，负向压 golden hue/sepia，避免每张都金灿灿。
+            # <lora:...> 直接写进正向，sd-direct/A1111 原生解析；表单 LoRA 栏就别再重复选它（会叠两层）。
+            $pos = "<lora:semirealisticanime:0.6>, (modern anime style:1.25), (semi-realistic:1.1), delicate refined anime face, (big detailed anime eyes:1.25), youthful face, detailed skin shading, (volumetric lighting:1.2), (chiaroscuro:1.2), (subsurface scattering:1.2), translucent skin, soft rim light, atmospheric haze, airbrushed shading, soft gradients, three-dimensional body, natural light color"
+            $neg = "(old anime style:1.2), retro anime, flat color, cel shading, (photorealistic:1.3), (mature female face:1.3), (flat lighting:1.3), (flat shading:1.2), (golden hue:1.3), (sepia:1.2), oversaturated"
+        }
+        '彩色哥特' {
+            # 原「真人感半写实」（SemiRealMix 旧配方）演化：华丽哥特——巴洛克金饰、暗调室内、
+            # 宝石色点缀（绯红/孔雀蓝）、戏剧性明暗。SemiRealMix 堆金、厚涂、高饱和的「毛病」
+            # 在这套词里正好变成风格本体。
+            $pos = "semi-realistic, gothic, dark baroque, ornate golden filigree, gold body jewelry, (crimson and teal accents:1.2), jewel tones, dramatic chiaroscuro, candle light, decadent atmosphere, detailed skin texture, beautiful detailed face"
+            $neg = "flat color, cel shading, lineart, (cartoon:1.3), (photorealistic:1.2), (flat lighting:1.2), low detail, simple background"
+        }
+        '写实二次元·东亚脸' {
+            # 用户自调画风（2026-10-15 本机实测配方，写实二次元·东亚脸眼细节验证版）：
+            # 在「写实二次元」基础上把五官往东亚脸收——脸型收窄、杏仁眼 + 虹膜高光、眼神光、
+            # 正面偏侧柔光 + 发丝轮廓光，负向压掉宽脸/宽眼距/西方面孔/过曝/真人照片。
+            $pos = "<lora:semirealisticanime:0.6>, (modern anime style:1.25), (semi-realistic:1.1), delicate refined face, slender oval face, (beautiful detailed almond eyes:1.3), (detailed sparkling iris:1.2), luminous gradient eyes, long eyelashes, eye highlight, youthful face, detailed skin shading, (volumetric lighting:1.2), (chiaroscuro:1.2), (subsurface scattering:1.2), translucent skin, (soft front-side fill light:1.3), gentle rim light on hair, atmospheric haze, airbrushed shading, soft gradients, three-dimensional body, natural light color"
+            $neg = "(old anime style:1.2), retro anime, flat color, cel shading, (photorealistic:1.3), real person, (mature female face:1.3), (flat lighting:1.3), (flat shading:1.2), (golden hue:1.3), (sepia:1.2), oversaturated, (overexposed:1.3), (wide-set eyes:1.4), (wide face:1.2), western features, bad face, deformed face, asymmetrical eyes"
+        }
+        '釉彩调色盘' {
+            # 用户自调画风（本机 LoRA）：釉彩·麻袋调色盘_v1.0——釉面质感 + 麻袋粗布调色盘色域，
+            # 只挂 LoRA（权重 0.8）+ 极简风格词，其余交给用户的提示词；LoRA 缺失时整段为空、表单照常可用。
+            $pos = "<lora:釉彩·麻袋调色盘_v1.0:0.8>, glaze texture, matte burlap canvas palette, muted earthy tones"
+            $neg = ""
+        }
+        '厚涂'     { $neg = "flat color, cel shading, lineart" }
+        '水彩'     { $neg = "thick paint, impasto, 3d render" }
+        '像素风'   { $neg = "smooth shading, gradient, blurry" }
+    }
+    return @{ Pos = $pos; Neg = $neg }
+}
+
+# ---- 出图参数表单（WinForms）：正向/负向提示词 + 迭代次数 / Denoising / 比例 / 画风 / 画质 ----
+# 提示词（基底已预填）作为多行文本框放在表单顶部，所有可填项一次填完；画风在图生图时默认「保持画风」。
+function Show-ParamForm {
+    param(
+        [int]$DefaultRounds,
+        [bool]$HasBaseImage,
+        [string]$Positive,
+        [string]$Negative,
+        [string[]]$LoraList,
+        [string[]]$CheckpointList
+    )
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "sd-inject 出图参数"
+    $form.ClientSize = New-Object System.Drawing.Size(350, 606)
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.StartPosition = 'CenterScreen'
+    $form.MaximizeBox = $false
+    $form.TopMost = $true
+
+    # 0) 正向 / 负向提示词（多行文本框：基底已预填，英文标签，逗号分隔，可整栏直接改）
+    $lbPos = New-Object System.Windows.Forms.Label
+    $lbPos.Text = '正向提示词：'
+    $lbPos.SetBounds(20, 12, 200, 22)
+    $form.Controls.Add($lbPos)
+
+    $txtPos = New-Object System.Windows.Forms.TextBox
+    $txtPos.Multiline = $true
+    $txtPos.ScrollBars = 'Vertical'
+    $txtPos.Text = $Positive
+    $txtPos.SetBounds(20, 36, 310, 78)
+    $form.Controls.Add($txtPos)
+
+    $lbNeg = New-Object System.Windows.Forms.Label
+    $lbNeg.Text = '负向提示词：'
+    $lbNeg.SetBounds(20, 122, 200, 22)
+    $form.Controls.Add($lbNeg)
+
+    $txtNeg = New-Object System.Windows.Forms.TextBox
+    $txtNeg.Multiline = $true
+    $txtNeg.ScrollBars = 'Vertical'
+    $txtNeg.Text = $Negative
+    $txtNeg.SetBounds(20, 146, 310, 78)
+    $form.Controls.Add($txtNeg)
+
+    # 1-7) 参数行（y 从 240 起，行距 40）
+    $labels = @('迭代次数：', 'Denoising：', '比例：', '画风：', '画质：', 'LoRA：', '模型：')
+    for ($i = 0; $i -lt $labels.Count; $i++) {
+        $lb = New-Object System.Windows.Forms.Label
+        $lb.Text = $labels[$i]
+        $lb.SetBounds(20, (244 + $i * 40), 90, 22)
+        $form.Controls.Add($lb)
+    }
+
+    # 1) 迭代次数（可编辑下拉：默认 32）
+    $cboRounds = New-Object System.Windows.Forms.ComboBox
+    $cboRounds.DropDownStyle = 'DropDown'
+    foreach ($n in @(1, 2, 3, 4, 5, 8, 12, 16, 24, 32)) { $null = $cboRounds.Items.Add("$n") }
+    $cboRounds.Text = "$DefaultRounds"
+    $cboRounds.SetBounds(120, (240 + 0 * 40), 190, 24)
+    $form.Controls.Add($cboRounds)
+
+    # 2) Denoising（可编辑下拉：图生图重绘幅度；无素体成品时灰掉但保留展示）
+    $cboDenoise = New-Object System.Windows.Forms.ComboBox
+    $cboDenoise.DropDownStyle = 'DropDown'
+    foreach ($v in @('0.4', '0.5', '0.6', '0.7', '0.8', '0.9')) { $null = $cboDenoise.Items.Add($v) }
+    $cboDenoise.Text = '0.7'
+    $cboDenoise.SetBounds(120, (240 + 1 * 40), 190, 24)
+    if (-not $HasBaseImage) { $cboDenoise.Enabled = $false }
+    $form.Controls.Add($cboDenoise)
+
+    # 3) 比例（只读下拉：常见比例）
+    $cboRatio = New-Object System.Windows.Forms.ComboBox
+    $cboRatio.DropDownStyle = 'DropDownList'
+    foreach ($r in @('9:16', '1:1', '3:4', '4:3', '16:9', '2:3', '3:2', '21:9')) { $null = $cboRatio.Items.Add($r) }
+    $cboRatio.SelectedIndex = 0   # 默认 9:16
+    $cboRatio.SetBounds(120, (240 + 2 * 40), 190, 24)
+    $form.Controls.Add($cboRatio)
+
+    # 4) 画风（只读下拉：图生图默认「保持画风」，文生图默认「二次元」）
+    $cboStyle = New-Object System.Windows.Forms.ComboBox
+    $cboStyle.DropDownStyle = 'DropDownList'
+    # 画风清单（C 档选项表·画风部分）：前三个是用户自己调出来的画风（2026-10-15 本机实测配方），
+    # 后面是通用画风；「釉彩调色盘」= 用户自调的本地 LoRA 画风（釉彩·麻袋调色盘）。
+    foreach ($s in @('保持画风', '二次元', '写实二次元', '写实二次元·东亚脸', '彩色哥特', '釉彩调色盘', '国风', '赛博朋克', '写实', '厚涂', '水彩', '像素风')) { $null = $cboStyle.Items.Add($s) }
+    if ($HasBaseImage) { $cboStyle.SelectedIndex = 0 } else { $cboStyle.SelectedIndex = 1 }
+    $cboStyle.SetBounds(120, (240 + 3 * 40), 190, 24)
+    $form.Controls.Add($cboStyle)
+
+    # 画风联动：切换画风时，把该画风对应的正向/负向提示词**幂等写入**两个提示词框。
+    # 用户要求（2026-10-15）：C 档弹表单时，根据画风在两个提示词框里加入对应画风提示词（用户看得见、可改）。
+    # 实现：脚本作用域记录「上次注入的（正/负）画风词」，切换时先按原样剥掉旧词，再追加新词——
+    # 这样用户手动改过的手写词不受影响，只有画风词那段被替换。
+    $script:injectedStylePos = ""
+    $script:injectedStyleNeg = ""
+    $cboStyle.Add_SelectedIndexChanged({
+        # 1) 剥掉上一次注入的画风词（若存在）
+        if ($script:injectedStylePos -and $txtPos.Text.Contains($script:injectedStylePos)) {
+            $txtPos.Text = $txtPos.Text.Replace($script:injectedStylePos, '').Trim()
+        }
+        if ($script:injectedStyleNeg -and $txtNeg.Text.Contains($script:injectedStyleNeg)) {
+            $txtNeg.Text = $txtNeg.Text.Replace($script:injectedStyleNeg, '').Trim()
+        }
+        # 2) 注入当前画风的词
+        $st = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
+        $script:injectedStylePos = ""
+        $script:injectedStyleNeg = ""
+        if ($st.Pos) {
+            $script:injectedStylePos = $st.Pos
+            $txtPos.Text = if ($txtPos.Text) { "$($txtPos.Text.Trim()), $($st.Pos)" } else { $st.Pos }
+        }
+        if ($st.Neg) {
+            $script:injectedStyleNeg = $st.Neg
+            $txtNeg.Text = if ($txtNeg.Text) { "$($txtNeg.Text.Trim()), $($st.Neg)" } else { $st.Neg }
+        }
+    })
+
+    # 5) 画质（只读下拉：短边像素档位）
+    $cboQuality = New-Object System.Windows.Forms.ComboBox
+    $cboQuality.DropDownStyle = 'DropDownList'
+    foreach ($q in @('480p', '640p', '768p', '1024p', '1280p', '1440p', '2160p（4K）')) { $null = $cboQuality.Items.Add($q) }
+    $cboQuality.SelectedIndex = 0   # 默认 480p
+    $cboQuality.SetBounds(120, (240 + 4 * 40), 190, 24)
+    $form.Controls.Add($cboQuality)
+
+    # 6) LoRA（可编辑下拉：SD 在跑时自动拉取本机列表；留空 = 不用；格式「名称 x权重」如「xxx 0.8」）
+    $cboLora = New-Object System.Windows.Forms.ComboBox
+    $cboLora.DropDownStyle = 'DropDown'
+    $null = $cboLora.Items.Add('（不用 LoRA）')
+    foreach ($l in $LoraList) { $null = $cboLora.Items.Add("$l 0.8") }
+    $cboLora.SelectedIndex = 0
+    $cboLora.SetBounds(120, (240 + 5 * 40), 190, 24)
+    $form.Controls.Add($cboLora)
+    if ($LoraList.Count -eq 0) {
+        $lbLoraHint = New-Object System.Windows.Forms.Label
+        $lbLoraHint.Text = '（SD 未运行，拉不到列表；可手填「名称 权重」）'
+        $lbLoraHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
+        $lbLoraHint.ForeColor = [System.Drawing.Color]::Gray
+        $lbLoraHint.SetBounds(120, (240 + 5 * 40 + 26), 220, 18)
+        $form.Controls.Add($lbLoraHint)
+    }
+
+    # 7) 模型（只读下拉：SD 在跑时自动拉取 checkpoint 列表；首项「（当前模型）」= 不切换）
+    $cboModel = New-Object System.Windows.Forms.ComboBox
+    $cboModel.DropDownStyle = 'DropDownList'
+    $null = $cboModel.Items.Add('（当前模型）')
+    foreach ($m in $CheckpointList) { $null = $cboModel.Items.Add($m) }
+    $cboModel.SelectedIndex = 0
+    $cboModel.SetBounds(120, (240 + 6 * 40), 190, 24)
+    $form.Controls.Add($cboModel)
+    if ($CheckpointList.Count -eq 0) {
+        $lbModelHint = New-Object System.Windows.Forms.Label
+        $lbModelHint.Text = '（SD 未运行，拉不到列表）'
+        $lbModelHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
+        $lbModelHint.ForeColor = [System.Drawing.Color]::Gray
+        $lbModelHint.SetBounds(120, (240 + 6 * 40 + 26), 220, 18)
+        $form.Controls.Add($lbModelHint)
+    }
+
+    # 8) 命名（文本框，可留空：留空 = 用提示词总结 + 序号；自定义名重复时自动加序号递增）
+    $lbName = New-Object System.Windows.Forms.Label
+    $lbName.Text = '命名：'
+    $lbName.SetBounds(20, (240 + 7 * 40), 90, 22)
+    $form.Controls.Add($lbName)
+    $txtName = New-Object System.Windows.Forms.TextBox
+    $txtName.Text = ''
+    $txtName.SetBounds(120, (240 + 7 * 40), 190, 24)
+    $form.Controls.Add($txtName)
+    $lbNameHint = New-Object System.Windows.Forms.Label
+    $lbNameHint.Text = '（留空 = 自动总结提示词命名）'
+    $lbNameHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
+    $lbNameHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbNameHint.SetBounds(120, (240 + 7 * 40 + 26), 220, 18)
+    $form.Controls.Add($lbNameHint)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = '确定出图'
+    $btnOk.SetBounds(110, 564, 100, 30)
+    $form.AcceptButton = $btnOk
+    $form.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消'
+    $btnCancel.SetBounds(220, 564, 100, 30)
+    $form.Controls.Add($btnCancel)
+
+    $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
+    $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
+    $form.CancelButton = $btnCancel
+    # 诊断日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-form-diag.log
+    try {
+        $dlgResult = $form.ShowDialog()
+    } catch {
+        $dlgResult = 'Cancel'
+    }
+    if ($dlgResult -ne 'OK') {
+        Write-Host "已在参数表单取消。" -ForegroundColor Yellow
+        exit 0
+    }
+
+    # 解析：非法输入回落默认（迭代次数回落 32、Denoising 回落 0.7）
+    $rounds = $DefaultRounds
+    $null = [int]::TryParse($cboRounds.Text.Trim(), [ref]$rounds)
+    if ($rounds -lt 1) { $rounds = 1 } elseif ($rounds -gt 32) { $rounds = 32 }
+    $den = 0.7
+    if ($HasBaseImage) {
+        $null = [double]::TryParse(($cboDenoise.Text -replace ',', '.').Trim(), [ref]$den)
+        if ($den -lt 0.1) { $den = 0.1 } elseif ($den -gt 0.95) { $den = 0.95 }
+    } else {
+        $den = 0
+    }
+    return @{
+        Pos     = $txtPos.Text.Trim()
+        Neg     = $txtNeg.Text.Trim()
+        Rounds  = $rounds
+        Denoise = $den
+        Ratio   = [string]$cboRatio.SelectedItem
+        Style   = [string]$cboStyle.SelectedItem
+        Quality = [string]$cboQuality.SelectedItem
+        Lora    = $cboLora.Text.Trim()
+        Model   = [string]$cboModel.SelectedItem
+        Name    = $txtName.Text.Trim()
+    }
+}
+
+# 比例 + 画质短边档 → SD 尺寸（8 的倍数；面积随画质档走，比例只定形状）
+function Get-SizeFor {
+    param([string]$Ratio, [string]$Quality)
+    $short = 480
+    switch ($Quality) {
+        '640p'  { $short = 640 }
+        '768p'  { $short = 768 }
+        '1024p' { $short = 1024 }
+        '1280p' { $short = 1280 }
+        '1440p' { $short = 1440 }
+        '2160p（4K）' { $short = 2160 }
+    }
+    $rw = 9.0; $rh = 16.0
+    if ($Ratio -match '^(\d+):(\d+)$') { $rw = [double]$Matches[1]; $rh = [double]$Matches[2] }
+    if ($rw -ge $rh) {
+        $w = $short; $h = [int][math]::Round($short * $rh / $rw)
+    } else {
+        $h = $short; $w = [int][math]::Round($short * $rw / $rh)
+    }
+    $w = [int]([math]::Floor($w / 8)) * 8
+    $h = [int]([math]::Floor($h / 8)) * 8
+    if ($w -lt 256) { $w = 256 }
+    if ($h -lt 256) { $h = 256 }
+    return @{ W = $w; H = $h }
+}
+
+# ---- 素体自检迭代（只跑基底，绝不改提示词）----
+# 脸/手质检：把图发给本地视觉模型（Ollama OpenAI 兼容端点 /chat/completions，image_url 用 base64 data URI），
+# 让它只回一个 0-100 的整数分（脸部 + 手部综合）。判定线：>= 75 过关；< 45 且已试过面部修复 → 判定该模型不会看图，质检降级为「只要没成功启动过一次就当过关」，避免无限烧卡。
+function Test-VlmApi {
+    try {
+        $null = Invoke-RestMethod -Uri "$QwenBase/models" -Method Get -TimeoutSec 5
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-VlmCandidates {
+    # 质检要的是视觉模型：vl / vision 排最前，专用代码模型依旧压底；缓存结果
+    if ($script:VlmCandidateCache) { return $script:VlmCandidateCache }
+    $models = @()
+    foreach ($ep in @("$QwenBase/models", "$QwenBase/../api/tags")) {
+        if ($models.Count -gt 0) { break }
+        try {
+            $r = Invoke-RestMethod -Uri $ep -Method Get -TimeoutSec 10
+            if ($r -and $r.data) { $models = @($r.data | ForEach-Object { [string]$_.id }) }
+            elseif ($r -and $r.models) { $models = @($r.models | ForEach-Object { [string]$_.name }) }
+        } catch { }
+    }
+    if ($models.Count -eq 0) {
+        # 一个都没枚举到：最常见的根因是 OLLAMA_MODELS 指向了空目录（模型实际在别处）。
+        Write-Host "本地模型服务上一个模型都没枚举到（$QwenBase）" -ForegroundColor Red
+        $ollamaModels = $env:OLLAMA_MODELS
+        if (-not $ollamaModels) { $ollamaModels = '(未设，用默认 ~/.ollama/models)' }
+        Write-Host "常见根因：OLLAMA_MODELS 指向了空目录。当前值：$ollamaModels" -ForegroundColor Yellow
+    }
+    $visionFirst = @($models | Where-Object { $_ -match 'vl|vision|llava|bakllava|moondream|minicpm-v|internvl' })
+    $rest = @($models | Where-Object { $visionFirst -notcontains $_ })
+    $script:VlmCandidateCache = @($visionFirst + $rest | Where-Object { $_ -and ($_ -notmatch 'embed|rerank') })
+    return $script:VlmCandidateCache
+}
+
+function Test-FaceQuality {
+    # 返回 0-100 整数分（解析失败返回 -1）。问句刻意只聊脸部与手部结构，不给模型任何「画面内容」的发挥空间。
+    # 用户要求（2026-10-15）：手部细节也纳入质检——手指数量/多指/少指/粘连/畸形，与脸部一起综合打分。
+    # 超时 180s：VLM 冷启动要把模型加载进显存，首问可能远慢于热状态（实测 8B 首问 >120s）。
+    param([string]$ImagePath)
+    try {
+        $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ImagePath))
+    } catch { return -1 }
+    $userContent = @"
+这张图里的人物脸部与手部结构健康吗？只检查两点：
+① 脸部：眼睛是否对称/无多余、五官是否扭曲错位、脸部是否畸形融化；
+② 手部：每只手是否五根手指齐全、有无多余或缺失的手指、手指是否扭曲粘连、手部是否畸形。
+脸部或手部任一处崩坏都要相应扣分。只回复一个 0-100 的整数分（100=完全健康，0=严重崩坏），除此之外一个字符都不要输出。
+"@
+    $body = @{
+        model = $VlmModel
+        messages = @(
+            @{ role = "user"; content = @(
+                @{ type = "text"; text = $userContent },
+                @{ type = "image_url"; image_url = @{ url = "data:image/png;base64,$b64" } }
+            ) }
+        )
+        temperature = 0.1
+        stream = $false
+    }
+    try {
+        $headers = @{ "Content-Type" = "application/json; charset=utf-8" }
+        if ($QwenApiKey) { $headers["Authorization"] = "Bearer $QwenApiKey" }
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 8))
+        $resp = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post -Headers $headers -Body $bodyBytes -TimeoutSec 180
+    } catch { return -1 }
+    $raw = Repair-Utf8Mojibake ([string]$resp.choices[0].message.content)
+    $m = [regex]::Match($raw, '\d{1,3}')
+    if (-not $m.Success) { return -1 }
+    $score = 0
+    if (-not [int]::TryParse($m.Value, [ref]$score)) { return -1 }
+    if ($score -lt 0 -or $score -gt 100) { return -1 }
+    return $score
+}
+
+function Invoke-BaseIterate {
+    # 素体迭代主流程：只跑 $BasePrompt，每轮换 seed；第 2 轮起开面部修复。
+    # 返回 @{ Path = 图路径; Seed = 实际 seed; Score = 脸/手得分 }；失败返回 $null。
+    # 铁律：本函数不修改 $positive / $negative 的任何内容——不加词、不加替换词、不加安全词。
+    if (-not (Test-VlmApi)) {
+        # 视觉质检不可用：不做无意义的迭代，保持老行为直接出一张
+        Write-Host "本地视觉模型不可用（$QwenBase），跳过素体自检迭代（可用 -NoIterate 显式关闭）" -ForegroundColor Yellow
+        return $null
+    }
+    if (-not $VlmModel -or ((Get-VlmCandidates) -notcontains $VlmModel)) {
+        $vlm = Get-VlmCandidates | Where-Object { $_ -match 'vl|vision' } | Select-Object -First 1
+        if (-not $vlm) {
+            Write-Host "本机没有视觉模型（vl/vision），跳过素体自检迭代；想用请先：ollama pull qwen3-vl:8b" -ForegroundColor Yellow
+            return $null
+        }
+        if ($vlm -ne $VlmModel) {
+            Write-Host "质检模型已回退到 '$vlm'（要固定用 '$VlmModel' 先执行：ollama pull $VlmModel）" -ForegroundColor Yellow
+            $script:VlmModel = $vlm
+        }
+    }
+    # 预热：发一条纯文本空问，把模型先加载进显存——否则首轮带图质检会撞冷启动超时（实测 >120s）
+    try {
+        $null = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post `
+            -Headers @{ "Content-Type" = "application/json; charset=utf-8"; "Authorization" = "Bearer $QwenApiKey" } `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ model = $VlmModel; messages = @(@{ role = "user"; content = "1" }); stream = $false } | ConvertTo-Json -Depth 6))) `
+            -TimeoutSec 300
+    } catch { }
+
+    Write-Host "素体自检迭代中..." -ForegroundColor Cyan
+    $bestPath = ''
+    $bestSeed = -1
+    $bestScore = -1
+    $roundsUsed = 0
+    $vlmEverWorked = $false
+    $giveUpVlm = $false
+    for ($round = 1; $round -le $IterateRounds; $round++) {
+        $roundsUsed = $round
+        $iterArgs = @(
+            "-ExecutionPolicy", "Bypass", "-File", "`"$SdDirect`"",
+            "-Prompt", "`"$BasePrompt`"",
+            "-Negative", "`"$BaseNegative`"",
+            "-Width", "$Width", "-Height", "$Height",
+            "-Steps", "$Steps", "-Cfg", "$Cfg",
+            "-Sampler", "`"$Sampler`"",
+            "-Seed", "-1",
+            "-OutDir", "`"$script:IterTempDir`"",
+            "-Name", "`"$Name`""
+        )
+        if ($SdDir) { $iterArgs += @("-SdDir", "`"$SdDir`"") }
+        # 坑33：不开 SD 内置面部修复（-RestoreFaces）。8G 显存下 CodeFormer/GFPGAN 与质检模型
+        # 抢显存，出图进度 100% 后卡死（实测「出图第 2 轮（含面部修复）卡住」）。质检已靠
+        # VLM 打分换 seed 重试，不需要 SD 内置修复。
+        # 迭代期间不弹窗，最终那张才弹；sd-direct.ps1 会打印 SEEDVALUE 行，捕获真实 seed
+        $iterArgs += "-NoOpen"
+        Write-Host "素体第 $round/$IterateRounds 轮..." -ForegroundColor Cyan
+        $iterOut = & powershell @iterArgs 2>&1
+        $iterOut | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "素体出图失败（exit $LASTEXITCODE），中止迭代" -ForegroundColor Red
+            Remove-IterTempDir
+            exit 1
+        }
+        # 从输出里解析真实 seed（Seed: 行；SEEDVALUE 是给机器看的冗余行）
+        $roundSeed = -1
+        $seedLine = @($iterOut | Where-Object { $_ -match '^SEEDVALUE:\s*(\d+)' } | Select-Object -First 1)
+        if ($seedLine -and $seedLine -match '^SEEDVALUE:\s*(\d+)') { $roundSeed = [long]$Matches[1] }
+        # sd-direct.ps1 的命名规则 = <Name>_<序号:D3>.png，本流程独占 $Name 前缀，取序号最大的那张
+        $cand = Get-ChildItem -LiteralPath $script:IterTempDir -Filter "$Name`_*.png" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if (-not $cand) {
+            Write-Host "找不到本轮产物（$script:IterTempDir\$Name`_*.png），中止迭代" -ForegroundColor Red
+            Remove-IterTempDir
+            exit 1
+        }
+        if ($giveUpVlm) {
+            $bestPath = $cand.FullName
+            $bestSeed = $roundSeed
+            break
+        }
+        $score = Test-FaceQuality -ImagePath $cand.FullName
+        if ($score -ge 0) { $vlmEverWorked = $true }
+        if ($score -lt 0) {
+            # 视觉模型没给出分数：第一轮先重试一轮（可能是冷启动抖动），仍不行就降级为「出一张就收」
+            if ($round -lt $IterateRounds) {
+                Write-Host "质检无分数（视觉模型未就绪或解析失败），再试一轮" -ForegroundColor Yellow
+                continue
+            }
+            $bestPath = $cand.FullName
+            $bestSeed = $roundSeed
+            break
+        }
+        Write-Host "  脸/手质检得分：$score/100（>= 75 过关）" -ForegroundColor DarkGray
+        if ($score -gt $bestScore) {
+            $bestScore = $score; $bestPath = $cand.FullName; $bestSeed = $roundSeed
+            # 增量落盘：新最高分立即复制进工作区（中途关闭也不丢当前最优成品）
+            try {
+                $null = New-Item -ItemType Directory -Path $OutDir -Force
+                Copy-Item -LiteralPath $bestPath -Destination (Join-Path $OutDir (Split-Path $bestPath -Leaf)) -Force
+            } catch { }
+        }
+        if ($score -ge 75) { break }
+        # 低于 45 且已经开过面部修复还没救回来 → 质检模型大概率不会看图，别再烧轮数
+        if ($score -lt 45 -and $round -ge 2) {
+            Write-Host "  连续低分且已开面部修复——判定质检模型不可靠，采用本轮结果" -ForegroundColor Yellow
+            $giveUpVlm = $true
+            $bestPath = $cand.FullName
+            $bestSeed = $roundSeed
+            try {
+                $null = New-Item -ItemType Directory -Path $OutDir -Force
+                Copy-Item -LiteralPath $bestPath -Destination (Join-Path $OutDir (Split-Path $bestPath -Leaf)) -Force
+            } catch { }
+            break
+        }
+    }
+    if (-not $bestPath) { return $null }
+    return @{ Path = $bestPath; Seed = $bestSeed; Score = $bestScore; RoundsUsed = $roundsUsed }
+}
+
+function Invoke-FinalIterate {
+    # 最终出图迭代：按表单参数连出 $Rounds 张（换 seed），每张质检脸/手取最高分。
+    # 质检失败/超时（得分 < 0）时：不再烧轮数，改为把「本轮及后续各轮」都生成出来、
+    # 全部保留让用户自己选（多选模式）。返回 @{ Paths = 图路径数组; Seed; Score }。
+    param(
+        [string]$InitImage = "",
+        [double]$Denoising = 0.7,
+        [int]$Rounds = 1,
+        [int]$W = 512,
+        [int]$H = 768,
+        [string]$Checkpoint = ""
+    )
+    $bestPath = ''
+    $bestSeed = -1
+    $bestScore = -1
+    $allPaths = @()
+    $vlmDown = $false
+    for ($round = 1; $round -le $Rounds; $round++) {
+        $finalArgs = @(
+            "-ExecutionPolicy", "Bypass", "-File", "`"$SdDirect`"",
+            "-Prompt", "`"$positive`"",
+            "-Negative", "`"$finalNegative`"",
+            "-Width", "$W", "-Height", "$H",
+            "-Steps", "$Steps", "-Cfg", "$Cfg",
+            "-Sampler", "`"$Sampler`"",
+            "-Seed", "-1",
+            "-OutDir", "`"$script:IterTempDir`"",
+            "-Name", "`"$Name`""
+        )
+        if ($Checkpoint) { $finalArgs += @("-Checkpoint", "`"$Checkpoint`"") }
+        if ($InitImage -and (Test-Path -LiteralPath $InitImage)) {
+            $finalArgs += @("-InitImage", "`"$InitImage`"", "-Denoising", "$Denoising")
+        }
+        if ($SdDir) { $finalArgs += @("-SdDir", "`"$SdDir`"") }
+        $finalArgs += "-NoOpen"
+        Write-Host "出图第 $round/$Rounds 轮$(if ($InitImage) { "（图生图 denoising=$Denoising）" })..." -ForegroundColor Cyan
+        $finalOut = & powershell @finalArgs 2>&1
+        $finalOut | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "出图失败（exit $LASTEXITCODE），中止迭代" -ForegroundColor Red
+            Remove-IterTempDir
+            exit 1
+        }
+        $roundSeed = -1
+        $seedLine = @($finalOut | Where-Object { $_ -match '^SEEDVALUE:\s*(\d+)' } | Select-Object -First 1)
+        if ($seedLine -and $seedLine -match '^SEEDVALUE:\s*(\d+)') { $roundSeed = [long]$Matches[1] }
+        $cand = Get-ChildItem -LiteralPath $script:IterTempDir -Filter "$Name`_*.png" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $cand) {
+            Write-Host "找不到本轮产物（$script:IterTempDir\$Name`_*.png），中止迭代" -ForegroundColor Red
+            Remove-IterTempDir
+            exit 1
+        }
+        # 记录本轮产物
+        $allPaths += $cand.FullName
+        $bestPath = $cand.FullName
+        $bestSeed = $roundSeed
+
+        if ($vlmDown) {
+            # 质检已失效：后续轮不再质检，直接出满剩余张数（多选模式）
+            Write-Host "  质检已失效，直接生成（用户自选）" -ForegroundColor Yellow
+            continue
+        }
+        $score = Test-FaceQuality -ImagePath $cand.FullName
+        if ($score -lt 0) {
+            # 质检失败/超时：不再烧轮数，改为出满 $Rounds 张让用户自选（用户要求）
+            Write-Host "  质检无分数——后续各轮直接生成，全部保留供你选择" -ForegroundColor Yellow
+            $vlmDown = $true
+            $bestScore = -1
+            continue
+        }
+        Write-Host "  脸/手质检得分：$score/100（>= 75 过关）" -ForegroundColor DarkGray
+        if ($score -gt $bestScore) { $bestScore = $score; $bestPath = $cand.FullName; $bestSeed = $roundSeed }
+        if ($score -ge 75) { break }
+    }
+    if ($allPaths.Count -eq 0) { return $null }
+    return @{ Paths = $allPaths; Path = $bestPath; Seed = $bestSeed; Score = $bestScore; VlmDown = $vlmDown }
+}
+
+# 质检模型起不来时的收尾选择器：把候选图列成「文件名 + 勾选框」的多选对话框（纯文本，绝不白屏），
+# 右侧带一张选中项的预览图；取消或一张没选 = 全部保留。返回保留的路径数组。
+function Show-ImagePicker {
+    param([string[]]$Images)
+    if (-not $Images -or $Images.Count -eq 0) { return @() }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "质检模型未就绪 · 请选择要保留的图片（勾选 = 保留）"
+    $form.ClientSize = New-Object System.Drawing.Size(720, 520)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'Sizable'
+    $form.MinimizeBox = $true
+    $form.MaximizeBox = $true
+    $form.TopMost = $true
+
+    # 左侧：文件名勾选列表（纯文本，不依赖缩略图加载，从根上杜绝白屏）
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.CheckOnClick = $true
+    $clb.IntegralHeight = $false
+    $clb.SetBounds(12, 12, 300, 460)
+    $clb.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9)
+    foreach ($src in $Images) {
+        $idx = $clb.Items.Add((Split-Path $src -Leaf))
+        $clb.SetItemChecked($idx, $true)   # 默认全选
+    }
+    $form.Controls.Add($clb)
+
+    # 右侧：选中项预览（加载失败就显示灰色占位，不影响左侧列表）
+    $pic = New-Object System.Windows.Forms.PictureBox
+    $pic.SetBounds(324, 12, 380, 400)
+    $pic.SizeMode = 'Zoom'
+    $pic.BackColor = [System.Drawing.Color]::FromArgb(40, 40, 46)
+    $pic.BorderStyle = 'FixedSingle'
+    $form.Controls.Add($pic)
+
+    # 选中变化 → 刷新预览（用脚本作用域数组按索引取路径；缩略图加载失败静默跳过）
+    $script:pickerPaths = @($Images)
+    $clb.Add_SelectedIndexChanged({
+        $i = $clb.SelectedIndex
+        if ($i -ge 0 -and $script:pickerPaths[$i]) {
+            $srcPath = $script:pickerPaths[$i]
+            try {
+                if (Test-Path -LiteralPath $srcPath) {
+                    $img = [System.Drawing.Image]::FromFile($srcPath)
+                    try { $pic.Image = New-Object System.Drawing.Bitmap($img) }
+                    finally { $img.Dispose() }
+                }
+            } catch { $pic.Image = $null }
+        }
+    })
+    # 默认选中第一张并出预览
+    if ($clb.Items.Count -gt 0) { $clb.SelectedIndex = 0 }
+
+    $pnl = New-Object System.Windows.Forms.Panel
+    $pnl.Dock = 'Bottom'
+    $pnl.Height = 46
+    $pnl.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 8)
+    $form.Controls.Add($pnl)
+
+    $btnAll = New-Object System.Windows.Forms.Button
+    $btnAll.Text = '全选'
+    $btnAll.SetBounds(10, 8, 70, 30)
+    $pnl.Controls.Add($btnAll)
+    $btnAll.Add_Click({ for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $true) } })
+
+    $btnNone = New-Object System.Windows.Forms.Button
+    $btnNone.Text = '全不选'
+    $btnNone.SetBounds(90, 8, 70, 30)
+    $pnl.Controls.Add($btnNone)
+    $btnNone.Add_Click({ for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $false) } })
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = '保留所选'
+    $btnOk.SetBounds(560, 8, 90, 30)
+    $pnl.Controls.Add($btnOk)
+    $form.AcceptButton = $btnOk
+    $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消（全部保留）'
+    $btnCancel.SetBounds(655, 8, 100, 30)
+    $pnl.Controls.Add($btnCancel)
+    $form.CancelButton = $btnCancel
+    $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
+
+    $null = $form.ShowDialog()
+    $kept = @()
+    if ($form.DialogResult -eq 'OK') {
+        for ($i = 0; $i -lt $clb.Items.Count; $i++) {
+            if ($clb.GetItemChecked($i) -and $script:pickerPaths[$i]) { $kept += [string]$script:pickerPaths[$i] }
+        }
+        if ($kept.Count -eq 0) { $kept = @($Images) }   # 一张没选 = 视为全部保留，避免误删
+    } else {
+        $kept = @($Images)   # 取消 = 全部保留
+    }
+    $form.Dispose()
+    return $kept
+}
+
+
+function Find-Ollama {
+    $cmd = Get-Command ollama -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($c in @("$env:LOCALAPPDATA\Programs\Ollama\ollama.exe", "D:\ollama\ollama.exe", "C:\ollama\ollama.exe", "$env:ProgramFiles\Ollama\ollama.exe", "${env:ProgramFiles(x86)}\Ollama\ollama.exe")) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    return ''
+}
+
+
+# ---- 0) 出图参数表单先弹（脚本一启动就弹，不等素体迭代）：正向/负向提示词 + 迭代次数 / Denoising / 比例 / 画风 / 画质 / LoRA / 模型 ----
+# 表单放最前面：用户先填参数 → 再跑素体迭代与最终出图，避免「屏幕静止几分钟像卡死」。
+# 注：表单时素体还没跑（HasBaseImage=false），Denoising 档位先按无素体展示。
+$hasBaseImg = $false
+if ($baseWin -and (Test-Path -LiteralPath $baseWin.Path)) { $hasBaseImg = $true }
+
+# 0a) 弹表单前先预热 SD：确保本机 SD API 已就绪，这样表单里 LoRA / 模型下拉能拉到真实列表，
+#     不会因为 SD 还没起（首次冷启动要加载模型 1-3 分钟）而显示「SD 未运行，拉不到列表」。
+#     用 sd-direct.ps1 的 -StartOnly 模式拉起：它自带启动进度条与运行时间，就绪即退、不出图。
+if (-not (Test-SdApiReady)) {
+    Write-Host "首次使用：正在拉起 Stable Diffusion（含模型加载，进度见下方进度条）..." -ForegroundColor Cyan
+    if (-not (Test-Path -LiteralPath $SdDirect)) {
+        Write-Host "预热跳过：找不到 sd-direct.ps1（$SdDirect），LoRA/模型列表可能为空" -ForegroundColor Yellow
+    } else {
+        $preheatArgs = @("-ExecutionPolicy", "Bypass", "-File", "`"$SdDirect`"", "-StartOnly")
+        if ($SdDir) { $preheatArgs += @("-SdDir", "`"$SdDir`"") }
+        $preheatOut = & powershell @preheatArgs 2>&1
+        $preheatOut | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -ne 0) {
+            # 预热失败不阻断主流程：仍弹出表单，只是 LoRA/模型列表可能拉不到
+            Write-Host "SD 预热未完成（exit $LASTEXITCODE），继续弹表单（LoRA/模型列表可能为空）" -ForegroundColor Yellow
+        } else {
+            Write-Host "SD 已就绪，正在拉取 LoRA / 模型列表..." -ForegroundColor Cyan
+        }
+    }
+}
+
+# 迭代次数默认 3（用户指定；质检不稳定时降到 3 轮快速验证，多选时出 3 张让用户选）
+$paramFormRounds = 3
+$sdLoras = Get-SdLoras
+$sdCheckpoints = Get-SdCheckpoints
+# 表单预填前先补末尾英文逗号：让两个输入框里显示的基底提示词末尾就带逗号（用户要求）
+$formPositive = $BasePrompt
+$formNegative = $BaseNegative
+if ($formPositive -and ($formPositive -notmatch ',\s*$')) { $formPositive = $formPositive.TrimEnd() + ", " }
+if ($formNegative -and ($formNegative -notmatch ',\s*$')) { $formNegative = $formNegative.TrimEnd() + ", " }
+$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints
+# 表单里的提示词是最终值（基底 + 用户在表单里的修改/追加）
+$positive = $P.Pos
+$negative = $P.Neg
+# 点确定后立即显示「开始绘制」（用户要求：表单确认后立刻显示）
+Write-Host ""
+Write-Host "开始绘制" -ForegroundColor Cyan
+
+# 末尾补英文逗号：两个输入框处理后的提示词，若末尾没有逗号就补一个，
+# 保证后面追加脸部词/LoRA/全身等拼接时不会粘连（用户要求）。
+if ($positive -and $positive.Trim() -and ($positive.Trim() -notmatch ',\s*$')) { $positive = $positive.Trim() + ", " }
+if ($negative -and $negative.Trim() -and ($negative.Trim() -notmatch ',\s*$')) { $negative = $negative.Trim() + ", " }
+
+# 默认景别「全身」：若用户未在正向提示词里指定任何构图/景别词（上半身/半身/头像/特写等），
+# 自动追加 "full body"（用户要求：没说明就默认全身）。
+$framingWords = 'full body|upper body|half body|headshot|portrait|close-up|closeup|bust|waist up|waist-up|cowboy shot|knee up|face|half-length|three-quarter|fullbody|whole body'
+if ($positive -and ($positive -notmatch $framingWords)) {
+    if ($positive -notmatch 'full body') {
+        $positive = "$positive full body, "
+    }
+}
+
+# ---- 0b) 素体自检迭代（表单确认后再跑）：只跑基底，换 seed + 面部修复迭代到脸部过关 ----
+# 追加为空时迭代产物就是最终图；有追加/参数变化时用 winning seed/图锚定最终出图，保住过关的脸。
+$baseWin = $null
+if (-not $NoIterate) {
+    $baseWin = Invoke-BaseIterate
+    if ($baseWin) {
+        Write-Host "素体迭代完成：$($baseWin.Path)（seed=$($baseWin.Seed)，脸/手 $($baseWin.Score)/100）" -ForegroundColor Green
+    }
+}
+if ($baseWin -and (Test-Path -LiteralPath $baseWin.Path)) { $hasBaseImg = $true }
+
+# 脸部细节词：自动追加进正向（去重——用户已手写过的词不重复加）
+$faceTags = @()
+foreach ($t in ($FaceBoostTags -split ',')) {
+    $tt = $t.Trim()
+    if ($tt -and ($positive -notmatch [regex]::Escape($tt))) { $faceTags += $tt }
+}
+if ($faceTags.Count -gt 0) {
+    $positive = "$positive, $($faceTags -join ', ')"
+    Write-Host "已追加脸部细节词：$($faceTags -join ', ')" -ForegroundColor DarkGray
+}
+
+# LoRA：表单选择 → <lora:名称:权重> 拼进正向（用户要求：可选择拉取新 lora）
+$loraFragment = ""
+if ($P.Lora -and $P.Lora -ne '（不用 LoRA）') {
+    $loraName = $P.Lora
+    $loraWeight = 0.8
+    if ($P.Lora -match '^(.*?)\s+([0-9]+(?:\.[0-9]+)?)\s*$') {
+        $loraName = $Matches[1].Trim()
+        $null = [double]::TryParse($Matches[2], [ref]$loraWeight)
+        if ($loraWeight -le 0) { $loraWeight = 0.8 } elseif ($loraWeight -gt 1.5) { $loraWeight = 1.5 }
+    }
+    $loraFragment = Format-LoraFragment -LoraName $loraName -Weight $loraWeight
+    $positive = "$positive, $loraFragment"
+    Write-Host "已挂 LoRA：$loraFragment" -ForegroundColor DarkGray
+}
+
+$size = Get-SizeFor -Ratio $P.Ratio -Quality $P.Quality
+# 模型切换：表单选了具体 checkpoint（非「（当前模型）」）才传给出图子流程
+$formCheckpoint = ""
+if ($P.Model -and $P.Model -ne '（当前模型）' -and $P.Model -ne '') { $formCheckpoint = $P.Model }
+
+# 最终命名：表单「命名」栏 > 提示词总结 > 默认 inject；统一用 Get-UniqueOutPath 去重递增
+$finalBaseName = $P.Name
+if (-not $finalBaseName) { $finalBaseName = Summarize-PromptName -Prompt $positive }
+if (-not $finalBaseName) { $finalBaseName = $Name }
+
+Write-Host ""
+Write-Host "出图参数：迭代 $($P.Rounds) 次 | Denoising $($P.Denoise) | 比例 $($P.Ratio)（$($size.W)x$($size.H)） | 画风 $($P.Style) | 画质 $($P.Quality)$(if ($loraFragment) { " | LoRA $loraFragment" })$(if ($formCheckpoint) { " | 模型 $formCheckpoint" }) | 命名 $finalBaseName" -ForegroundColor Green
+Write-Host "正向: $positive" -ForegroundColor White
+Write-Host "负向: $negative" -ForegroundColor White
+
+# ---- 5) 最终出图（按表单参数迭代，取脸/手最高分那张）----
+# 画风词已由表单联动（切换画风时注入两个提示词框）写进 $P.Pos/$P.Neg，这里**不再二次追加**，
+# 否则会重复（用户要求：C 档弹表单时根据画风在两个提示词框里加入对应画风词）。
+# 这里只保留「画风 → 自动切模型」的兜底逻辑（写实 → majicMIX；写实二次元 → 首选动漫底子不切模型，备选 SemiRealMix）。
+
+# 写实画风且用户没在表单里手动选模型 → 自动切到本机写实 checkpoint（majicMIX），
+# 否则写实词落在动漫模型上会画风漂移（实测：AWPainting + 写实词 → 光影写实但脸还是动漫）。
+if ($P.Style -eq '写实' -and -not $formCheckpoint) {
+    $realisticCkpt = @($sdCheckpoints | Where-Object { $_ -match 'majicMIX|majicmix|realistic|麦橘|写实' } | Select-Object -First 1)
+    if ($realisticCkpt) {
+        $formCheckpoint = $realisticCkpt
+        Write-Host "写实画风：自动切换模型 → $formCheckpoint" -ForegroundColor DarkGray
+    } else {
+        Write-Host "写实画风：本机未找到写实 checkpoint，用当前模型（建议 ollama 或 SD 里补装 majicMIX）" -ForegroundColor Yellow
+    }
+}
+
+# 写实二次元画风（十轮迭代实测结论）：首选「动漫底子 + 半写实 LoRA」——画风词里的
+# <lora:semirealisticanime:0.6> 已经把脸拉向现代 CG 半写实，此时**保持动漫模型（不切）**效果最好；
+# 实测 SemiRealMix 做底反而容易出 3D 娃娃脸或直接跑成真人照片，只在半写实 LoRA 缺失时退回它。
+if ($P.Style -in @('写实二次元', '写实二次元·东亚脸') -and -not $formCheckpoint) {
+    $hasSemirealLora = @($sdLoras | Where-Object { $_ -match 'semirealisticanime' }).Count -gt 0
+    if ($hasSemirealLora) {
+        Write-Host "写实二次元画风：保持动漫模型 + 半写实 LoRA 0.6（实测最优路径，不切模型）" -ForegroundColor DarkGray
+    } else {
+        $semirealCkpt = @($sdCheckpoints | Where-Object { $_ -match 'SemiReal|semireal|半写实|2.5d|2\.5D' } | Select-Object -First 1)
+        if ($semirealCkpt) {
+            $formCheckpoint = $semirealCkpt
+            Write-Host "写实二次元画风：未找到半写实 LoRA（semirealisticanime），退回 SemiRealMix 模型 → $formCheckpoint（建议跑 install-sd.ps1 补装 semireal LoRA，效果更稳）" -ForegroundColor Yellow
+        } else {
+            Write-Host "写实二次元画风：半写实 LoRA 与 SemiRealMix 都没有，用当前模型（跑 install-sd.ps1 补装 semireal / semirealmix）" -ForegroundColor Yellow
+        }
+    }
+}
+
+# 彩色哥特画风（原「真人感半写实」改名演化）：SemiRealMix 做底——它堆金、厚涂、高饱和的
+# 特性在这套词里正好是哥特华丽感的本体。用户没手动选模型时自动切到 SemiRealMix。
+if ($P.Style -eq '彩色哥特' -and -not $formCheckpoint) {
+    $semirealCkpt = @($sdCheckpoints | Where-Object { $_ -match 'SemiReal|semireal|半写实|2.5d|2\.5D' } | Select-Object -First 1)
+    if ($semirealCkpt) {
+        $formCheckpoint = $semirealCkpt
+        Write-Host "彩色哥特画风：自动切换模型 → $formCheckpoint" -ForegroundColor DarkGray
+    } else {
+        Write-Host "彩色哥特画风：本机未找到 SemiRealMix，用当前模型（跑 install-sd.ps1 补装 semirealmix）" -ForegroundColor Yellow
+    }
+}
+
+# 追加为空（表单里提示词与基底一致 + 无脸部词/LoRA 追加）+ 素体迭代已产出成品 + 参数全是默认形态（无比例/画质/画风调整）：不重复出图，直接收尾。
+$defaultsOnly = ($P.Ratio -eq '9:16' -and $P.Quality -eq '480p' -and $P.Style -in @('保持画风', '二次元') -and $P.Rounds -eq $paramFormRounds)
+$promptsUntouched = ($positive -eq $formPositive.Trim() -and $negative -eq $formNegative.Trim())
+# 决策日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-decision.log
+if ($promptsUntouched -and $hasBaseImg -and $defaultsOnly) {
+    Write-Host ""
+    Write-Host "追加为空：素体迭代产物即最终图，不再重复出图。" -ForegroundColor Green
+    # 素体图目前还在临时目录：用「工作区唯一序号」复制进工作区（不覆盖历史成品）
+    $finalPath = Get-UniqueOutPath -BaseName $finalBaseName
+    Copy-Item -LiteralPath $baseWin.Path -Destination $finalPath -Force
+    Remove-IterTempDir
+    Write-Host "成品: $finalPath（seed=$($baseWin.Seed)，脸/手 $($baseWin.Score)/100）"
+    if (-not $NoOpen) {
+        try {
+            Start-Process -FilePath $finalPath
+            Write-Host "已打开: $finalPath"
+        } catch {
+            Write-Host "自动打开失败（$($_.Exception.Message)），可手动打开：$finalPath" -ForegroundColor Yellow
+        }
+    }
+    exit 0
+}
+
+# 组装最终负向：负向提示词已含「画风负面词」（表单联动注入），这里直接用 $negative。
+# 画风词不再二次追加（否则会与表单里已注入的词重复）。
+$finalNegative = $negative
+
+# 组装最终正向：正向提示词已含「画风正向词」（表单联动注入），这里直接用 $positive。
+
+# 最终末尾补英文逗号：正向/负向经过 full body、脸部词、LoRA、画风负面等追加后，
+# 末尾可能又没有逗号了，出图前统一再补一次（用户要求：提示词末尾加英文逗号）。
+if ($positive -and ($positive -notmatch ',\s*$')) { $positive = $positive.TrimEnd() + ", " }
+if ($finalNegative -and ($finalNegative -notmatch ',\s*$')) { $finalNegative = $finalNegative.TrimEnd() + ", " }
+
+# 最终出图：始终走文生图（txt2img），用完整的 $positive（表单提示词 + 脸部词 + LoRA）。
+# 不拿素体图做 img2img 底图——素体迭代只是「验证脸部质检能过关」，若拿它当底图，
+# denoising 会强烈保留素体裸基底的内容，用户填的提示词被稀释得几乎看不见（实测根因）。
+$finalWin = Invoke-FinalIterate -InitImage "" -Denoising 0 -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint
+
+if ($finalWin) {
+    if ($finalWin.VlmDown) {
+        # 质检模型起不来：先把本轮生成的所有候选图复制进工作区并全部打开，
+        # 再弹带缩略图的多选对话框，让用户勾选要保留的（单选/多选/全选），未勾选的删除。
+        Write-Host ""
+        Write-Host "质检模型未就绪，已生成 $($finalWin.Paths.Count) 张候选图：" -ForegroundColor Green
+        $saved = @()
+        foreach ($p in $finalWin.Paths) {
+            $dst = Get-UniqueOutPath -BaseName $finalBaseName
+            Copy-Item -LiteralPath $p -Destination $dst -Force
+            $saved += $dst
+            Write-Host "  $dst"
+        }
+        Remove-IterTempDir
+        if (-not $NoOpen) {
+            foreach ($dst in $saved) {
+                try { Start-Process -FilePath $dst } catch { }
+            }
+        }
+        if ($saved.Count -gt 1) {
+            $kept = Show-ImagePicker -Images $saved
+            foreach ($dst in $saved) {
+                if ($kept -notcontains $dst) {
+                    try { Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue } catch { }
+                    Write-Host "  已删除未选中: $(Split-Path $dst -Leaf)" -ForegroundColor DarkGray
+                }
+            }
+            Write-Host "已保留 $($kept.Count) 张。" -ForegroundColor Green
+        } else {
+            Write-Host "仅生成 1 张，已保留。" -ForegroundColor DarkGray
+        }
+    } else {
+        # 正常模式：复制最高分那张
+        $finalPath = Get-UniqueOutPath -BaseName $finalBaseName
+        Copy-Item -LiteralPath $finalWin.Path -Destination $finalPath -Force
+        Remove-IterTempDir
+        Write-Host ""
+        Write-Host "最终成品: $finalPath（seed=$($finalWin.Seed)$(if ($finalWin.Score -ge 0) { "，脸/手 $($finalWin.Score)/100" })）" -ForegroundColor Green
+        Write-Host "（迭代中间图已存于临时目录并清理，工作区只保留成品）" -ForegroundColor DarkGray
+        if (-not $NoOpen) {
+            try {
+                Start-Process -FilePath $finalPath
+                Write-Host "已打开: $finalPath"
+            } catch {
+                Write-Host "自动打开失败（$($_.Exception.Message)），可手动打开：$finalPath" -ForegroundColor Yellow
+            }
+        }
+    }
+} else {
+    Remove-IterTempDir
+    Write-Host "最终出图未产出（迭代全部失败）" -ForegroundColor Red
+    exit 1
+}

@@ -16,8 +16,8 @@
 # 跑完行为：保存成功后自动用默认看图器**打开这张图**；不想要就加 -NoOpen。
 
 param(
-    [Parameter(Mandatory=$true)][string]$Prompt,
-    [Alias('NegativePrompt')][string]$Negative = "lowres, bad anatomy, bad hands, watermark, text, worst quality",
+    [string]$Prompt = "",            # 提示词；留空 = 仅拉起 SD API 到就绪即退出（不占端口、不出图，供调用方预热用）
+    [Alias('NegativePrompt')][string]$Negative = "lowres, bad anatomy, bad hands, extra fingers, fewer digits, malformed limbs, watermark, text, signature, jpeg artifacts, worst quality, low quality",
     [string]$InitImage = "",        # 给了就走 img2img，留空走 txt2img
     [string]$Mask = "",             # 蒙版图路径（白/不透明 = 重绘区）；给了就是蒙版重绘，必须同时给 -InitImage
     [int]$MaskBlur = 4,             # 蒙版边缘羽化 px（接缝明显就调 8-16）
@@ -26,19 +26,27 @@ param(
     [switch]$NoFullRes,             # 关掉「只在蒙版区按原分辨率重绘」
     [int]$InpaintPadding = 32,      # 蒙版区域外扩像素，越大边缘越自然
     [Alias('DenoisingStrength')][double]$Denoising = 0.55,   # 与插件默认一致（越小越贴参考图；保画风用 0.30-0.50）
-    [int]$Width = 640,
-    [int]$Height = 960,
-    [int]$Steps = 24,
+    [int]$Width = 512,
+    [int]$Height = 768,
+    [int]$Steps = 22,
     [string]$Sampler = "DPM++ 2M",    # 采样器：与插件默认一致（比 Euler a 更干净、同步数噪点更少）
+    [string]$Checkpoint = "",       # 临时切换的 checkpoint（title，如 "AWPainting_v1.2.safetensors [3d1b3c42ec]"）；留空用当前模型
     [double]$Cfg = 7,
     [long]$Seed = -1,          # 必须 64 位：SD 的 seed 是 uint32（可到 4294967295），[int] 在 >2147483647 时报参数转换错误
     [string]$OutDir = "",           # 留空 = 当前目录下的 SD-Picture（插件会显式注入）
     [string]$Name = "direct",       # 输出文件名前缀，序号自动递增
     [string]$ApiBase = "http://127.0.0.1:7860",
     [string]$SdDir = "",            # SD WebUI 目录（含 launch.py）；留空自动查找
+    [switch]$RestoreFaces,          # 开启面部修复（CodeFormer/GFPGAN）——全身图脸小易崩，修复能救回来
+    [double]$CodeFormerWeight = 0.5, # 面部修复强度：0=最强修复 1=最贴近原图（默认 0.5 折中）
+    [switch]$NoHires,               # 关闭 Hires Fix（默认开）：txt2img 二次采样放大，脸部/服装/手脚细节翻倍
+    [double]$HiresScale = 2,        # Hires 放大倍率（输出 = 原尺寸 × 此值；2 即 512x768 → 1024x1536）
+    [double]$HiresDenoising = 0.55, # Hires 二次采样重绘幅度（0.4-0.6 保构图补细节，过高会改构图）
     [int]$StartTimeout = 300,       # 自动拉起后等待就绪的秒数（首次含模型加载给足余量）
     [switch]$NoStart,               # SD 没开时不自动拉起，直接报错退出
-    [switch]$NoOpen                 # 加 -NoOpen 则跑完不自动打开这张图
+    [switch]$NoOpen,                # 加 -NoOpen 则跑完不自动打开这张图
+    [string]$TermFile = "",         # 占位符映射表路径（JSON），脚本读取后做字符串替换
+    [switch]$StartOnly               # 只拉起 SD API 到就绪后退出（预热用，不出图、不校验 Prompt）
 )
 
 if ($OutDir -eq "") { $OutDir = Join-Path (Get-Location).Path "SD-Picture" }
@@ -58,6 +66,19 @@ function Fail {
     Write-Host "错误：$Message" -ForegroundColor Red
     if ($Hint) { Write-Host $Hint -ForegroundColor Yellow }
     exit 1
+}
+
+# 等待过程中的进度条：用原生 Write-Progress 画一条会前进的条 + 已运行时间（mm:ss）。
+# $Percent ∈ 0..100，$Seconds = 已运行秒数（>= 0）。
+# 注意：脚本顶部为压制下载进度设了 $ProgressPreference='SilentlyContinue'，那会连 Write-Progress
+# 一起吞掉——这里临时切回 'Continue' 才画得出来。
+function Show-WaitProgress {
+    param([int]$Percent, [double]$Seconds)
+    if ($ProgressPreference -ne 'Continue') { $ProgressPreference = 'Continue' }
+    $pct = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $bar = '#' * [int]($pct / 4) + '-' * (25 - [int]($pct / 4))
+    $elapsed = '{0:D2}:{1:D2}' -f [int]([Math]::Floor($Seconds / 60)), [int]([Math]::Floor($Seconds % 60))
+    Write-Progress -Id 1 -Activity "正在拉起 Stable Diffusion API" -Status "$bar  $($pct)%   已运行 $elapsed" -PercentComplete $pct
 }
 
 # SD API 是否就绪（能回 200 才算）
@@ -197,6 +218,8 @@ function Start-SdApiIfNeeded {
     $lastPrint = 0
     while ((Get-Date) -lt $deadline) {
         if ($proc.HasExited) {
+            # 进程退出也要把进度条关掉，避免残留半截条
+            Write-Progress -Id 1 -Activity "正在拉起 Stable Diffusion API" -Completed
             $tail = ''
             foreach ($f in @($launchLogErr, $launchLog)) {
                 if (Test-Path $f) {
@@ -207,29 +230,118 @@ function Start-SdApiIfNeeded {
             Fail "SD 启动进程提前退出（退出码 $($proc.ExitCode)）" "启动日志 $launchLog :`n$tail"
         }
         if (Test-SdApi) {
+            Write-Progress -Id 1 -Activity "正在拉起 Stable Diffusion API" -Completed
             Write-Host "SD API 已就绪：$ApiBase" -ForegroundColor Green
             return
         }
+        # 进度条：启动等待通常 1-3 分钟（首次含模型加载），按剩余时间线性推进到 95%，
+        # 到点仍未就绪则由外层超时报错并关条；已运行时间实时刷新。
         $elapsed = [int]((Get-Date) - $deadline.AddSeconds(-$StartTimeout)).TotalSeconds
-        if ($elapsed - $lastPrint -ge 15) { Write-Host "  等待就绪... ${elapsed}s" -ForegroundColor DarkGray; $lastPrint = $elapsed }
+        $progressPct = [Math]::Min(95, [int]($elapsed / [Math]::Max(1, $StartTimeout) * 100))
+        Show-WaitProgress -Percent $progressPct -Seconds $elapsed
+        if ($elapsed - $lastPrint -ge 15) { $lastPrint = $elapsed }
         Start-Sleep -Seconds 2
     }
+    Write-Progress -Id 1 -Activity "正在拉起 Stable Diffusion API" -Completed
     Fail "等待 SD API 就绪超时（${StartTimeout}s）" "看启动日志排查：$launchLog / $launchLogErr；也可调大 -StartTimeout。"
 }
 
 function Invoke-SdApi {
     param([string]$Endpoint, [hashtable]$Body)
     $json = $Body | ConvertTo-Json -Depth 8
-    try {
-        return Invoke-RestMethod -Uri "$ApiBase$Endpoint" -Method Post -Body $json `
-            -ContentType "application/json" -TimeoutSec 600
-    } catch {
-        Fail "SD API 调用失败 $Endpoint（$($_.Exception.Message)）" "服务地址 $ApiBase；SD 若刚被拉起可稍候重试，或看 $launchLog。"
+    $maxTry = 2
+    for ($try = 1; $try -le $maxTry; $try++) {
+        try {
+            # 必须显式发 UTF-8 字节体：PS5.1 的 Invoke-RestMethod 拿 string Body 时按 Latin-1 编码，
+            # 中文 checkpoint 名（写实：majicMIX…）会变成 åå®ï¼… 乱码 → SD 报 model not found（500）。
+            $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            return Invoke-RestMethod -Uri "$ApiBase$Endpoint" -Method Post -Body $jsonBytes `
+                -ContentType "application/json; charset=utf-8" -TimeoutSec 600
+        } catch {
+            # 把 SD 塞在 4xx 响应体里的真实报错挖出来（默认异常 Message 只有一句「错误的请求」）
+            $detail = ""
+            try {
+                $respStream = $_.Exception.Response.GetResponseStream()
+                if ($respStream) {
+                    $reader = New-Object System.IO.StreamReader($respStream, [System.Text.Encoding]::UTF8)
+                    $detail = $reader.ReadToEnd()
+                }
+            } catch { }
+            if (-not $detail) { try { $detail = [string]$_.ErrorDetails.Message } catch { } }
+            $code = 0
+            try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            # 400/500/503 且还有重试机会 → 等 5 秒重试一次（常见于切模型后加载中、显存刚被占满）
+            if ($try -lt $maxTry -and $code -in @(400, 500, 503)) {
+                Write-Host "SD 返回 $code（$(if ($detail) { $detail.Substring(0, [Math]::Min(160, $detail.Length)) } else { '无详情' })）—— 5 秒后重试 $try/$maxTry" -ForegroundColor Yellow
+                Start-Sleep -Seconds 5
+                continue
+            }
+            $hint = "服务地址 $ApiBase；SD 若刚被拉起可稍候重试，或看 $launchLog。"
+            if ($detail) { $hint = "SD 报错详情：$detail" }
+            Fail "SD API 调用失败 $Endpoint（远程服务器返回错误: $code）" $hint
+        }
     }
 }
 
 # ---- 1) 保证 API 可用（没开就自己拉起） ----
 Start-SdApiIfNeeded
+
+# ---- 1x) 预热模式：只拉起 API 到就绪即退出（不出图、不校验 Prompt），供 sd-inject 弹表单前预热 ----
+if ($StartOnly) {
+    Write-Host "SD API 已就绪（预热完成）：$ApiBase" -ForegroundColor Green
+    exit 0
+}
+
+# ---- 1a) 临时切换 checkpoint：记录原模型 → 仅在当前模型 ≠ 目标时切换 → 出图后还原 ----
+# （迭代场景每轮都会带同一个 -Checkpoint：目标已生效时跳过切换/还原，避免反复加载模型）
+$script:OrigCheckpoint = ""
+$script:CheckpointSwitched = $false
+if ($Checkpoint -and $Checkpoint.Trim()) {
+    try {
+        $optsNow = Invoke-RestMethod -Uri "$ApiBase/sdapi/v1/options" -Method Get -TimeoutSec 10 -UseBasicParsing
+        $script:OrigCheckpoint = [string]$optsNow.sd_model_checkpoint
+        if ($script:OrigCheckpoint -ne $Checkpoint.Trim()) {
+            # 中文模型名必须走 UTF-8 字节体（见 Invoke-SdApi 注释），否则 SD 收到乱码报 model not found
+            $switchJson = [System.Text.Encoding]::UTF8.GetBytes((@{ sd_model_checkpoint = $Checkpoint.Trim() } | ConvertTo-Json))
+            $null = Invoke-RestMethod -Uri "$ApiBase/sdapi/v1/options" -Method Post `
+                -Body $switchJson -ContentType "application/json; charset=utf-8" -TimeoutSec 120
+            $script:CheckpointSwitched = $true
+            Write-Host "已临时切换模型: $($Checkpoint.Trim())（出图后还原为 $($script:OrigCheckpoint)）"
+            # 切模型是异步加载：等 /sdapi/v1/options 里的 sd_model_checkpoint 真正变过来再继续，
+            # 否则紧跟着的 img2img/txt2img 会撞「模型加载中」的 400/503（实测偶发）
+            $swLoad = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($swLoad.Elapsed.TotalSeconds -lt 120) {
+                try {
+                    $optsChk = Invoke-RestMethod -Uri "$ApiBase/sdapi/v1/options" -Method Get -TimeoutSec 10 -UseBasicParsing
+                    if ([string]$optsChk.sd_model_checkpoint -eq $Checkpoint.Trim()) { break }
+                } catch { }
+                Start-Sleep -Seconds 2
+            }
+        }
+    } catch {
+        Write-Host "切换模型失败（$($_.Exception.Message)），按当前模型继续" -ForegroundColor Yellow
+    }
+}
+
+# ---- 1b) 占位符替换：从外部 JSON 读取映射表，对 Prompt / Negative 做字符串替换 ----
+# 映射表由用户在执行前提供；脚本不生成、不推断任何映射内容。
+# 文件不存在或解析失败 → 静默跳过，原样执行，不阻断、不报错。
+if ($TermFile -and (Test-Path -LiteralPath $TermFile)) {
+    try {
+        $terms = [System.IO.File]::ReadAllText($TermFile) | ConvertFrom-Json
+        foreach ($prop in $terms.PSObject.Properties) {
+            $key = [string]$prop.Name
+            $val = [string]$prop.Value
+            if ($key) {
+                $Prompt = $Prompt.Replace($key, $val)
+                $Negative = $Negative.Replace($key, $val)
+            }
+        }
+        Write-Host "词表已应用: $TermFile"
+    } catch {
+        # 词表读取或解析失败 → 静默跳过，原样执行
+    }
+}
 
 # ---- 2) 输出目录与文件名 ----
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
@@ -291,6 +403,33 @@ if ($InitImage -ne "") {
         steps           = $Steps; cfg_scale = $Cfg; seed = $Seed
     }
     if ($Sampler -and $Sampler.Trim()) { $body['sampler_name'] = $Sampler.Trim() }
+    if (-not $NoHires) {
+        # Hires Fix（默认开）：512x768 直接出全身图脸只有 40-60px，SD1.5 画不出细节；
+        # 二次采样放大后脸部/服装/手脚细节量翻倍（实测同 seed 对照：29KB → 1.6MB）。
+        # denoising_strength 必须显式给：缺省时 A1111 用 None 参与比较会 500（TypeError）。
+        $body['enable_hr'] = $true
+        $body['hr_scale'] = [math]::Max(1, [math]::Min(4, $HiresScale))
+        $body['hr_upscaler'] = 'Latent'
+        $body['hr_second_pass_steps'] = [math]::Max(1, [int]($Steps * 0.5))
+        $body['denoising_strength'] = [math]::Max(0.1, [math]::Min(0.9, $HiresDenoising))
+    }
+    if ($RestoreFaces) {
+        # A1111 的面部修复强度不在 txt2img 请求体里，要走 /sdapi/v1/options；
+        # face_restoration_model 为空时 restore_faces=true 会直接报错，所以这里一并补上。
+        try {
+            $opts = Invoke-RestMethod -Uri "$ApiBase/sdapi/v1/options" -Method Get -TimeoutSec 10 -UseBasicParsing
+            $optBody = @{}
+            if (-not $opts.face_restoration_model) { $optBody['face_restoration_model'] = 'CodeFormer' }
+            if ($null -ne $CodeFormerWeight) { $optBody['code_former_weight_factor'] = [math]::Min(1, [math]::Max(0, $CodeFormerWeight)) }
+            if ($optBody.Count -gt 0) {
+                $optBytes = [System.Text.Encoding]::UTF8.GetBytes(($optBody | ConvertTo-Json))
+                $null = Invoke-RestMethod -Uri "$ApiBase/sdapi/v1/options" -Method Post -Body $optBytes -ContentType "application/json; charset=utf-8" -TimeoutSec 30
+            }
+        } catch {
+            Write-Host "面部修复参数设置失败（$($_.Exception.Message)），按服务端默认继续" -ForegroundColor Yellow
+        }
+        $body['restore_faces'] = $true
+    }
     $result = Invoke-SdApi "/sdapi/v1/txt2img" $body
 }
 
@@ -319,13 +458,27 @@ try {
 
 Write-Host "已保存: $outPath"
 Write-Host "Seed:   $actualSeed   采样: $(if ($Sampler) { $Sampler } else { 'SD 默认' })   耗时: $([math]::Round($sw.Elapsed.TotalSeconds,1))s"
+# 供父脚本（如 sd-inject.ps1 素体迭代）解析 winning seed 用；人类看着是重复信息，机器靠它做锚定
+Write-Host "SEEDFILE: $outPath"
+Write-Host "SEEDVALUE: $actualSeed"
 Write-Host ("模式:   " + $(
     if ($Mask -ne "") { "蒙版重绘 inpaint (denoising=$Denoising, maskBlur=$MaskBlur, fill=$InpaintFill, padding=$InpaintPadding$(if ($MaskInvert) { ', invert' })$(if ($NoFullRes) { ', 全图分辨率' }))" }
     elseif ($InitImage -ne "") { "img2img (denoising=$Denoising)" }
-    else { "txt2img" }
+    else { "txt2img$(if ($RestoreFaces) { ' + 面部修复' })$(if (-not $NoHires) { " + Hires x$HiresScale" })" }
 ))
 
 # ---- 5) 出图跑完 → 用系统默认看图器打开这张图（批量跑/不想弹窗就加 -NoOpen） ----
+# 临时切换过的 checkpoint 在这里还原（放最后：成功/失败路径都走到脚本尾部才执行）
+if ($script:CheckpointSwitched) {
+    try {
+        $restoreJson = [System.Text.Encoding]::UTF8.GetBytes((@{ sd_model_checkpoint = $script:OrigCheckpoint } | ConvertTo-Json))
+        $null = Invoke-RestMethod -Uri "$ApiBase/sdapi/v1/options" -Method Post `
+            -Body $restoreJson -ContentType "application/json; charset=utf-8" -TimeoutSec 120
+        Write-Host "已还原模型: $($script:OrigCheckpoint)"
+    } catch {
+        Write-Host "模型还原失败（$($_.Exception.Message)），SD 当前用的是 $($Checkpoint.Trim())" -ForegroundColor Yellow
+    }
+}
 if ($NoOpen) {
     Write-Host "已跳过自动打开（-NoOpen）：$outPath"
 } else {

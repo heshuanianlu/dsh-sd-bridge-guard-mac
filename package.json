@@ -1,52 +1,54 @@
 {
-  "name": "dsh-sd-bridge-guard",
-  "version": "0.7.0",
-  "description": "DeepSeek Harness 插件：本机 Stable Diffusion 生图六件套（文生图/图生图/蒙版重绘/只生成脚本/模型清单/服务管理）+ 违规分流协议。跨机器零适配——SD 目录自动探测，找不到可一键自举安装（先补齐 git/Python/VC++ 等环境），产物目录自动落在会话工作区；设置 → 插件可直接改配置。",
-  "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "deepseek-harness",
-    "stable-diffusion",
-    "automatic1111",
-    "txt2img",
-    "img2img",
-    "image-generation",
-    "guard"
-  ],
-  "type": "module",
-  "main": "sd-bridge.js",
-  "files": [
-    "sd-bridge.js",
-    "sd-direct.ps1",
-    "install-sd.ps1",
-    "cordis.patch.yml",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE"
-  ],
-  "scripts": {
-    "test": "node smoke-skill.mjs && node test-install-record.mjs && node test-settings.mjs && node test-install-catalog.mjs",
-    "test:smoke": "node smoke-skill.mjs",
-    "test:record": "node test-install-record.mjs",
-    "test:settings": "node test-settings.mjs",
-    "test:catalog": "node test-install-catalog.mjs",
-    "acceptance": "node acceptance.mjs"
-  },
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/savinglighting/dsh-sd-bridge-guard.git"
-  },
-  "homepage": "https://github.com/savinglighting/dsh-sd-bridge-guard#readme",
-  "bugs": {
-    "url": "https://github.com/savinglighting/dsh-sd-bridge-guard/issues"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  }
+    "name":  "dsh-sd-bridge-guard",
+    "version":  "0.9.7",
+    "description":  "DeepSeek Harness 插件：本机 Stable Diffusion 生图八件套（文生图/图生图/蒙版重绘/只生成脚本/双版本对齐脚本/C 档本地注入命令/模型清单/服务管理）+ 违规分流协议 + C 档选项表（A 档出图后罗列画风/模型/LoRA/比例等，一句话即可重出图）。跨机器零适配——SD 目录自动探测，找不到可一键自举安装，产物目录自动落在会话工作区。",
+    "keywords":  [
+                     "dsh",
+                     "dsh-plugin",
+                     "deepseek-harness",
+                     "stable-diffusion",
+                     "automatic1111",
+                     "txt2img",
+                     "img2img",
+                     "image-generation",
+                     "guard"
+                 ],
+    "type":  "module",
+    "main":  "sd-bridge.js",
+    "files":  [
+                  "sd-bridge.js",
+                  "sd-direct.ps1",
+                  "sd-inject.ps1",
+                  "install-sd.ps1",
+                  "cordis.patch.yml",
+                  "README.md",
+                  "CHANGELOG.md",
+                  "LICENSE",
+                  "docs/"
+              ],
+    "scripts":  {
+                    "test":  "node smoke-skill.mjs \u0026\u0026 node test-install-record.mjs \u0026\u0026 node test-settings.mjs \u0026\u0026 node test-install-catalog.mjs",
+                    "test:smoke":  "node smoke-skill.mjs",
+                    "test:record":  "node test-install-record.mjs",
+                    "test:settings":  "node test-settings.mjs",
+                    "test:catalog":  "node test-install-catalog.mjs",
+                    "acceptance":  "node acceptance.mjs"
+                },
+    "license":  "MIT",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "git+https://github.com/savinglighting/dsh-sd-bridge-guard.git"
+                   },
+    "homepage":  "https://github.com/savinglighting/dsh-sd-bridge-guard#readme",
+    "bugs":  {
+                 "url":  "https://github.com/savinglighting/dsh-sd-bridge-guard/issues"
+             },
+    "engines":  {
+                    "node":  "\u003e=18"
+                },
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           }
+            }
 }

@@ -1,0 +1,90 @@
+# 模型 / VAE / LoRA / 嵌入 —— 清单与镜像站（本机实测）
+
+> 本文件由「整理打包」任务生成（2026-10-15），列出 dsh-sd-bridge-guard 在本机用到的全部权重资源：
+> **每一条都有 HF 镜像直链**（`hf-mirror.com`，国内可直连），另有 **sha256**（与本机正在出图、画质已验证的文件逐字节比对过；HF 的 LFS `oid` 就是 sha256）。
+> 一键拉取用包内 `install-sd.ps1`（默认就走镜像）；单文件手动下载按下面的直链 `curl`/浏览器即可。
+
+## 0. 镜像站与用法
+
+| 站点 | 地址 | 说明 |
+| --- | --- | --- |
+| HF 国内镜像（默认） | `https://hf-mirror.com` | `install-sd.ps1 -Mirror` 默认值；把 `huggingface.co` 原样换成它即可 |
+| HF 官方源 | `https://huggingface.co` | 科学上网时用 `-Mirror ""` 切换 |
+| ModelScope 魔搭 | `https://modelscope.cn` | 部分 checkpoint 有搬运版，国内直连，搜索模型名即可 |
+| LiblibAI 哩布哩布 | `https://www.liblib.art` | **国内自调 LoRA 来源**（国风山水 / 赛博朋克 / 自然美妆场景 / 釉彩·麻袋调色盘 / 39 这类） |
+| Civitai | `https://civitai.com` | 备用 LoRA / embedding 来源（EasyNegative、badhandv4 等都有收录） |
+
+一键按清单拉取（自动走镜像 + sha256 校验 + 断点续传 8 段并行）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "插件目录\install-sd.ps1" -Models "awpainting,semirealmix,majicmix" -Vaes "mse,animevae" -Loras "add_detail,semireal,easynegative,badhandv4"
+```
+
+单文件手动下载（示例，任意条目同理）：把表格里的「镜像直链」丢给浏览器 / `curl`：
+
+```powershell
+curl.exe -L -o AWPainting_v1.2.safetensors https://hf-mirror.com/sam749/AWPainting-v1-2/resolve/main/awpainting_v12.safetensors
+# 校验（可选，值见下表 sha256）：Get-FileHash .\AWPainting_v1.2.safetensors -Algorithm SHA256
+```
+
+落地位置：checkpoint → `<SD目录>\models\Stable-diffusion\`；VAE → `models\VAE\`；LoRA → `models\Lora\`；embedding → `embeddings\`（老版 A1111 也认 `models\embeddings\`）。
+
+---
+
+## 1. Checkpoint（大模型，本机 7 个）
+
+| 键（`-Models`） | 本机文件 | 大小 | HF 仓库 | 镜像直链 | sha256 | 用途 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `awpainting` | `AWPainting_v1.2.safetensors` | 2034 MB | `sam749/AWPainting-v1-2` | https://hf-mirror.com/sam749/AWPainting-v1-2/resolve/main/awpainting_v12.safetensors | `3d1b3c42ec704f3397d9e2968e3e544eda111741e10793afd78faa8148b36e12` | **默认·通用**（动漫/插画，官方推荐 CLIP skip 2） |
+| `revanimated` | `动漫ReVAnimated_v1.1.safetensors` | 5410 MB | `hanafuusen2001/ReVAnimated` | https://hf-mirror.com/hanafuusen2001/ReVAnimated/resolve/main/revAnimated_v11.safetensors | `d725be5d187c172fbabfb2d35cf6bff2237367a8c1cf743d03c1c0e57f0e43fa` | 动漫综合（画风更能打，体积大） |
+| `anythingv5` | `anything-v5-PrtRE.safetensors` | 2034 MB | `ckpt/anything-v5.0` | https://hf-mirror.com/ckpt/anything-v5.0/resolve/main/AnythingV5V3_v5PrtRE.safetensors | `7f96a1a9ca9b3a3242a9ae95d19284f0d2da8d5282b42d2d974398bf7663a252` | 动漫·anything v5（稳妥老牌） |
+| `majicmix` | `写实：majicMIX realistic 麦橘写实_v7.safetensors` | 2034 MB | `digiplay/majicMIX_realistic_v7` | https://hf-mirror.com/digiplay/majicMIX_realistic_v7/resolve/main/majicmixRealistic_v7.safetensors | `7c819b6d13663ed720c2254f4fe18373107dfef2448d337913c8fc545640881e` | **写实人像**（C 档「写实」画风自动切它） |
+| `semirealmix` | `SemiRealMix.safetensors` | 2034 MB | `robotjung/SemiRealMix` | https://hf-mirror.com/robotjung/SemiRealMix/resolve/main/SemiRealMix.safetensors | `385ea18efae6a93c19c1fc5e13447e19b5ed6f16d01b7be65f7f48252688e4b4` | **彩色哥特**画风底模（半写实/2.5D 备选） |
+| `darksushi` | `二次元：dark sushi mix 大颗寿司mix_brighterpruned.safetensors` | 2034 MB | `mdl-mirror/dark-sushi-mix` | https://hf-mirror.com/mdl-mirror/dark-sushi-mix/resolve/main/darkSushiMixMix_brighterPruned.safetensors | `099e07547a45dc501a96a7b613e5bfe502be9477199172ca29821882dd8350a1` | 二次元·大颗寿司（亮部加强版） |
+
+## 2. VAE（本机 2 个）
+
+| 键（`-Vaes`） | 本机文件 | 大小 | HF 仓库 | 镜像直链 | sha256 | 用途 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `mse` | `vae-ft-mse-840000-ema-pruned.safetensors` | 319 MB | `stabilityai/sd-vae-ft-mse-original` | https://hf-mirror.com/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors | `735e4c3a447a3255760d7f86845f09f937809baa529c17370d83e4c3758f3c75` | **默认·不发灰**（写进 `config.json` 的 `sd_vae`） |
+| `animevae` | `animevae.pt` | 785 MB | `akibanzu/animevae` | https://hf-mirror.com/akibanzu/animevae/resolve/main/animevae.pt | `f921fb3f29891d2a77a6571e56b8b5052420d2884129517a333c60b1b4816cdf` | 动漫·anything 系专用 |
+
+## 3. LoRA（HF 清单 + 本机自调）
+
+### 3.1 HF 清单（`-Loras` 键，`install-sd.ps1` 能一键拉）
+
+| 键 | 本机文件 | 大小 | HF 仓库 | 镜像直链 | sha256 | 用途 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `add_detail` | `add_detail.safetensors` | 36 MB | `OedoSoldier/detail-tweaker-lora` | https://hf-mirror.com/OedoSoldier/detail-tweaker-lora/resolve/main/add_detail.safetensors | `47aaaf0d2945ca937151d61304946dd229b3f072140b85484bc93e38f2a6e2f7` | 细节增强（写 0.6-0.8） |
+| `semireal` | `semirealisticanime.safetensors` | 288 MB | `NoneIQalt/semirealisticlora` | https://hf-mirror.com/NoneIQalt/semirealisticlora/resolve/main/semirealisticanime.safetensors | `ffce33239edde3afd8831beac2168cf60fc0a447e2f76d86dcc06460a2b9359a` | **写实二次元 / 写实二次元·东亚脸** 专用（**0.6** 是实测平衡点） |
+| `easynegative` | `EasyNegative.safetensors`（嵌入，放 `embeddings\`） | 24 KB | `embed/EasyNegative` | https://hf-mirror.com/embed/EasyNegative/resolve/main/EasyNegative.safetensors | `c74b4e810b030f6b75fde959e2db678c268d07115b85356d3c0138ba5eb42340` | 负面嵌入·通用质量底线 |
+| `badhandv4` | `badhandv4.safetensors`（嵌入，放 `embeddings\`） | 18 KB | `Eugeoter/badhandv4` | https://hf-mirror.com/Eugeoter/badhandv4/resolve/main/badhandv4.safetensors | `6836f178cc41a5436730afded6cbe2bdcef61663b1ad2d2f83ad028019a0ff98` | 手部修复嵌入（**手崩优先用它**） |
+
+### 3.2 本机自调 / 国内站 LoRA（不进 HF 默认清单，手动放 `models\Lora\`）
+
+这些是用户自己收集/自己调的风格资源（国内站直链不稳，脚本不抓，手动下载后放进 `models\Lora\`，`sd_models` 就能列出来）：
+
+| 本机文件 | 大小 | 建议来源（搜同名即可） | 用途 / 对应画风 |
+| --- | --- | --- | --- |
+| `釉彩·麻袋调色盘_v1.0.safetensors` | 144 MB | LiblibAI / Civitai 搜「釉彩 麻袋 调色盘 / glaze palette」 | **C 档画风「釉彩调色盘」**（釉面质感 + 粗布色域，权重 0.8） |
+| `国风山水_v1.0.safetensors` | 72 MB | LiblibAI 搜「国风山水」 | 国风山水（`<lora:国风山水_v1.0:0.8>`） |
+| `赛博朋克_v1.0.safetensors` | 144 MB | LiblibAI 搜「赛博朋克」 | 赛博朋克人物/氛围 |
+| `赛博朋克场景_v1.0.safetensors` | 144 MB | LiblibAI 搜「赛博朋克场景」 | 赛博朋克场景（霓虹雨夜街景） |
+| `自然美妆场景_v1.0.safetensors` | 144 MB | LiblibAI 搜「自然美妆场景」 | 电商/美妆人像场景 |
+| `39_v1.0.safetensors` | 72 MB | LiblibAI 搜「39」 | 用户自留风格（按需挂） |
+| `EasyNegativeV2.safetensors` | 24 KB | Civitai 搜 EasyNegativeV2 | 负面嵌入（V2，与 EasyNegative 二选一） |
+
+> 国内站下载要点：LiblibAI 需登录后点下载；Civitai 直链要带 token。两个站都建议直接搜文件名关键词，
+> 下载后核对体积（上表「大小」是本机实测值，误差 ±1 MB 属正常）。
+
+## 4. 本机环境基线（画质已验证）
+
+| 项 | 值 |
+| --- | --- |
+| checkpoint | `AWPainting_v1.2.safetensors`（Model hash `3d1b3c42ec`） |
+| VAE | `vae-ft-mse-840000-ema-pruned.safetensors`（VAE hash `735e4c3a44`） |
+| CLIP skip | `2`（动漫模型必须，写进 `config.json` 的 `CLIP_stop_at_last_layers`） |
+| 采样器 / 步数 / CFG | `DPM++ 2M` / 22-28 / 7 |
+| 典型 hires | scale 1.5、denoising 0.55（别开 restoreFaces，会洗细节） |
+
+换机器复现同样画质：装好 WebUI 后跑一次 `install-sd.ps1`（默认就补 AWPainting + mse VAE + CLIP skip 2），再按上表核对 `sd_models` 列出的名字。

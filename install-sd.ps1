@@ -33,11 +33,11 @@ param(
     [string]$Target = (Join-Path $env:LOCALAPPDATA 'dsh-sd-bridge\webui'),
     [string]$Repo = 'https://github.com/AUTOMATIC1111/stable-diffusion-webui.git',
     # 主模型清单（逗号多选，键见 $ModelCatalog；none = 不拉模型）
-    [string]$Models = 'awpainting',
+    [string]$Models = 'awpainting,semirealmix',
     # VAE 清单（逗号多选，键见 $VaeCatalog；none = 不拉 VAE）
     [string]$Vaes = 'mse,animevae',
     # LoRA / Embedding 清单（逗号多选，键见 $LoraCatalog；none = 不拉）
-    [string]$Loras = 'add_detail,easynegative,badhandv4',
+    [string]$Loras = 'add_detail,semireal,easynegative,badhandv4',
     # 已存在的文件做 sha 复验、清单里有更高版本就补拉（旧版本按 Supersedes 识别）
     [switch]$Upgrade,
     [string]$Mirror = 'https://hf-mirror.com',   # 填 "" 用官方源
@@ -53,7 +53,8 @@ param(
     [switch]$SkipPython,                        # 跳过 Python 自举
     [switch]$SkipVC,                            # 跳过 VC++ 运行库预检
     [switch]$SkipDiskCheck,                     # 跳过磁盘空间预检
-    [switch]$NoPrereq                           # 跳过整个环境预检段
+    [switch]$NoPrereq,                          # 跳过整个环境预检段
+    [string]$StateFile = ''                     # 安装记录路径；留空 = ~/.dsh-sd-bridge.json（可用 DSH_SD_STATE_FILE 覆盖）
 )
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ $ModelCatalog = [ordered]@{
     revanimated = @{ Name = 'revAnimated_v11.safetensors'; Repo = 'hanafuusen2001/ReVAnimated'; File = 'revAnimated_v11.safetensors'; Sha = 'd725be5d187c172fbabfb2d35cf6bff2237367a8c1cf743d03c1c0e57f0e43fa'; Tag = '动漫综合（v1.1，本机实测同哈希）'; Supersedes = @('revAnimated_v10.safetensors', '动漫ReVAnimated_v1.1.safetensors') }
     anythingv5  = @{ Name = 'AnythingV5V3_v5PrtRE.safetensors'; Repo = 'ckpt/anything-v5.0'; File = 'AnythingV5V3_v5PrtRE.safetensors'; Sha = '7f96a1a9ca9b3a3242a9ae95d19284f0d2da8d5282b42d2d974398bf7663a252'; Tag = '动漫·anything v5（本机实测同哈希）' }
     majicmix    = @{ Name = 'majicmixRealistic_v7.safetensors'; Repo = 'digiplay/majicMIX_realistic_v7'; File = 'majicmixRealistic_v7.safetensors'; Sha = '7c819b6d13663ed720c2254f4fe18373107dfef2448d337913c8fc545640881e'; Tag = '写实（麦橘写实 v7，本机实测同哈希）' }
+    semirealmix = @{ Name = 'SemiRealMix.safetensors'; Repo = 'robotjung/SemiRealMix'; File = 'SemiRealMix.safetensors'; Sha = '385ea18efae6a93c19c1fc5e13447e19b5ed6f16d01b7be65f7f48252688e4b4'; Tag = '写实二次元·半写实（二次元脸 + 写实渲染，SemiRealMix）' }
     darksushi   = @{ Name = 'darkSushiMixMix_brighterPruned.safetensors'; Repo = 'mdl-mirror/dark-sushi-mix'; File = 'darkSushiMixMix_brighterPruned.safetensors'; Sha = '099e07547a45dc501a96a7b613e5bfe502be9477199172ca29821882dd8350a1'; Tag = '二次元·大颗寿司 brighterPruned（本机实测同哈希）' }
 }
 
@@ -76,6 +78,7 @@ $VaeCatalog = [ordered]@{
 # LoRA 放 models\Lora，Embedding 放 models\embeddings（A1111 各自的扫描目录）
 $LoraCatalog = [ordered]@{
     add_detail   = @{ Sub = 'Lora'; Name = 'add_detail.safetensors'; Repo = 'OedoSoldier/detail-tweaker-lora'; File = 'add_detail.safetensors'; Sha = '47aaaf0d2945ca937151d61304946dd229b3f072140b85484bc93e38f2a6e2f7'; Tag = '细节增强（detail tweaker，38MB）' }
+    semireal     = @{ Sub = 'Lora'; Name = 'semirealisticanime.safetensors'; Repo = 'NoneIQalt/semirealisticlora'; File = 'semirealisticanime.safetensors'; Sha = 'ffce33239edde3afd8831beac2168cf60fc0a447e2f76d86dcc06460a2b9359a'; Tag = '写实二次元·半写实 LoRA（288MB）' }
     easynegative = @{ Sub = 'embeddings'; Name = 'EasyNegative.safetensors'; Repo = 'embed/EasyNegative'; File = 'EasyNegative.safetensors'; Sha = 'c74b4e810b030f6b75fde959e2db678c268d07115b85356d3c0138ba5eb42340'; Tag = '负面嵌入·通用质量底线（24KB）' }
     badhandv4    = @{ Sub = 'embeddings'; Name = 'badhandv4.safetensors'; Repo = 'Eugeoter/badhandv4'; File = 'badhandv4.safetensors'; Sha = '6836f178cc41a5436730afded6cbe2bdcef61663b1ad2d2f83ad028019a0ff98'; Tag = '手部修复嵌入（18KB）' }
 }
@@ -101,6 +104,45 @@ function Get-HfUrl([hashtable]$Item, [string]$MirrorBase) {
     $url = "https://huggingface.co/$($Item.Repo)/resolve/main/$($Item.File)"
     if ($MirrorBase -ne '' -and $url -like '*huggingface.co*') { $url = $url -replace 'https://huggingface.co', $MirrorBase }
     return $url
+}
+
+# hf-mirror.com 对 resolve/main/ 下的**每个文件**都回 308（Location 指向 huggingface.co，再 302 到 CDN）。
+# PS5.1 的 HttpWebRequest 不把 308 当可自动跟随的重定向——即使 AllowAutoRedirect 默认为 true 也直接抛异常。
+# 这里手动跟 Location 链（301/302/303/307/308 都跟），返回最终地址；跟不动就退回原 URL 让下载自己报错。
+function Resolve-HfRedirect {
+    param([string]$Url)
+    $maxHop = 8
+    $cur = $Url
+    for ($hop = 0; $hop -lt $maxHop; $hop++) {
+        $code = 0
+        $loc = $null
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($cur)
+            $req.Method = 'HEAD'
+            $req.AllowAutoRedirect = $false
+            $req.Timeout = 20000
+            $req.UserAgent = 'dsh-sd-bridge-guard/install-sd.ps1'
+            $resp = $req.GetResponse()
+            $code = [int]$resp.StatusCode
+            $loc = [string]$resp.Headers['Location']
+            $resp.Close()
+        } catch {
+            # 308 会让 GetResponse 抛 WebException，但响应体里带着 Location——从这里抠出来
+            if ($_.Exception -and $_.Exception.Response) {
+                try {
+                    $code = [int]$_.Exception.Response.StatusCode
+                    $loc = [string]$_.Exception.Response.Headers['Location']
+                } catch { }
+            }
+            if ($code -lt 300 -or $code -ge 400 -or -not $loc) { return $cur }
+        }
+        if ($code -ge 300 -and $code -lt 400 -and $loc) {
+            try { $cur = ([System.Uri]::new([System.Uri]$cur, $loc)).AbsoluteUri } catch { return $cur }
+            continue
+        }
+        return $cur
+    }
+    return $cur
 }
 
 
@@ -249,22 +291,39 @@ function Install-Python310 {
 $script:SegmentWorker = {
     param([string]$Url, [long]$Start, [long]$End, [string]$Part, [int]$Tries)
     $need = $End - $Start + 1
+    $tmp = "$Part.partnew"
     for ($a = 1; $a -le $Tries; $a++) {
+        $resp = $null; $src = $null; $dst = $null
         try {
             if ((Test-Path -LiteralPath $Part) -and ((Get-Item -LiteralPath $Part).Length -eq $need)) { return $true }
-            $req = [System.Net.HttpWebRequest]::Create($Url)
+            # 308 手动跟一次：hf-mirror 对 resolve/main 下每个文件都回 308，PS5.1 不会自动跟随
+            $eff = Resolve-HfRedirect -Url $Url
+            $req = [System.Net.HttpWebRequest]::Create($eff)
             $req.AddRange($Start, $End)
+            $req.AllowAutoRedirect = $true
             $req.UserAgent = 'dsh-sd-bridge-guard/install-sd.ps1'
             $req.Timeout = 30000
             $req.ReadWriteTimeout = 120000
             $resp = $req.GetResponse()
             $src = $resp.GetResponseStream()
-            $dst = [System.IO.File]::Create($Part)
+            # 先写 .partnew，长度校验通过再原子改名——永不产生半成品分片
+            $dst = [System.IO.File]::Create($tmp)
             $buf = New-Object byte[] (262144)
             while (($n = $src.Read($buf, 0, $buf.Length)) -gt 0) { $dst.Write($buf, 0, $n) }
-            $dst.Dispose(); $src.Dispose(); $resp.Close()
-            if ((Get-Item -LiteralPath $Part).Length -eq $need) { return $true }
-        } catch { }
+            $dst.Flush(); $dst.Close(); $dst = $null
+            $src.Close(); $src = $null
+            $resp.Close(); $resp = $null
+            if ((Get-Item -LiteralPath $tmp).Length -eq $need) {
+                Move-Item -LiteralPath $tmp -Destination $Part -Force
+                return $true
+            }
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        } catch {
+        } finally {
+            if ($dst) { try { $dst.Dispose() } catch { } }
+            if ($src) { try { $src.Dispose() } catch { } }
+            if ($resp) { try { $resp.Close() } catch { } }
+        }
         Start-Sleep -Seconds ([Math]::Min(10, 2 * $a))
     }
     return $false
@@ -280,11 +339,15 @@ function Get-SegmentedFile {
     $dir = Split-Path -Parent $OutFile
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
+    # 0) 先跟 308 跳转拿真实 CDN 地址（PS5.1 不自动跟随 308，HEAD 探测拿不到长度就退化单流）
+    $effUrl = Resolve-HfRedirect -Url $Url
+
     # 1) 探总长度（HEAD；不支持就退回单流）
     $total = -1
     try {
-        $head = [System.Net.HttpWebRequest]::Create($Url)
+        $head = [System.Net.HttpWebRequest]::Create($effUrl)
         $head.Method = 'HEAD'
+        $head.AllowAutoRedirect = $true
         $head.Timeout = 30000
         $head.UserAgent = 'dsh-sd-bridge-guard/install-sd.ps1'
         $r = $head.GetResponse(); $total = $r.ContentLength; $r.Close()
@@ -304,66 +367,94 @@ function Get-SegmentedFile {
             [long]$e = [Math]::Min($total - 1, $s + $chunk - 1)
             $part = "$OutFile.part$i"
             $parts += $part
-            if ((Test-Path -LiteralPath $part) -and ((Get-Item -LiteralPath $part).Length -eq ($e - $s + 1))) { continue }  # 断点续传
+            # 断点续传：只认「长度正好等于这一段」的完整分片；被截断的半成品不算数（下次重下这一段）
+            if ((Test-Path -LiteralPath $part) -and ((Get-Item -LiteralPath $part).Length -eq ($e - $s + 1))) { continue }
             $ps = [powershell]::Create()
-            $ps.AddScript($script:SegmentWorker.ToString()).AddArgument($Url).AddArgument($s).AddArgument($e).AddArgument($part).AddArgument(5) | Out-Null
+            $ps.AddScript($script:SegmentWorker.ToString()).AddArgument($effUrl).AddArgument($s).AddArgument($e).AddArgument($part).AddArgument(5) | Out-Null
             $ps.RunspacePool = $pool
             $jobs += [pscustomobject]@{ Pipe = $ps; Handle = $ps.BeginInvoke(); Part = $part }
         }
-        Write-Host "分段并行下载（$Segs 段，共 $([math]::Round($total/1MB,1)) MB）：$Url"
+        Write-Host "分段并行下载（$Segs 段，共 $([math]::Round($total/1MB,1)) MB）：$effUrl"
         $failed = @()
         foreach ($j in $jobs) {
             $ok = $false
             try { $res = $j.Pipe.EndInvoke($j.Handle); $ok = [bool]($res[$res.Count - 1]) } catch { $ok = $false }
-            $j.Pipe.Dispose()
+            try { $j.Pipe.Dispose() } catch { }
             if (-not $ok) { $failed += $j.Part }
         }
-        $pool.Close()
+        try { $pool.Close() } catch { }
+        try { $pool.Dispose() } catch { }
+
+        # 分段全挂（网络并发不稳 / 整段都失败）→ 自动降级单流重试一轮，而不是直接抛错
         if ($failed.Count -gt 0) {
             $left = @($parts | Where-Object { -not (Test-Path -LiteralPath $_) -or ((Get-Item -LiteralPath $_).Length -eq 0) })
             if ($failed.Count -eq $parts.Count -or $left.Count -eq $parts.Count) {
-                throw "分段下载全部失败（网络或不支持 Range）：$Url"
+                # 清理半成品分片（逐项 try/catch，别让残留句柄把脚本打断）
+                foreach ($p in $parts) {
+                    try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } catch { }
+                }
+                Write-Host "分段下载全部失败，降级单流下载：$effUrl" -ForegroundColor Yellow
+                $ok = $false
+                for ($a = 1; $a -le 3 -and -not $ok; $a++) {
+                    try {
+                        Invoke-WebRequest -Uri $effUrl -OutFile $OutFile -UseBasicParsing -TimeoutSec 1800
+                        $ok = (Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -eq $total)
+                    } catch {
+                        Write-Host "单流第 $a 次失败：$($_.Exception.Message)" -ForegroundColor Yellow
+                        Start-Sleep -Seconds (3 * $a)
+                    }
+                }
+                if (-not $ok) { throw "下载失败（分段与单流均失败）：$effUrl" }
+            } else {
+                Write-Host "有 $($failed.Count) 段失败，留待重跑续传（已成功的段不会重下）。" -ForegroundColor Yellow
             }
-            Write-Host "有 $($failed.Count) 段失败，留待重跑续传（已成功的段不会重下）。" -ForegroundColor Yellow
         }
-        # 合并分段
-        $out = [System.IO.File]::Create($OutFile)
-        try {
-            for ($i = 0; $i -lt $parts.Count; $i++) {
-                $p = $parts[$i]
-                if (-not (Test-Path -LiteralPath $p)) { throw "缺少分段 $p（请重跑续传）" }
-                $in = [System.IO.File]::OpenRead($p)
-                $in.CopyTo($out)
-                $in.Dispose()
+
+        # 只在一部分段成功、需要合并时才走下面（全部失败已降级单流直接返回）
+        $stillNeedsMerge = $false
+        foreach ($p in $parts) { if (Test-Path -LiteralPath $p) { $stillNeedsMerge = $true; break } }
+        if ($stillNeedsMerge) {
+            # 释放可能残留的文件句柄再合并（下载线程刚 Dispose，句柄有时要一小拍才彻底释放）
+            Start-Sleep -Milliseconds 1200
+            $out = [System.IO.File]::Create($OutFile)
+            try {
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $p = $parts[$i]
+                    if (-not (Test-Path -LiteralPath $p)) { throw "缺少分段 $p（请重跑续传）" }
+                    $in = [System.IO.File]::OpenRead($p)
+                    try { $in.CopyTo($out) } finally { $in.Dispose() }
+                }
+            } finally { $out.Dispose() }
+            # 合并完成后清分段（逐项 try/catch，文件被占也不掀翻脚本）
+            foreach ($p in $parts) {
+                try { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } } catch { }
             }
-        } finally { $out.Dispose() }
-        # 合并完成后清分段
-        foreach ($p in $parts) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force } }
-        if ((Get-Item -LiteralPath $OutFile).Length -ne $total) {
-            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
-            throw "合并后长度不符（期望 $total），已删除，请重跑续传。"
+            if ((Get-Item -LiteralPath $OutFile).Length -ne $total) {
+                try { Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue } catch { }
+                throw "合并后长度不符（期望 $total），已删除，请重跑续传。"
+            }
         }
     } else {
         # 服务器不给长度/不支持 Range → 单流 + 重试
-        Write-Host "单流下载（服务器未提供长度或不支持 Range）：$Url"
+        Write-Host "单流下载（服务器未提供长度或不支持 Range）：$effUrl"
         $ok = $false
         for ($a = 1; $a -le 4 -and -not $ok; $a++) {
             try {
-                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 1800
+                Invoke-WebRequest -Uri $effUrl -OutFile $OutFile -UseBasicParsing -TimeoutSec 1800
                 $ok = (Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -gt 0)
             } catch {
                 Write-Host "第 $a 次下载失败：$($_.Exception.Message)" -ForegroundColor Yellow
                 Start-Sleep -Seconds (3 * $a)
             }
         }
-        if (-not $ok) { throw "下载失败：$Url" }
+        if (-not $ok) { throw "下载失败：$effUrl" }
     }
 
     $size = (Get-Item -LiteralPath $OutFile).Length
     if ($Sha256) {
         $got = Get-Sha256 $OutFile
         if ($got -ne $Sha256.ToLowerInvariant()) {
-            Remove-Item -LiteralPath $OutFile -Force
+            try { Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue } catch { }
             throw "sha256 校验失败：期望 $Sha256，实际 $got（已删除）"
         }
         Write-Host "sha256 校验通过: $got" -ForegroundColor Green
@@ -580,8 +671,12 @@ function Invoke-CatalogDownload {
         return $st.Path
     } catch {
         Write-Host "$Label 下载失败（$($_.Exception.Message)），跳过继续——可稍后重跑补齐。" -ForegroundColor Yellow
-        Get-ChildItem -LiteralPath $Dir -Filter '*.part*' -ErrorAction SilentlyContinue | Remove-Item -Force
-        if ((Test-Path -LiteralPath $st.Path) -and -not $Item.Sha) { Remove-Item -LiteralPath $st.Path -Force -ErrorAction SilentlyContinue }
+        # 逐项 try/catch 清理 .part*：下载线程可能仍占着文件，Remove-Item 抛 IOException
+        # 在 $ErrorActionPreference='Stop' 下会把整个脚本掀翻（后续 VAE/LoRA/config/记录全不执行）
+        Get-ChildItem -LiteralPath $Dir -Filter '*.part*' -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+        }
+        if ((Test-Path -LiteralPath $st.Path) -and -not $Item.Sha) { try { Remove-Item -LiteralPath $st.Path -Force -ErrorAction SilentlyContinue } catch { } }
         $script:downloadLog += [pscustomobject]@{ Kind = $Label; Name = $Item.Name; Result = "✗ $($_.Exception.Message)" }
         return $null
     }
@@ -665,19 +760,42 @@ if ($downloadLog.Count -gt 0) {
 # 5) 记录安装位置，插件下次启动自动读到（~/.dsh-sd-bridge.json）
 #    坑10 根因：PS5.1 `Set-Content -Encoding UTF8` 写出**带 BOM** 的文件，
 #    插件裸 JSON.parse 遇 BOM 抛错 → sdDir 读成空 → 每次都指引重复安装。这里用无 BOM 写入。
-$stateFile = Join-Path $env:USERPROFILE '.dsh-sd-bridge.json'
+#    坑21：记录写失败（目录只读 / 沙箱拦 / 企业策略）**不能把已装好的 SD 判成失败**——
+#    WebUI、模型、VAE、配置都已落盘，重跑一次也只是补缺。所以这里只报一条错 + 一行提示，
+#    不让未捕获异常把整次安装打成 exit 1。
+if ($StateFile) {
+    $stateFile = $StateFile
+} elseif ($env:DSH_SD_STATE_FILE) {
+    $stateFile = $env:DSH_SD_STATE_FILE
+} else {
+    $stateFile = Join-Path $env:USERPROFILE '.dsh-sd-bridge.json'
+}
 $record = [ordered]@{ sdDir = $Target }
 if ($pythonExe) { $record['pythonDir'] = (Split-Path -Parent $pythonExe) }   # 插件启动时优先用它
 $json = ($record | ConvertTo-Json)
-[System.IO.File]::WriteAllText($stateFile, "$json`r`n", $Utf8NoBom)
-$bytes = [System.IO.File]::ReadAllBytes($stateFile)
-$bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-Write-Host "已记录安装位置 -> $stateFile  (BOM=$bom，必须 False)" -ForegroundColor Green
-if ($bom) { Write-Host "警告：记录仍带 BOM，插件将读不出来！请手动删除该文件重跑。" -ForegroundColor Red }
+$recordWritten = $false
+try {
+    [System.IO.File]::WriteAllText($stateFile, "$json`r`n", $Utf8NoBom)
+    $bytes = [System.IO.File]::ReadAllBytes($stateFile)
+    $bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    if ($bom) {
+        Write-Host "警告：记录仍带 BOM，插件将读不出来！请手动删除该文件重跑：$stateFile" -ForegroundColor Red
+    } else {
+        Write-Host "已记录安装位置 -> $stateFile  (BOM=$bom，必须 False)" -ForegroundColor Green
+    }
+    $recordWritten = $true
+} catch {
+    # 安装本身已成功：只提示，不中断。插件侧还有 DSH_SD_DIR / cordis.patch.yml 两条兜底路径。
+    Write-Host "安装记录写入失败（不影响已装好的 SD）：$stateFile — $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "插件读不到记录时可改设环境变量 DSH_SD_DIR=$Target，或在 cordis.patch.yml 按 id sd-bridge 覆盖 sdDir。" -ForegroundColor Yellow
+}
 
 Write-Host ""
 Write-Host "== 完成 ==" -ForegroundColor Cyan
 Write-Host "1. 重启 DeepSeek Harness（插件会重新探测 SD 目录）"
+if (-not $recordWritten) {
+    Write-Host "   （本次安装记录没写成功：重启前先设 DSH_SD_DIR=$Target，否则插件探测不到）" -ForegroundColor Yellow
+}
 Write-Host "2. 直接让它画一张图即可；首次启动会在线安装 Python/torch 依赖（10-30 分钟），之后秒级"
 Write-Host "3. 想换安装位置：设环境变量 DSH_SD_DIR，或在 cordis.patch.yml 按 id sd-bridge 覆盖 sdDir"
 Write-Host "4. 首次依赖准备已由插件预置：Blackwell(RTX50 系) 自动用 torch 2.7.0+cu128、pip 钉 setuptools/numpy/opencv、"
