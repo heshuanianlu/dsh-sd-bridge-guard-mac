@@ -500,6 +500,38 @@ assert.ok(injectPs1.includes('釉彩·麻袋调色盘_v1.0'), '「釉彩调色�
 assert.ok(/\$P\.Style -in @\('写实二次元', '写实二次元·东亚脸'\)/.test(injectPs1), '东亚脸画风必须复用「不切模型 + 半写实 LoRA」路径')
 
 // ---------------------------------------------------------------------------
+// 画风映射完整性回归（2026-10-15「二次元画风画不出来」事故）：
+// ① 下拉里的每个画风都必须有 Get-StylePrompt 分支（只有「保持画风」允许是空映射，这是它的语义）；
+// ② 「二次元」必须有正向词（当时就是这一档整个没有分支 → 选了等于没选）；
+// ③ 「二次元」必须有切回动漫底的模型规则（画风切模型是持久的，不切回来就会停在写实底上出图）。
+// ---------------------------------------------------------------------------
+const styleListMatch = injectPs1.match(/foreach \(\$s in @\(([^)]*)\)\) \{ \$null = \$cboStyle\.Items\.Add\(\$s\) \}/)
+assert.ok(styleListMatch, '画风下拉清单必须可解析（foreach ($s in @(...)) 形式）')
+const dropdownStyles = [...styleListMatch[1].matchAll(/'([^']+)'/g)].map((m) => m[1])
+assert.ok(dropdownStyles.length >= 10, `画风下拉清单过短：${dropdownStyles.join(', ')}`)
+
+const styleFnMatch = injectPs1.match(/function Get-StylePrompt \{[\s\S]*?\n\}/)
+assert.ok(styleFnMatch, 'Get-StylePrompt 函数必须存在')
+const mappedStyles = [...styleFnMatch[0].matchAll(/^\s{8}'([^']+)'/gm)].map((m) => m[1])
+const intentionallyEmpty = new Set(['保持画风'])
+for (const style of dropdownStyles) {
+  assert.ok(
+    mappedStyles.includes(style) || intentionallyEmpty.has(style),
+    `画风「${style}」在下拉里但没有 Get-StylePrompt 映射（选了等于没选）——已知事故：二次元`,
+  )
+}
+const animeCase = styleFnMatch[0].match(/'二次元'\s*\{([\s\S]*?)\n\s{8}\}/)
+assert.ok(animeCase, 'Get-StylePrompt 必须有「二次元」分支')
+assert.ok(/anime style/.test(animeCase[1]), '「二次元」分支必须给出动漫正向词（anime style / lineart 一类）')
+assert.ok(/cel shading/.test(animeCase[1]), '「二次元」分支必须写明赛璐璐平涂（cel shading）')
+assert.ok(/function Get-AnimeCheckpoint/.test(injectPs1), '必须有动漫底 checkpoint 选择函数 Get-AnimeCheckpoint')
+assert.ok(/\$P\.Style -eq '二次元' -and -not \$formCheckpoint/.test(injectPs1), '「二次元」必须有切回动漫底的模型规则')
+assert.ok(/AWPainting\|awpainting/.test(injectPs1), '动漫底选择必须优先 AWPainting（本机动漫默认）')
+assert.ok(/function Test-RealisticCheckpoint/.test(injectPs1), '必须有写实底判定（写实二次元在当前底是写实向时先切回动漫底）')
+assert.ok(/function Get-SdCurrentModel/.test(injectPs1), '必须能读到真实当前模型（表单首项要显示它，避免「看着二次元其实在写实底上」）')
+assert.ok(/function Add-StyleWords/.test(injectPs1) && /function Remove-StyleWords/.test(injectPs1), '画风词注入/剥离必须走净化函数（防止反复切换堆出 ",,"）')
+
+// ---------------------------------------------------------------------------
 // 文档必须写清的两件事（用户明确要求）：本地模型评估链 + 触发话术（0.9.7）
 // ---------------------------------------------------------------------------
 const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8')

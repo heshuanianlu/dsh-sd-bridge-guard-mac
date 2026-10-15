@@ -282,7 +282,58 @@ function Get-SdCheckpoints {
     return $cps
 }
 
-# LoRA 片段：<lora:名称:权重>；名称带 .safetensors 后缀时保留原样（SD 两种都认）
+# 当前加载的 checkpoint 名。
+# 关键（2026-10-15 修「二次元画风画不出来」）：画风自动切模型是**持久**的——切过一次写实底
+# （写实 → majicMIX、彩色哥特 → SemiRealMix），SD 里就一直停在写实底；之后再选「二次元」若
+# 不显式切回来，出的还是写实/半写实图。这个函数让表单与画风规则都能看到真实的当前底子。
+function Get-SdCurrentModel {
+    try {
+        $o = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/sdapi/v1/options" -Method Get -TimeoutSec 5
+        return (Repair-Utf8Mojibake ([string]$o.sd_model_checkpoint))
+    } catch { return '' }
+}
+
+# 动漫底 checkpoint 选择：优先 AWPainting（本机动漫默认），其次 anything / ReVAnimated / dark sushi / 二次元 / 动漫 / anime。
+# 用途：二次元画风强制切回动漫底；写实二次元在「当前底是写实向」时也先切回来（再靠半写实 LoRA 上脸）。
+function Get-AnimeCheckpoint {
+    param([string[]]$Checkpoints)
+    $cps = @($Checkpoints | Where-Object { $_ })
+    $first = @($cps | Where-Object { $_ -match 'AWPainting|awpainting' } | Select-Object -First 1)
+    if ($first.Count -gt 0) { return [string]$first[0] }
+    $second = @($cps | Where-Object { $_ -match 'anything|ReVAnimated|revanimated|dark\s*sushi|二次元|动漫|anime' } | Select-Object -First 1)
+    if ($second.Count -gt 0) { return [string]$second[0] }
+    return ''
+}
+
+# 写实向底子判定（写实 / 半写实 / 真人照片取向的 checkpoint）
+function Test-RealisticCheckpoint {
+    param([string]$Name)
+    if (-not $Name) { return $false }
+    return [bool]($Name -match 'majicMIX|majicmix|realistic|SemiReal|semireal|麦橘|写实|real')
+}
+
+# 画风词注入 / 剥离时的提示词净化（2026-10-15 修：反复切画风会把逗号越堆越多）。
+# 现象：只做 Replace 的话，剥掉画风词会留下 ", " 尾巴，下一次注入再补一个 ", " → 实测连切三次
+# 正向词就变成 "1girl, solo, silver hair,,, anime style, ..."（多余的 ",," 空标签）。
+# 这两个函数把「连续逗号折叠成一个、开头逗号去掉、结尾不留空标签」集中处理。
+function Add-StyleWords {
+    param([string]$Text, [string]$Words)
+    if (-not $Words) { return $Text }
+    $t = "$Text"
+    $t = ($t -replace '(\s*,\s*)+', ', ').Trim().TrimEnd(',')
+    if (-not $t) { return $Words }
+    return "$t, $Words"
+}
+
+function Remove-StyleWords {
+    param([string]$Text, [string]$Words)
+    $t = "$Text"
+    if ($Words) { $t = $t.Replace($Words, '') }
+    $t = $t -replace '(\s*,\s*)+', ', '   # 连续逗号折叠成一个
+    $t = $t -replace '^\s*,\s*', ''       # 开头的逗号去掉
+    return $t.Trim()
+}
+
 function Format-LoraFragment {
     param([string]$LoraName, [double]$Weight)
     if (-not $LoraName) { return "" }
@@ -328,9 +379,39 @@ function Get-StylePrompt {
             $pos = "<lora:釉彩·麻袋调色盘_v1.0:0.8>, glaze texture, matte burlap canvas palette, muted earthy tones"
             $neg = ""
         }
-        '厚涂'     { $neg = "flat color, cel shading, lineart" }
-        '水彩'     { $neg = "thick paint, impasto, 3d render" }
-        '像素风'   { $neg = "smooth shading, gradient, blurry" }
+        '二次元'   {
+            # 2026-10-15 修：这一档以前**完全没有映射**（switch 里没有 '二次元' 分支 → 返回空词），
+            # 而它又是「无底图时」的默认档 —— 表现就是「选二次元什么都没有、画不出二次元」。
+            # 正统二次元 = 线稿 + 赛璐璐平涂 + 动漫脸；负向压掉 3D/照片感。
+            $pos = "anime style, (clean lineart:1.2), (cel shading:1.15), flat color, vibrant colors, (detailed anime eyes:1.2), beautiful detailed face, masterpiece, best quality"
+            $neg = "(3d:1.2), (photorealistic:1.3), photo, (realistic skin texture:1.2), (realistic face:1.2), sketch, (blurry lineart:1.1)"
+        }
+        '国风'     {
+            # 国风：以国风山水 LoRA 为主，这里只补底层风格词（不写 <lora:...>，避免与表单 LoRA 栏叠两层）
+            $pos = "traditional Chinese style, guofeng, (ink wash painting elements:1.15), elegant hanfu, silk texture, misty mountains, (classical Chinese aesthetic:1.2)"
+            $neg = "(3d:1.2), photorealistic, (western cartoon:1.1), modern city, neon lights"
+        }
+        '赛博朋克' {
+            # 赛博朋克：以赛博朋克场景 LoRA 为主，这里只补场景/光照底词
+            $pos = "cyberpunk, neon lights, rain-slick night city, holographic signs, (high-tech low-life:1.1), volumetric neon fog, reflective wet streets"
+            $neg = "daylight, rural, countryside, (flat lighting:1.1)"
+        }
+        '保持画风' {
+            # 明确「不注入任何画风词」：维持底图/LoRA/用户自己的提示词——保持空映射是这个档位的语义，
+            # 不是漏写（下方 厚涂/水彩/像素风 同理只补对应风格的词）。
+        }
+        '厚涂'     {
+            $pos = "impasto, thick paint, oil painting, visible brush strokes, palette knife texture"
+            $neg = "flat color, cel shading, lineart"
+        }
+        '水彩'     {
+            $pos = "watercolor painting, wet-on-wet, soft washes, pigment bleed, paper texture"
+            $neg = "thick paint, impasto, 3d render"
+        }
+        '像素风'   {
+            $pos = "pixel art, 8-bit, limited color palette, dithering, retro game sprite"
+            $neg = "smooth shading, gradient, blurry"
+        }
     }
     return @{ Pos = $pos; Neg = $neg }
 }
@@ -345,7 +426,8 @@ function Show-ParamForm {
         [string]$Negative,
         [string[]]$LoraList,
         [string[]]$CheckpointList,
-        [string]$InitImageDefault = ""
+        [string]$InitImageDefault = "",
+        [string]$CurrentModel = ""
     )
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "sd-inject 出图参数"
@@ -467,10 +549,10 @@ function Show-ParamForm {
     $cboStyle.Add_SelectedIndexChanged({
         # 1) 剥掉上一次注入的画风词（若存在）
         if ($script:injectedStylePos -and $txtPos.Text.Contains($script:injectedStylePos)) {
-            $txtPos.Text = $txtPos.Text.Replace($script:injectedStylePos, '').Trim()
+            $txtPos.Text = Remove-StyleWords -Text $txtPos.Text -Words $script:injectedStylePos
         }
         if ($script:injectedStyleNeg -and $txtNeg.Text.Contains($script:injectedStyleNeg)) {
-            $txtNeg.Text = $txtNeg.Text.Replace($script:injectedStyleNeg, '').Trim()
+            $txtNeg.Text = Remove-StyleWords -Text $txtNeg.Text -Words $script:injectedStyleNeg
         }
         # 2) 注入当前画风的词
         $st = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
@@ -478,13 +560,28 @@ function Show-ParamForm {
         $script:injectedStyleNeg = ""
         if ($st.Pos) {
             $script:injectedStylePos = $st.Pos
-            $txtPos.Text = if ($txtPos.Text) { "$($txtPos.Text.Trim()), $($st.Pos)" } else { $st.Pos }
+            $txtPos.Text = Add-StyleWords -Text $txtPos.Text -Words $st.Pos
         }
         if ($st.Neg) {
             $script:injectedStyleNeg = $st.Neg
-            $txtNeg.Text = if ($txtNeg.Text) { "$($txtNeg.Text.Trim()), $($st.Neg)" } else { $st.Neg }
+            $txtNeg.Text = Add-StyleWords -Text $txtNeg.Text -Words $st.Neg
         }
     })
+
+    # 初始档位也要注入一次（2026-10-15 修）：上面的 SelectedIndex 是在挂事件**之前**设的，
+    # 不补这一下，用户「不动下拉直接点确定」时默认档（无底图 = 二次元）就一个词都没有
+    # —— 现象正是「选了二次元却画不出二次元」。
+    try {
+        $st0 = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
+        if ($st0.Pos) {
+            $script:injectedStylePos = $st0.Pos
+            $txtPos.Text = Add-StyleWords -Text $txtPos.Text -Words $st0.Pos
+        }
+        if ($st0.Neg) {
+            $script:injectedStyleNeg = $st0.Neg
+            $txtNeg.Text = Add-StyleWords -Text $txtNeg.Text -Words $st0.Neg
+        }
+    } catch { }
 
     # 5) 画质（只读下拉：短边像素档位）
     $cboQuality = New-Object System.Windows.Forms.ComboBox
@@ -514,7 +611,11 @@ function Show-ParamForm {
     # 7) 模型（只读下拉：SD 在跑时自动拉取 checkpoint 列表；首项「（当前模型）」= 不切换）
     $cboModel = New-Object System.Windows.Forms.ComboBox
     $cboModel.DropDownStyle = 'DropDownList'
-    $null = $cboModel.Items.Add('（当前模型）')
+    # 首项直接写出**真实当前模型**：画风自动切模型是持久的，用户看不到底子就很容易
+    # 「选着二次元、其实还在写实底上出图」（2026-10-15 的故障现象）。
+    $curModelLabel = '（当前模型）'
+    if ($CurrentModel) { $curModelLabel = "（当前模型：$CurrentModel）" }
+    $null = $cboModel.Items.Add($curModelLabel)
     foreach ($m in $CheckpointList) { $null = $cboModel.Items.Add($m) }
     $cboModel.SelectedIndex = 0
     $cboModel.SetBounds(120, (240 + 7 * 40), 190, 24)
@@ -1038,12 +1139,13 @@ if (-not (Test-SdApiReady)) {
 $paramFormRounds = 3
 $sdLoras = Get-SdLoras
 $sdCheckpoints = Get-SdCheckpoints
+$sdCurrentModel = Get-SdCurrentModel   # 真实当前底子：画风切模型是持久的，规则与表单都要看到它
 # 表单预填前先补末尾英文逗号：让两个输入框里显示的基底提示词末尾就带逗号（用户要求）
 $formPositive = $BasePrompt
 $formNegative = $BaseNegative
 if ($formPositive -and ($formPositive -notmatch ',\s*$')) { $formPositive = $formPositive.TrimEnd() + ", " }
 if ($formNegative -and ($formNegative -notmatch ',\s*$')) { $formNegative = $formNegative.TrimEnd() + ", " }
-$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $InitImage
+$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $InitImage -CurrentModel $sdCurrentModel
 # 表单里的提示词是最终值（基底 + 用户在表单里的修改/追加）
 $positive = $P.Pos
 $negative = $P.Neg
@@ -1105,7 +1207,7 @@ if ($P.Lora -and $P.Lora -ne '（不用 LoRA）') {
 $size = Get-SizeFor -Ratio $P.Ratio -Quality $P.Quality
 # 模型切换：表单选了具体 checkpoint（非「（当前模型）」）才传给出图子流程
 $formCheckpoint = ""
-if ($P.Model -and $P.Model -ne '（当前模型）' -and $P.Model -ne '') { $formCheckpoint = $P.Model }
+if ($P.Model -and ($P.Model -notlike '（当前模型*') -and $P.Model -ne '') { $formCheckpoint = $P.Model }
 
 # 最终命名：表单「命名」栏 > 提示词总结 > 默认 inject；统一用 Get-UniqueOutPath 去重递增
 $finalBaseName = $P.Name
@@ -1123,6 +1225,23 @@ Write-Host "负向: $negative" -ForegroundColor White
 # 画风词已由表单联动（切换画风时注入两个提示词框）写进 $P.Pos/$P.Neg，这里**不再二次追加**，
 # 否则会重复（用户要求：C 档弹表单时根据画风在两个提示词框里加入对应画风词）。
 # 这里只保留「画风 → 自动切模型」的兜底逻辑（写实 → majicMIX；写实二次元 → 首选动漫底子不切模型，备选 SemiRealMix）。
+
+# 二次元画风：**必须显式切回动漫底**（2026-10-15 修「二次元画风画不出来」的核心）。
+# 原因：画风自动切模型是持久的——写实 → majicMIX、彩色哥特 → SemiRealMix 之后，SD 会一直停在那；
+# 再选「二次元」若不切回来，出的就是写实/半写实图（实测现网 SD 当时正停在 SemiRealMix 上）。
+if ($P.Style -eq '二次元' -and -not $formCheckpoint) {
+    $animeCkpt = Get-AnimeCheckpoint -Checkpoints $sdCheckpoints
+    if ($animeCkpt) {
+        $formCheckpoint = $animeCkpt
+        if ($sdCurrentModel -and $sdCurrentModel -ne $animeCkpt) {
+            Write-Host "二次元画风：当前底子是 $sdCurrentModel（不是动漫底）→ 自动切回动漫底 $animeCkpt" -ForegroundColor DarkGray
+        } else {
+            Write-Host "二次元画风：使用动漫底 $animeCkpt" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "二次元画风：本机未找到动漫底 checkpoint（当前 $sdCurrentModel），建议装 AWPainting / anything-v5" -ForegroundColor Yellow
+    }
+}
 
 # 写实画风且用户没在表单里手动选模型 → 自动切到本机写实 checkpoint（majicMIX），
 # 否则写实词落在动漫模型上会画风漂移（实测：AWPainting + 写实词 → 光影写实但脸还是动漫）。
@@ -1142,7 +1261,18 @@ if ($P.Style -eq '写实' -and -not $formCheckpoint) {
 if ($P.Style -in @('写实二次元', '写实二次元·东亚脸') -and -not $formCheckpoint) {
     $hasSemirealLora = @($sdLoras | Where-Object { $_ -match 'semirealisticanime' }).Count -gt 0
     if ($hasSemirealLora) {
-        Write-Host "写实二次元画风：保持动漫模型 + 半写实 LoRA 0.6（实测最优路径，不切模型）" -ForegroundColor DarkGray
+        if (Test-RealisticCheckpoint $sdCurrentModel) {
+            # 当前底是写实向（多半是上一次 写实/彩色哥特 留下的）→ 先切回动漫底，不然半写实 LoRA 挂在写实底上更糊
+            $animeCkpt = Get-AnimeCheckpoint -Checkpoints $sdCheckpoints
+            if ($animeCkpt) {
+                $formCheckpoint = $animeCkpt
+                Write-Host "写实二次元画风：当前底子是写实向（$sdCurrentModel）→ 先切回动漫底 $animeCkpt，再挂半写实 LoRA 0.6" -ForegroundColor DarkGray
+            } else {
+                Write-Host "写实二次元画风：当前是写实底（$sdCurrentModel）且本机找不到动漫底，保持当前模型 + 半写实 LoRA（会偏写实）" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "写实二次元画风：保持动漫模型 + 半写实 LoRA 0.6（实测最优路径，不切模型）" -ForegroundColor DarkGray
+        }
     } else {
         $semirealCkpt = @($sdCheckpoints | Where-Object { $_ -match 'SemiReal|semireal|半写实|2.5d|2\.5D' } | Select-Object -First 1)
         if ($semirealCkpt) {
@@ -1201,6 +1331,11 @@ $finalNegative = $negative
 # 末尾可能又没有逗号了，出图前统一再补一次（用户要求：提示词末尾加英文逗号）。
 if ($positive -and ($positive -notmatch ',\s*$')) { $positive = $positive.TrimEnd() + ", " }
 if ($finalNegative -and ($finalNegative -notmatch ',\s*$')) { $finalNegative = $finalNegative.TrimEnd() + ", " }
+
+# 送 SD 前最后一道提示词净化：脸部词/LoRA/画风词反复追加可能留下 "a,, b" 这种空标签（实测会出现），
+# 折叠成单个逗号后再补回结尾逗号（把「末尾必须有英文逗号」这条要求保下来）。
+if ($positive) { $positive = (($positive -replace '(\s*,\s*)+', ', ').Trim().TrimEnd(',')).Trim() + ", " }
+if ($finalNegative) { $finalNegative = (($finalNegative -replace '(\s*,\s*)+', ', ').Trim().TrimEnd(',')).Trim() + ", " }
 
 # 最终出图：底图 + Denoising 决定走不走图生图（2026-10-15 第二轮修：C 档实测「填了 Denoising 还是文生图」）。
 #   底图优先级：表单「底图」栏（路径 /「最近」/ 浏览选图） > 素体自检迭代的 winning 图 > 现场补一张素体底图。
