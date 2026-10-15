@@ -1,7 +1,7 @@
 ﻿# sd-inject.ps1 —— 本地提示词注入脚本（素体自检迭代 + 素体基底 + 参数表单）
 # 流程：素体自检迭代（只跑基底，换 seed + 面部修复重试到脸/手不崩；正向自动追加脸部细节词）
-#   → 出图参数表单（一次填完）：正向/负向提示词[基底已预填，多行文本框可直接改] / 迭代次数[默认32] / Denoising[默认0.7] / 比例[默认9:16] / 画风[默认二次元，图生图默认保持画风] / 画质[默认480p，最高2160p（4K）] / LoRA[可选，从 SD 拉取列表] / 取消退出
-#   → 最终出图：有素体成品走图生图（-InitImage + Denoising），最终图同样按迭代次数做脸/手质检迭代，取最高分那张
+#   → 出图参数表单（一次填完）：正向/负向提示词[基底已预填，多行文本框可直接改] / 迭代次数[默认32] / Denoising[可编辑，默认 0 = 文生图；填 0.3-0.9 = 拿素体成品做底图走图生图] / 比例[默认9:16] / 画风[默认二次元，图生图默认保持画风] / 画质[默认480p，最高2160p（4K）] / LoRA[可选，从 SD 拉取列表] / 取消退出
+#   → 最终出图：Denoising=0 走文生图（默认）；Denoising>0 且素体迭代有成品 → 图生图（-InitImage 素体 winning 图 + 表单 Denoising），最终图同样按迭代次数做脸/手质检迭代，取最高分那张
 # 迭代产物全部写入系统临时目录（**不进工作区**），最终只把脸/手最高分的一张复制进 -OutDir，
 # 脚本退出（含取消/失败）时删除整个临时迭代目录——工作区里永远只有成品。
 # 全程本地运行（SD 与脸/手质检的视觉模型都在本机）。
@@ -272,14 +272,25 @@ function Show-ParamForm {
     $cboRounds.SetBounds(120, (240 + 0 * 40), 190, 24)
     $form.Controls.Add($cboRounds)
 
-    # 2) Denoising（可编辑下拉：图生图重绘幅度；无素体成品时灰掉但保留展示）
+    # 2) Denoising（**恒可编辑**下拉：默认 0 = 文生图，不用素体底图；>0 = 拿素体 winning 图当底图走图生图）
+    # 坑：表单在素体自检迭代**之前**弹出，那时 $HasBaseImage 恒为 $false；旧代码据此把控件 Enabled=$false，
+    #     结果用户每次看到的都是灰掉的 Denoising（值改不了、手填也没用）——这就是「被错误锁定」的根因。
+    #     现在恒定 Enabled=$true + DropDown（可下拉可手填任意 0-0.95），锁定逻辑整段删除。
     $cboDenoise = New-Object System.Windows.Forms.ComboBox
     $cboDenoise.DropDownStyle = 'DropDown'
-    foreach ($v in @('0.4', '0.5', '0.6', '0.7', '0.8', '0.9')) { $null = $cboDenoise.Items.Add($v) }
-    $cboDenoise.Text = '0.7'
+    foreach ($v in @('0（文生图·不用底图）', '0.3', '0.4', '0.5', '0.6', '0.7', '0.8', '0.9')) { $null = $cboDenoise.Items.Add($v) }
+    $cboDenoise.Text = '0（文生图·不用底图）'   # 默认 = 现状行为（文生图），改大才走图生图
     $cboDenoise.SetBounds(120, (240 + 1 * 40), 190, 24)
-    if (-not $HasBaseImage) { $cboDenoise.Enabled = $false }
+    $cboDenoise.Enabled = $true
     $form.Controls.Add($cboDenoise)
+
+    # 灰字提示：说清 0 与 >0 的差别（用户可手填 0-0.95 之间任意值）
+    $lbDenoiseHint = New-Object System.Windows.Forms.Label
+    $lbDenoiseHint.Text = '（0=文生图；0.3-0.5 贴底图；≥0.7 重画）'
+    $lbDenoiseHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
+    $lbDenoiseHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbDenoiseHint.SetBounds(120, (240 + 1 * 40 + 24), 220, 16)
+    $form.Controls.Add($lbDenoiseHint)
 
     # 3) 比例（只读下拉：常见比例）
     $cboRatio = New-Object System.Windows.Forms.ComboBox
@@ -410,17 +421,17 @@ function Show-ParamForm {
         exit 0
     }
 
-    # 解析：非法输入回落默认（迭代次数回落 32、Denoising 回落 0.7）
+    # 解析：非法输入回落默认（迭代次数回落默认轮数、Denoising 回落 0 = 文生图）
     $rounds = $DefaultRounds
     $null = [int]::TryParse($cboRounds.Text.Trim(), [ref]$rounds)
     if ($rounds -lt 1) { $rounds = 1 } elseif ($rounds -gt 32) { $rounds = 32 }
-    $den = 0.7
-    if ($HasBaseImage) {
-        $null = [double]::TryParse(($cboDenoise.Text -replace ',', '.').Trim(), [ref]$den)
-        if ($den -lt 0.1) { $den = 0.1 } elseif ($den -gt 0.95) { $den = 0.95 }
-    } else {
-        $den = 0
-    }
+    # Denoising **恒定解析**（不再按 HasBaseImage 强行归零——表单先弹，那一刻必然还没有素体成品）：
+    # 取文本框开头的数字（兼容「0（文生图·不用底图）」这类带说明的条目），0 = 文生图，>0 = 图生图重绘幅度；
+    # 空值/非法 → 0（等于现状行为）。上限 0.95，防止填 1 直接把底图信息全洗掉。
+    $den = 0.0
+    $denMatch = [regex]::Match(($cboDenoise.Text -replace ',', '.').Trim(), '^[0-9]*\.?[0-9]+')
+    if ($denMatch.Success) { $null = [double]::TryParse($denMatch.Value, [ref]$den) }
+    if ($den -lt 0) { $den = 0 } elseif ($den -gt 0.95) { $den = 0.95 }
     return @{
         Pos     = $txtPos.Text.Trim()
         Neg     = $txtNeg.Text.Trim()
@@ -951,7 +962,8 @@ if (-not $finalBaseName) { $finalBaseName = Summarize-PromptName -Prompt $positi
 if (-not $finalBaseName) { $finalBaseName = $Name }
 
 Write-Host ""
-Write-Host "出图参数：迭代 $($P.Rounds) 次 | Denoising $($P.Denoise) | 比例 $($P.Ratio)（$($size.W)x$($size.H)） | 画风 $($P.Style) | 画质 $($P.Quality)$(if ($loraFragment) { " | LoRA $loraFragment" })$(if ($formCheckpoint) { " | 模型 $formCheckpoint" }) | 命名 $finalBaseName" -ForegroundColor Green
+$denoiseDesc = if ($P.Denoise -gt 0) { "Denoising $($P.Denoise)（图生图）" } else { "Denoising 0（文生图）" }
+Write-Host "出图参数：迭代 $($P.Rounds) 次 | $denoiseDesc | 比例 $($P.Ratio)（$($size.W)x$($size.H)） | 画风 $($P.Style) | 画质 $($P.Quality)$(if ($loraFragment) { " | LoRA $loraFragment" })$(if ($formCheckpoint) { " | 模型 $formCheckpoint" }) | 命名 $finalBaseName" -ForegroundColor Green
 Write-Host "正向: $positive" -ForegroundColor White
 Write-Host "负向: $negative" -ForegroundColor White
 
@@ -1002,8 +1014,10 @@ if ($P.Style -eq '彩色哥特' -and -not $formCheckpoint) {
     }
 }
 
-# 追加为空（表单里提示词与基底一致 + 无脸部词/LoRA 追加）+ 素体迭代已产出成品 + 参数全是默认形态（无比例/画质/画风调整）：不重复出图，直接收尾。
-$defaultsOnly = ($P.Ratio -eq '9:16' -and $P.Quality -eq '480p' -and $P.Style -in @('保持画风', '二次元') -and $P.Rounds -eq $paramFormRounds)
+# 追加为空（表单里提示词与基底一致 + 无脸部词/LoRA 追加）+ 素体迭代已产出成品 + 参数全是默认形态（无比例/画质/画风调整）
+# + Denoising=0（用户没要求图生图）：不重复出图，直接收尾。
+# 注：Denoising>0 时**不**走这条捷径——用户明确要用素体图做底图重绘，必须真正出一轮图生图。
+$defaultsOnly = ($P.Ratio -eq '9:16' -and $P.Quality -eq '480p' -and $P.Style -in @('保持画风', '二次元') -and $P.Rounds -eq $paramFormRounds -and $P.Denoise -le 0)
 $promptsUntouched = ($positive -eq $formPositive.Trim() -and $negative -eq $formNegative.Trim())
 # 决策日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-decision.log
 if ($promptsUntouched -and $hasBaseImg -and $defaultsOnly) {
@@ -1036,10 +1050,25 @@ $finalNegative = $negative
 if ($positive -and ($positive -notmatch ',\s*$')) { $positive = $positive.TrimEnd() + ", " }
 if ($finalNegative -and ($finalNegative -notmatch ',\s*$')) { $finalNegative = $finalNegative.TrimEnd() + ", " }
 
-# 最终出图：始终走文生图（txt2img），用完整的 $positive（表单提示词 + 脸部词 + LoRA）。
-# 不拿素体图做 img2img 底图——素体迭代只是「验证脸部质检能过关」，若拿它当底图，
-# denoising 会强烈保留素体裸基底的内容，用户填的提示词被稀释得几乎看不见（实测根因）。
-$finalWin = Invoke-FinalIterate -InitImage "" -Denoising 0 -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint
+# 最终出图：Denoising 表单值说了算（2026-10-15 解锁）。
+#   - Denoising = 0（默认）→ 文生图（txt2img），用完整的 $positive（表单提示词 + 脸部词 + LoRA）。
+#     不拿素体图做底图的原因：denoising 会强烈保留素体裸基底的内容，用户填的提示词被稀释得几乎看不见（实测根因）。
+#   - Denoising > 0 → 图生图（img2img）：底图 = 素体自检迭代的 winning 图，重绘幅度 = 表单值。
+#     用户自己选就按用户选的来：0.3-0.5 贴底图微调、≥0.7 基本重画；力度与提示词稀释都交由用户权衡。
+$finalInit = ""
+$finalDenoise = 0.0
+if ($P.Denoise -gt 0) {
+    if ($baseWin -and (Test-Path -LiteralPath $baseWin.Path)) {
+        $finalInit = $baseWin.Path
+        $finalDenoise = $P.Denoise
+        Write-Host "最终出图走图生图：底图 = 素体成品（seed=$($baseWin.Seed)），denoising = $finalDenoise" -ForegroundColor Cyan
+    } else {
+        Write-Host "表单填了 Denoising $($P.Denoise)，但素体迭代没有可用成品（-NoIterate 或迭代失败）→ 本次仍走文生图" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "最终出图走文生图（Denoising 0，不用素体底图）" -ForegroundColor DarkGray
+}
+$finalWin = Invoke-FinalIterate -InitImage $finalInit -Denoising $finalDenoise -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint
 
 if ($finalWin) {
     if ($finalWin.VlmDown) {

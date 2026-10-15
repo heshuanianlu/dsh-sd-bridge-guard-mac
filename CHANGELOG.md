@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.8（C 档参数表单 Denoising 解锁：从「看得到改不了」变成「改了就生效」）
+
+背景：C 档 `sd-inject.ps1` 的参数表里，Denoising 一栏永远显示为灰掉（禁用）——用户既下拉不动也手填不了。
+
+- **根因（三段全废）**：① 表单在**素体自检迭代之前**弹出，那一刻 `-HasBaseImage` 传参恒为 `$false`（`$baseWin` 还没产生），旧代码据此执行 `if (-not $HasBaseImage) { $cboDenoise.Enabled = $false }` → 控件**每次都被禁用**；② 解析段在同一条件下直接 `$den = 0`，手填的值也被丢掉；③ 最终出图硬编码 `Invoke-FinalIterate -InitImage "" -Denoising 0`，即使前两处放行也不生效。
+- **修复（`sd-inject.ps1`）**：
+  - **控件恒可编辑**：删掉 `Enabled = $false` 锁定逻辑，改为恒 `Enabled = $true` 的 `DropDown`（可下拉、可手填 0-0.95）；选项表改为 `0（文生图·不用底图）` / 0.3 / 0.4 / 0.5 / 0.6 / 0.7 / 0.8 / 0.9，**默认 `0（文生图·不用底图）`**（= 现状行为，不动默认出图链路）；下方新增 7pt 灰字提示「（0=文生图；0.3-0.5 贴底图；≥0.7 重画）」。
+  - **解析恒定生效**：不再按 `HasBaseImage` 归零；取文本框开头的数字（兼容带说明的条目，`0,6` 这类逗号小数也认），空值/非法 → 0（保持现状），上限钳到 0.95。
+  - **最终出图按值分派**：`Denoising = 0` → 文生图（默认行为不变，仍用完整 `$positive`）；`Denoising > 0` 且素体迭代有 winning 成品 → **图生图**（`-InitImage` 素体成品 + 表单 Denoising），素体无成品（`-NoIterate`/迭代失败）则回落文生图并给黄字提示；两处都打印模式日志（`最终出图走图生图：底图 = 素体成品（seed=…），denoising = …`）。
+  - **「追加为空直接收尾」捷径加守卫**：`$defaultsOnly` 追加 `$P.Denoise -le 0`——用户填了 >0 就必须真出一轮图生图，不能被「素体图即最终图」那条捷径吃掉。
+- **测试**：`sd-inject.ps1` 首三字节 `EF BB BF`（坑13/19：编辑工具会剥 BOM，已按流程补回）+ PS7 与 PS5.1 双 Parser `SYNTAX OK`；**抽发布代码段做行为验证**（`0（文生图·不用底图）`→0、`0.3`→0.3、`0,6`→0.6、`1`/`2`→钳 0.95、`abc`/空 → 0）；`npm test`（smoke-skill / test-install-record / test-settings / test-install-catalog）四条全绿。
+- **四处同步**：dev 仓库、插件包（`node_modules\dsh-sd-bridge-guard`）、会话工作区、`release\` 的 `sd-inject.ps1` 内容一致（sha256 `15d4d407…` 相同、BOM 齐备）。原文件备份于 `dist\dsh-sd-bridge-guard-backup-20261015-185331\`。
+
 ## 0.9.7（C 档选项表：A 档出图后自动罗列 + 用户自调画风进 C 档表单 + 权重/镜像清单）
 
 背景：「整理打包」本次把插件在本机的全部相关内容（源码、脚本、模型/VAE/LoRA 权重、用户自调画风）整理成可复现的一套，并解决「A 档出图后用户不知道还能改什么参数」这个体验缺口。
