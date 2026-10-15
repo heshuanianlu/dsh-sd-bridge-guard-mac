@@ -77,7 +77,21 @@ curl.exe -L -o AWPainting_v1.2.safetensors https://hf-mirror.com/sam749/AWPainti
 > 国内站下载要点：LiblibAI 需登录后点下载；Civitai 直链要带 token。两个站都建议直接搜文件名关键词，
 > 下载后核对体积（上表「大小」是本机实测值，误差 ±1 MB 属正常）。
 
-## 4. 本机环境基线（画质已验证）
+## 4. 本地 Ollama 模型（本地评估链：质检 + 翻译，图片不出机器）
+
+C 档 `sd-inject.ps1` 会用本机 Ollama 上的模型给每轮候选图打分、并把你填的中文直译成英文标签。两个角色、默认两个模型：
+
+| 角色 | 默认模型 | 参数 | 用途 | 拉取命令 |
+| --- | --- | --- | --- | --- |
+| **视觉质检**（脸 + 手 0-100 打分） | `qwen3-vl:8b` | `sd-inject.ps1 -VlmModel`（留空 = 自动挑本机 `vl`/`vision` 模型） | 素体自检迭代 + 最终出图选最高分那张；**≥75 过关** | `ollama pull qwen3-vl:8b` |
+| **中文→英文标签翻译** | `huihui_ai/qwen2.5-abliterate:14b` | `-QwenModel`（留空 = 选本机第一个 qwen 系通用模型），`-QwenRetries` 重试次数 | 表单里填的中文逐条译成英文标签（纯翻译器：不增删改写、不补质量词/画风词、不加权、不加安全类标签） | `ollama pull huihui_ai/qwen2.5-abliterate:14b` |
+
+- 接口：Ollama OpenAI 兼容端点，默认 `-QwenBase http://127.0.0.1:11434/v1`（`-QwenApiKey` 任意非空即可）；服务没起时脚本会自己拉起 `ollama serve`（`-NoQwenStart` 关闭、`-QwenStartTimeout` 调超时）。
+- 兜底：本机没有视觉模型 → 提示 `ollama pull qwen3-vl:8b` 并照常出图；质检持续无分 → 出满 N 张并弹多选对话框让你自己留；一个模型都枚举不到 → 直接点出 `OLLAMA_MODELS` 指向空目录这个最常见根因。
+- 可换小模型省显存：8G 显存机器上，`qwen3-vl:8b` 与 SD 抢显存会变慢，可换更小的视觉模型（`-VlmModel <名称>`，只要支持图像输入即可）。
+- **检测本机已装模型**：`ollama list`（本机实测 OLLAMA_MODELS 曾指向空目录，模型实际在另一路径下，脚本已在报错里点出这条）。
+
+## 5. 本机环境基线（画质已验证）
 
 | 项 | 值 |
 | --- | --- |

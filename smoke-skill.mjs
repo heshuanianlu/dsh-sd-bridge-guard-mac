@@ -499,6 +499,24 @@ assert.ok(injectPs1.includes('slender oval face') && injectPs1.includes('beautif
 assert.ok(injectPs1.includes('釉彩·麻袋调色盘_v1.0'), '「釉彩调色盘」必须挂上本机 LoRA 全名')
 assert.ok(/\$P\.Style -in @\('写实二次元', '写实二次元·东亚脸'\)/.test(injectPs1), '东亚脸画风必须复用「不切模型 + 半写实 LoRA」路径')
 
+// ---------------------------------------------------------------------------
+// 文档必须写清的两件事（用户明确要求）：本地模型评估链 + 触发话术（0.9.7）
+// ---------------------------------------------------------------------------
+const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8')
+const catalog = fs.readFileSync(new URL('./docs/models-loras.md', import.meta.url), 'utf8')
+assert.ok(readme.includes('C 档选项表'), 'README 必须写明 C 档选项表（A 档出图后罗列）')
+assert.ok(readme.includes('打开SD插件'), 'README 必须写明触发话术「打开SD插件」')
+assert.ok(readme.includes('用SD插件绘制'), 'README 必须写明触发话术「用SD插件绘制」')
+assert.ok(readme.includes('本地模型评估链'), 'README 必须有「本地模型评估链」专章（调用本地模型做质检/翻译）')
+assert.ok(readme.includes('qwen3-vl:8b'), 'README 必须写明脸/手质检用的本地视觉模型 qwen3-vl:8b')
+assert.ok(readme.includes('qwen2.5-abliterate:14b'), 'README 必须写明翻译用的本地模型')
+assert.ok(readme.includes('≥ 75') || readme.includes('>= 75'), 'README 必须写明质检过关线 75')
+assert.ok(readme.includes('-VlmModel') && readme.includes('-IterateRounds'), 'README 必须写明质检相关参数')
+assert.ok(readme.includes('A 档没有这一步'), 'README 必须区分：A 档质检是执行模型自己 read_image，不走本地视觉模型')
+assert.ok(catalog.includes('本地 Ollama 模型'), 'docs/models-loras.md 必须有本地 Ollama 模型一节')
+assert.ok(catalog.includes('ollama pull qwen3-vl:8b'), 'docs/models-loras.md 必须给出质检模型的拉取命令')
+assert.ok(catalog.includes('hf-mirror.com'), 'docs/models-loras.md 必须给出 HF 镜像直链')
+
 console.log('skill title:', skill.title)
 console.log('sd_inject(C 档):', inj.command)
 console.log('sd_script(i2i):', out.command)
