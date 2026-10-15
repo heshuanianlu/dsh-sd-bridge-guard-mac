@@ -227,6 +227,9 @@ assert.ok(
   !inj.command.includes('(nsfw:1.6)') && !inj.command.includes('nudity'),
   `sd_inject 生成的 -BaseNegative 只能含画质底线，不得夹带违禁/安全类标签（用户红线）：${inj.command}`,
 )
+// v0.9.18：默认允许冷启动本地视觉模型；插件设置 vlmAutoStart=false 时必须显式追加 -NoVlmStart
+assert.ok(!inj.command.includes('-NoVlmStart'), `默认（vlmAutoStart=true）不得带 -NoVlmStart：${inj.command}`)
+assert.ok(!inj.command.includes('-NoVlmReview'), `默认（vlmReview=true）不得带 -NoVlmReview：${inj.command}`)
 assert.ok(inj.command.includes('-Width 512') && inj.command.includes('-Height 768'), inj.command)
 assert.ok(inj.command.includes('-Name "inject"'), inj.command)
 // 不传 basePrompt 时用素体兜底（默认 "1girl, solo"，见 sd-bridge.js 与 sd-inject.ps1 的 $BasePrompt 默认值）
@@ -578,7 +581,7 @@ assert.ok(/\$script:LastInitFail/.test(injectPs1), '解析失败原因必须回�
 assert.ok(/sha256:/.test(injectPs1) && /8,64/.test(injectPs1), '底图解析必须能剥掉哈希/附件装饰')
 assert.ok(/attachments/.test(injectPs1), '底图解析要能在 DSH 附件目录里按哈希找图')
 assert.ok(injectPs1.includes('[A-Za-z]:\\') && injectPs1.includes('-replace'), '底图解析要能从说明文字里抠出无后缀的附件路径')
-assert.ok(/\$refSize = Get-ImageSizePx -Path \$finalInit/.test(injectPs1), 'C-1a 必须按参考图原生尺寸出图')
+assert.ok(/refOut = Get-RefOutputSize -Path \$finalInit/.test(injectPs1), 'C-1a 必须按参考图原生尺寸出图（尺寸统一走 Get-RefOutputSize）')
 assert.ok(/一致模式：denoising/.test(injectPs1) && /\$finalDenoise = 0\.65/.test(injectPs1), '一致模式 denoising 过高必须收敛')
 assert.ok(/box\(px\)\?/.test(injectPs1), '蒙版必须支持精确坐标框 box:/boxpx:')
 assert.ok(/region-mask-scaled\.png/.test(injectPs1), '蒙版尺寸与出图尺寸不符时必须缩放对齐')
@@ -594,13 +597,13 @@ assert.ok(readme.includes('C 档选项表'), 'README 必须写明 C 档选项表
 assert.ok(readme.includes('打开SD插件'), 'README 必须写明触发话术「打开SD插件」')
 assert.ok(readme.includes('用SD插件绘制'), 'README 必须写明触发话术「用SD插件绘制」')
 assert.ok(readme.includes('本地模型评估链'), 'README 必须有「本地模型评估链」专章（调用本地模型做质检/翻译）')
-assert.ok(readme.includes('qwen3-vl:8b'), 'README 必须写明脸/手质检用的本地视觉模型 qwen3-vl:8b')
-assert.ok(readme.includes('qwen2.5-abliterate:14b'), 'README 必须写明翻译用的本地模型')
+assert.ok(readme.includes('qwen3-vl:8b'), 'README 必须写明视觉审核用的是能识图的 qwen3-vl:8b')
+assert.ok(!readme.includes('huihui_ai/qwen2.5-abliterate:14b') || readme.includes('翻译链路已整体移除'), '翻译链路已移除：README 不得再把翻译模型写成现行功能')
 assert.ok(readme.includes('≥ 75') || readme.includes('>= 75'), 'README 必须写明质检过关线 75')
 assert.ok(readme.includes('-VlmModel') && readme.includes('-IterateRounds'), 'README 必须写明质检相关参数')
 assert.ok(readme.includes('A 档没有这一步'), 'README 必须区分：A 档质检是执行模型自己 read_image，不走本地视觉模型')
 assert.ok(catalog.includes('本地 Ollama 模型'), 'docs/models-loras.md 必须有本地 Ollama 模型一节')
-assert.ok(catalog.includes('ollama pull qwen3-vl:8b'), 'docs/models-loras.md 必须给出质检模型的拉取命令')
+assert.ok(catalog.includes('ollama pull qwen3-vl:8b'), 'docs/models-loras.md 必须给出视觉审核模型的拉取命令（qwen3-vl:8b）')
 assert.ok(catalog.includes('hf-mirror.com'), 'docs/models-loras.md 必须给出 HF 镜像直链')
 
 console.log('skill title:', skill.title)
@@ -628,6 +631,7 @@ assert.ok(/\$autoMask = \(\$maskSpec -match '\^自动'/.test(injectPs1), '决策
 assert.ok(/自动蒙版：按参考图内容抠/.test(injectPs1), '自动抠图必须打印目标与引擎')
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { spawnSync } from 'node:child_process'
 
 console.log('AUTO-MASK SMOKE OK')
 
@@ -675,7 +679,7 @@ assert.ok(/sdapi\/v1\/\$ep/.test(injectPs1) && /'sd-models', 'loras'/.test(injec
 assert.ok(/SdRootProbed/.test(injectPs1), 'SD 根探测必须只做一次（缓存）')
 assert.ok(/\$sdRootForHelper = \$SdDir/.test(injectPs1) && /--sd-dir', \$sdRootForHelper/.test(injectPs1), '抠图器必须拿到探测出的 SD 根（否则找不到 YOLO-World 权重）')
 assert.ok(/Get-ChildItem -LiteralPath \$drv -Directory -ErrorAction SilentlyContinue/.test(injectPs1), '扫盘兜底不得限制目录数量（上次被「前 60 个」截掉了 SD.4.8）')
-assert.ok(/蒙版没画出来/.test(injectPs1) && /缺少抠图脚本|找不到可用的 python/.test(injectPs1), '抠图失败必须给出可读原因')
+assert.ok(/自动抠图没成功/.test(injectPs1) && /缺少抠图脚本|找不到可用的 python/.test(injectPs1), '抠图失败必须给出可读原因')
 console.log('SD-PY-DETECT SMOKE OK')
 
 
@@ -693,3 +697,304 @@ assert.ok(/PYTHONIOENCODING = 'utf-8'/.test(injectPs1) && /PYTHONUTF8 = '1'/.tes
 assert.ok(/Repair-Utf8Mojibake -Text \$out/.test(injectPs1), '解析失败必须再用乱码修复兜一次')
 assert.ok(/-Encoding UTF8 -ErrorAction SilentlyContinue/.test(injectPs1), '读临时输出文件必须按 UTF-8')
 console.log('JSON-ENCODING SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 区域蒙版真跑回归（2026-10-15「C 档蒙版功能不完善」）：
+// 源码级 bug —— New-RegionMask 里 `$rects += @{...}` 从 $null 起步，得到的是 Hashtable
+// 而不是数组；环形（四周/背景）加第二块时 PowerShell 直接抛
+// 「Item has already been added. Key in dictionary: 'Y'」→ 整条「换背景」蒙版路径静默失效
+// （单矩形形状只是碰巧还能用：foreach 一个 Hashtable 会把它自己当一项、`.X` 恰好还是键访问）。
+// 以前 smoke 对这个函数**只有源码正则**，一行都没真跑过，所以这个 bug 一路发版。
+// 现在：源码断言 + 真跑 test-region-mask.ps1（AST 抽真函数 + 量白像素）。
+// ---------------------------------------------------------------------------
+assert.ok(/\$rects = @\(\)/.test(injectPs1), 'New-RegionMask 必须先初始化 $rects = @()（否则环形的第二块会抛键已存在）')
+assert.ok(!/\$rects = \$rects/.test(injectPs1), '不允许残留 `$rects = $rects` 这种空操作（那是忘写初始化的痕迹）')
+const ringBlock = /\$band = \[int\]\(\$W \* 0\.18\)([\s\S]{0,700}?)\}\s*if \(\$invert\)/.exec(injectPs1)
+assert.ok(ringBlock && (ringBlock[1].match(/\$rects \+=/g) || []).length === 4, '四周（背景）必须是 4 块矩形拼成的环，且每块都真的进了 $rects')
+assert.ok(/\$rects\) \{ \$g\.FillRectangle\(\$black/.test(injectPs1) && /\$rects\) \{ \$g\.FillRectangle\(\$white/.test(injectPs1), '反选必须靠「整张涂白 + 形状涂黑」实现（两个分支都要用 $rects）')
+assert.ok(/function Get-RefOutputSize/.test(injectPs1), '尺寸推导必须抽成 Get-RefOutputSize（C-1a / C-1b 共用一套）')
+assert.ok(/refOut = Get-RefOutputSize -Path \$refPath[\s\S]{0,300}New-RegionMask -Spec \$maskSpec/.test(injectPs1), '区域蒙版必须按「参考图的最终出图尺寸」生成（否则 boxpx 会被当成表单尺寸的像素）')
+assert.ok(!/蒙版区域认不出（\$maskSpec）→ 退回整图重绘/.test(injectPs1), '认不出的区域名不得再宣称「退回整图重绘」（实际是落到 C-1a 收敛 denoising）')
+
+const maskTestPs1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-region-mask.ps1')
+assert.ok(fs.existsSync(maskTestPs1), 'test-region-mask.ps1 必须随包发布（区域蒙版真跑回归）')
+const maskRun = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', maskTestPs1], { encoding: 'utf8', timeout: 180000 })
+assert.equal(maskRun.status, 0, `区域蒙版真跑测试必须通过：\n${maskRun.stdout || ''}\n${maskRun.stderr || ''}`)
+assert.ok(/REGION-MASK TEST OK/.test(maskRun.stdout || ''), '区域蒙版真跑测试必须打印 REGION-MASK TEST OK')
+assert.ok(/ok\s+ring-bg/.test(maskRun.stdout || ''), '四周（背景）环形成必须真跑通过（本轮修的那个 bug）')
+console.log('REGION-MASK SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 0.9.16（「极端情况测试，生成还是混乱」那轮）：
+//  ① SAM 在 A1111 常驻时 CUDA OOM → 抠图整段失败 → 蒙版拿不到（实测 23:16 复现，notes 里就是
+//     "CUDA out of memory ... 2.57 GiB free"）；现在按剩余显存决定设备/分辨率，并加检测框兜底。
+//  ② 衣服只留最大连通块 → 同一件衣服被 SAM 拆开时袖子/裙摆那一侧整个丢掉。
+//  ③ 蒙版准不准以前只能靠人眼看生成结果（用「脱衣服」提示词去看，模型会把衣服画成半脱状态，
+//     看着像漏检，其实那块像素已经改过）→ 新增 sd-mask-qa.py 逐像素体检 + 总览图，并接入 C-1b 流程。
+// ---------------------------------------------------------------------------
+assert.ok(/mem_get_info/.test(autoMaskPy) && /vram_cpu_gb/.test(autoMaskPy), 'SAM 必须按剩余显存决定上不上 cuda（实测 2.57G 剩余时 ViT-L 直接 CUDA OOM）')
+assert.ok(/改走 CPU/.test(autoMaskPy), '显存不够必须能降到 CPU 分割，而不是让蒙版整条失败')
+assert.ok(/生成粗蒙版兜底/.test(autoMaskPy), 'SAM 全失败必须用检测框兜底（不许 ok:false 把替换路径废掉）')
+assert.ok(/裁到躯干带/.test(autoMaskPy), '粗蒙版吞掉整个人时必须裁到躯干带（否则等于整个人重画）')
+assert.ok(/保留 \{len\(keep_ids\)\}\/\{n_lab - 1\} 块/.test(autoMaskPy), '衣服必须保留同一件的多块（旧的「只留最大块」会丢袖子/裙摆那一侧）')
+assert.ok(/args\.target == "衣服"/.test(autoMaskPy), '连通块筛选必须按目标分流（衣服走多块规则）')
+assert.ok(/sd-mask-qa\.py/.test(injectPs1) && /function Invoke-MaskQaReport/.test(injectPs1), 'C-1b 出图后必须自动跑蒙版命中率体检')
+assert.ok(/命中率总览图/.test(injectPs1), '体检必须落地一张可人工审阅的总览图')
+assert.ok(/Invoke-MaskQaReport -RefPath \$finalInit -MaskPath \$finalMask/.test(injectPs1), '体检必须用「参考图 + 本次蒙版 + 本次成品」三方对齐')
+
+const qaPs1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-mask-qa.ps1')
+assert.ok(fs.existsSync(qaPs1), 'test-mask-qa.ps1 必须随包发布（体检工具真跑测试）')
+const qaRun = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', qaPs1], { encoding: 'utf8', timeout: 300000 })
+assert.equal(qaRun.status, 0, `蒙版体检工具真跑测试必须通过：\n${qaRun.stdout || ''}\n${qaRun.stderr || ''}`)
+assert.ok(/MASK-QA TEST OK|MASK-QA TEST SKIP/.test(qaRun.stdout || ''), '蒙版体检测试必须给出 OK 或 SKIP')
+console.log('MASK-QA SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 0.9.17（用户要求：本地视觉模型加入冷启动；C 档脚本跑完删掉产生的额外图片）：
+//  ① 质检/画风识别都依赖本地视觉模型（Ollama）。以前它没起就静默降级：
+//     素体只出一张、最终出图变成「出满 N 张让你自己挑」——用户看到的就是「插件没质检」。
+//     现在解析侧也冷启动：没起就替你 `ollama serve`，就绪后再往下走（-NoVlmStart 可关）。
+//  ② 产物目录只留成品：预蒙版 premask-*.png / _overlay.png、命中率总览图都算中间图，
+//     跑完自动清掉（-KeepWorkFiles 保留并列出）。
+// ---------------------------------------------------------------------------
+assert.ok(/function Start-OllamaService/.test(injectPs1), '必须有本地视觉模型冷启动函数')
+assert.ok(/\[switch\]\$NoVlmStart/.test(injectPs1) && /\[int\]\$VlmStartTimeout/.test(injectPs1), '冷启动必须有开关与超时参数（-NoVlmStart / -VlmStartTimeout；注意不能沿用已被移除的翻译链路参数名）')
+assert.ok(/ArgumentList 'serve'/.test(injectPs1), '冷启动必须真的拉起 `ollama serve`')
+assert.ok(/测试|等待 ollama serve 起来/.test(injectPs1), '冷启动必须轮询等待就绪，而不是起完就往下走')
+const coldCalls = (injectPs1.match(/Start-OllamaService -TimeoutSec \$VlmStartTimeout/g) || []).length
+assert.ok(coldCalls >= 3, `冷启动必须接在三处使用点（预热/质检前置/画风识别），当前 ${coldCalls} 处`)
+assert.ok(/function Add-RunWorkFile/.test(injectPs1) && /function Remove-RunWorkFiles/.test(injectPs1), '必须给本次产生的中间图记账并可清理')
+assert.ok(/Add-RunWorkFile \$maskOut/.test(injectPs1), '预蒙版必须记账（否则产物目录会一直堆 premask-*.png）')
+assert.ok(/Invoke-MaskQaReport -RefPath \$finalInit -MaskPath \$finalMask -OutPath \$finalPath -QaDir \$script:IterTempDir/.test(injectPs1), '命中率总览图必须写进迭代临时目录（随目录一起清），而不是产物目录')
+assert.ok((injectPs1.match(/Remove-RunWorkFiles/g) || []).length >= 4, '成品保存/多选/失败三条路径都要清中间图')
+assert.ok(/\[switch\]\$KeepWorkFiles/.test(injectPs1), '必须能用 -KeepWorkFiles 保留中间图排查')
+
+const vlmPs1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-vlm-cleanup.ps1')
+assert.ok(fs.existsSync(vlmPs1), 'test-vlm-cleanup.ps1 必须随包发布（冷启动 + 清理真跑测试）')
+const vlmRun = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', vlmPs1], { encoding: 'utf8', timeout: 300000 })
+assert.equal(vlmRun.status, 0, `冷启动/清理真跑测试必须通过：\n${vlmRun.stdout || ''}\n${vlmRun.stderr || ''}`)
+assert.ok(/VLM-CLEANUP TEST OK/.test(vlmRun.stdout || ''), '冷启动/清理测试必须打印 VLM-CLEANUP TEST OK')
+console.log('VLM-COLDSTART+CLEANUP SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 0.9.18（用户要求：本地视觉模型关掉）：插件侧开关 vlmAutoStart=false
+//   · true（默认）= C 档质检前探活失败就替你 `ollama serve`
+//   · false      = 生成的命令追加 `-NoVlmStart`，服务没起就跳过质检（出满 N 张让你自己挑），
+//                  绝不偷偷在你机器上拉起本地模型服务
+// ---------------------------------------------------------------------------
+{
+  const tools2 = new Map()
+  const ctx2 = {
+    logger: { log: () => {} },
+    effect: (fn) => fn(),
+    get: (key) => (key === 'skills' ? { register: () => () => {} } : undefined),
+    tools: { register(def) { tools2.set(def.name, def); return () => tools2.delete(def.name) } },
+  }
+  const ws2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-off-'))
+  await mod.apply(ctx2, { sdDir: process.env.DSH_SD_DIR || '', port: 7860, vlmAutoStart: false })
+  const inj2 = await tools2.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws2 } } } })
+  assert.ok(inj2.command.includes('-NoVlmStart'), `vlmAutoStart=false 必须把 -NoVlmStart 写进命令：${inj2.command}`)
+  assert.ok(/(^|\s)-NoVlmStart(\s|$)/.test(inj2.command), `-NoVlmStart 必须是独立开关：${inj2.command}`)
+  assert.ok(inj2.command.startsWith('powershell -ExecutionPolicy Bypass -File '), '关掉冷启动不得破坏命令结构')
+  console.log('VLM-AUTOSTART-SWITCH SMOKE OK')
+}
+
+
+// ---------------------------------------------------------------------------
+// 0.9.19（用户要求：在插件页加个开关，是否启动可以自己选）：
+//   · 插件页两个开关：vlmAutoStart（本地视觉模型服务）、maskAutoSegment（自动抠图 YOLO-World + SAM）
+//   · maskAutoSegment=false → 生成命令追加 -NoAutoMask → 脚本完全不加载检测模型，
+//     改用几何区域蒙版；且自动抠图失败时**不再 exit 1**、也不再只留一张空蒙版栏。
+//   · 真机复现的坑：cuda 下检测模型会把 python 进程**原生崩掉**（连 JSON 都没打，
+//     PowerShell 只看到「抠图脚本没有输出」）；同一命令 `--device cpu` 100% 成功且结果一致
+//     → 失败说明必须带上退出码/stderr，并自动用 CPU 重试一次。
+// ---------------------------------------------------------------------------
+assert.ok(/\[switch\]\$NoAutoMask/.test(injectPs1), '必须有 -NoAutoMask 开关（插件页 maskAutoSegment=false 会带它）')
+assert.ok(/maskAutoSegment=false/.test(injectPs1), '-NoAutoMask 的说明要指明来自插件设置')
+assert.ok(/--device', 'cpu'/.test(injectPs1), 'CPU 重试必须显式传 --device cpu')
+assert.ok(/New-AutoMaskFromImage -ImagePath \$ImagePath -Target \$Target -OutPath \$OutPath/.test(injectPs1), '自动抠图失败必须自动用 CPU 重试一次')
+assert.ok(/自动改用 CPU 重试一次/.test(injectPs1), 'CPU 重试必须打印出来（用户要知道发生了什么）')
+assert.ok(/抠图脚本没有输出（python 退出码/.test(injectPs1), '失败说明必须带 python 退出码（不能只说「没有输出」）')
+assert.ok(/已预填几何区域蒙版/.test(injectPs1), '抠图失败时表单蒙版栏必须预填几何区域蒙版（不能留空让用户猜）')
+assert.ok(!/不会退回整图重绘（那会把背景\/姿势一起换掉/.test(injectPs1), '抠图失败不得再直接 exit 1（用户拿到的是「什么都没出」）')
+assert.ok(/\[switch\]\$ForceCpu/.test(injectPs1), '必须有 ForceCpu 内部开关（重试路径）')
+
+{
+  const tools3 = new Map()
+  const ctx3 = {
+    logger: { log: () => {} },
+    effect: (fn) => fn(),
+    get: (key) => (key === 'skills' ? { register: () => () => {} } : undefined),
+    tools: { register(def) { tools3.set(def.name, def); return () => tools3.delete(def.name) } },
+  }
+  const ws3 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-maskoff-'))
+  await mod.apply(ctx3, { sdDir: process.env.DSH_SD_DIR || '', port: 7860, maskAutoSegment: false })
+  const inj3 = await tools3.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws3 } } } })
+  assert.ok(inj3.command.includes('-NoAutoMask'), `maskAutoSegment=false 必须把 -NoAutoMask 写进命令：${inj3.command}`)
+  assert.ok(inj3.command.startsWith('powershell -ExecutionPolicy Bypass -File '), '关掉自动抠图不得破坏命令结构')
+  console.log('MASK-AUTOSEGMENT-SWITCH SMOKE OK')
+}
+
+const retryPs1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-automask-retry.ps1')
+assert.ok(fs.existsSync(retryPs1), 'test-automask-retry.ps1 必须随包发布（抠图失败→CPU 重试真跑测试）')
+const retryRun = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', retryPs1], { encoding: 'utf8', timeout: 300000 })
+assert.equal(retryRun.status, 0, `抠图 CPU 重试真跑测试必须通过：\n${retryRun.stdout || ''}\n${retryRun.stderr || ''}`)
+assert.ok(/AUTOMASK-RETRY TEST OK/.test(retryRun.stdout || ''), '抠图 CPU 重试测试必须打印 AUTOMASK-RETRY TEST OK')
+console.log('AUTOMASK-RETRY SMOKE OK')
+
+// ---------------------------------------------------------------------------
+// 0.9.20（用户要求：插件页加开关「视觉模型审核是否启动」；模型换成 qwen3.6-fable；审核人物肢体）
+//   · 插件页 vlmReview（默认 true）：设 false → 命令追加 -NoVlmReview → 不探活、不冷启动、
+//     不加载模型、不打分（连参考图画风识别也不调模型），出满 N 张让你自己挑。
+//   · 默认模型改成 qwen3.6-fable（插件页 vlmModel 可改，会写成 -VlmModel "<name>"）。
+//   · 审核问句从「脸 + 手」扩到「脸 + 手 + 四肢」：手臂/腿是否各两条、左右对称、多肢少肢、
+//     关节反向错位、四肢畸形粘连、躯干与四肢比例失衡。
+// ---------------------------------------------------------------------------
+assert.ok(/\[switch\]\$NoVlmReview/.test(injectPs1), '必须有 -NoVlmReview 开关（插件页 vlmReview=false 会带它）')
+assert.ok(/视觉模型审核已关闭/.test(injectPs1), '关掉审核必须打印说明（用户要知道这次没质检）')
+assert.ok(/vlmReview=false/.test(injectPs1), '-NoVlmReview 的说明要指明来自插件设置')
+assert.ok(/\$VlmModel = "qwen3-vl:8b"/.test(injectPs1), '视觉审核默认模型必须是能识图的 qwen3-vl:8b')
+assert.ok(/人物肢体结构是否健康/.test(injectPs1), '审核问句必须覆盖人物肢体结构')
+assert.ok(/① 脸部/.test(injectPs1) && /② 手部/.test(injectPs1) && /③ 肢体/.test(injectPs1), '审核问句必须三类都问：脸部 / 手部 / 肢体')
+assert.ok(/手臂与腿是否各两条/.test(injectPs1) && /多肢少肢/.test(injectPs1), '肢体审核必须查多肢少肢/左右对称')
+assert.ok(/关节反向或错位/.test(injectPs1) && /躯干与四肢比例失衡/.test(injectPs1), '肢体审核必须查关节错位与比例失衡')
+assert.ok(/ollama create \$\{?VlmModel\}?|ollama create \$VlmModel/.test(injectPs1) || /ollama create/.test(injectPs1), '模型不在本机时必须给出 ollama pull / ollama create 两条路')
+assert.ok(/if \(\$NoVlmReview\) \{ return '' \}/.test(injectPs1), '关掉审核后画风识别也不得调模型')
+
+{
+  const mk = (toolsMap, cfgOverride) => {
+    const ctxN = {
+      logger: { log: () => {} },
+      effect: (fn) => fn(),
+      get: (key) => (key === 'skills' ? { register: () => () => {} } : undefined),
+      tools: { register(def) { toolsMap.set(def.name, def); return () => toolsMap.delete(def.name) } },
+    }
+    return ctxN
+  }
+  // ① 关闭审核
+  const tools4 = new Map()
+  const ws4 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-noreview-'))
+  await mod.apply(mk(tools4), { sdDir: process.env.DSH_SD_DIR || '', port: 7860, vlmReview: false })
+  const inj4 = await tools4.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws4 } } } })
+  assert.ok(inj4.command.includes('-NoVlmReview'), `vlmReview=false 必须把 -NoVlmReview 写进命令：${inj4.command}`)
+  assert.ok(inj4.command.includes('-VlmModel "qwen3-vl:8b"'), `默认模型必须写进命令（能识图的视觉模型）：${inj4.command}`)
+  assert.ok(inj4.command.startsWith('powershell -ExecutionPolicy Bypass -File '), '关掉审核不得破坏命令结构')
+  // ② 自定义模型名
+  const tools5 = new Map()
+  const ws5 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-vlmmodel-'))
+  await mod.apply(mk(tools5), { sdDir: process.env.DSH_SD_DIR || '', port: 7860, vlmReview: true, vlmModel: 'my-vl:7b' })
+  const inj5 = await tools5.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws5 } } } })
+  assert.ok(inj5.command.includes('-VlmModel "my-vl:7b"'), `插件页自定义模型名必须写进命令：${inj5.command}`)
+  assert.ok(!inj5.command.includes('-NoVlmReview'), '显式开启审核时不得带 -NoVlmReview: ' + inj5.command)
+  console.log('VLM-REVIEW-SWITCH SMOKE OK')
+}
+
+// ---------------------------------------------------------------------------
+// 0.9.21（用户要求：素体不需要额外生成了 + 重新调试蒙版）
+//   · 有参考图（图生图/蒙版重绘）时**不再先生成素体**：参考图本身就是底图，
+//     再跑素体只会多出一张 inject_00N.png（实测那轮产物目录里就有一张 inject_001.png）。
+//   · 衣服蒙版：词表补 detached sleeves / hood / cloak / shawl / scarf（同一套衣服的其它部件），
+//     检测框上限从写死的 2 提到 --max-boxes 3；肩线守卫从 8% 放宽到 4%（实测 8% 会把肩部服饰丢掉）。
+//   · 连通块筛选把各块面积写进 notes，便于定位「保留 1/7 块」到底丢了什么。
+// ---------------------------------------------------------------------------
+assert.ok(/skipBaseIterate/.test(injectPs1), '有参考图时必须跳过素体自检迭代（不再额外生成素体底图）')
+assert.ok(/已有参考图 → 跳过素体自检迭代/.test(injectPs1), '跳过素体迭代必须打印说明（用户要知道为什么没生成素体）')
+assert.ok(/\$preInitPath -or \(\$Mode -eq '图生图' -and \$InitImage\)/.test(injectPs1), '跳过条件必须覆盖「对话给了参考图」与「表单选图生图」两条路')
+assert.ok(/detached sleeves/.test(autoMaskPy) && /hood/.test(autoMaskPy) && /cloak/.test(autoMaskPy), '衣服词表必须含袖套/兜帽/披风等「同套衣服的其它部件」')
+assert.ok(/--max-boxes/.test(autoMaskPy) && /args\.max_boxes/.test(autoMaskPy), '检测框上限必须可配（默认 3，实测只收 2 个会漏袖套）')
+assert.ok(/0\.04 \* \(person_box\[1\] - person_box\[0\]\)/.test(autoMaskPy), '肩线守卫必须放宽到 4%（8% 会把肩部服饰整块丢掉）')
+assert.ok(/各块面积/.test(autoMaskPy), '连通块筛选必须把各块面积写进 notes（便于定位漏块）')
+console.log('BASE-SKIP+MASK-V2 SMOKE OK')
+
+// ---------------------------------------------------------------------------
+// 0.9.21（视觉审核「一致失效」的真因与修法 —— 已真机跑到 score=100）
+//   真机复现：832x1216 原图 + qwen3-vl:8b → 每次 180s 超时、返回 -1（=「审核一致失效」）。
+//   逐层定位：
+//     · 根因A：送审原图太大 → 8G 卡上 SD 常驻时 8B 模型走 CPU，180s 跑不完 → 先降分辨率（长边 768）。
+//     · 根因B：qwen3-vl 是**思考型**模型 —— 走 /v1/chat/completions 时 content 恒为空（思维链在 reasoning）；
+//              原生 /api/chat + think:false + num_predict=1024 → finish=stop、content="SCORE=100"。
+//              num_predict 太小（256/512/700）会想一半被截断 → content 空或只剩半截数字（实测回过 "797"）。
+//     · 根因C：空白回答在 PowerShell 里是「真值」，-not $raw 判空失效 → 必须 Trim。
+// ---------------------------------------------------------------------------
+assert.ok(/VlmImageMaxSide/.test(injectPs1) && /Longest|MaxSide/.test(injectPs1) || /VlmImageMaxSide/.test(injectPs1), '必须有送审前降分辨率的参数')
+assert.ok(/VlmTimeoutSec/.test(injectPs1), '审核超时秒数必须可配（原来是写死的 180）')
+assert.ok(/\/api\/chat/.test(injectPs1), '审核首选原生 /api/chat（只有它认 think:false）')
+assert.ok(/num_predict = 1024/.test(injectPs1), '思考型视觉模型必须给足预算（1024；太小会想一半被截断）')
+assert.ok(/think = \$false/.test(injectPs1), '必须显式关掉思考')
+assert.ok(/SCORE\\s\*\[=:：\]/.test(injectPs1), '解析必须先认显式 SCORE=<n>')
+assert.ok(/foreach \(\$mm in \[regex\]::Matches\(\$raw, '\\d\{1,3\}'\)\)/.test(injectPs1), '解析必须退化为「第一个 0-100 的整数」（813 这种要跳过）')
+assert.ok(/\$raw = \("\$raw"\)\.Trim\(\)/.test(injectPs1), '回答必须先 Trim 再判空（空白串在 PowerShell 里是真值）')
+assert.ok(/没给出可用的 0-100 分数/.test(injectPs1), '拿不到分数必须打印模型原话与耗时（可观测）')
+assert.ok(/已用 \$\(\[math\]::Round\(\$sw\.Elapsed\.TotalSeconds,0\)\)s/.test(injectPs1), '失败信息必须带耗时，便于判断是「慢」还是「答非所问」')
+console.log('VLM-REVIEW-FIX SMOKE OK')
+
+// ---------------------------------------------------------------------------
+// 0.9.22（用户要求：模型换成能识图的；制止它审查技术性之外的内容）
+//   · 默认审核模型必须是**能识图**的 qwen3-vl:8b（itsailor/qwen3.6-fable 那类是纯文本模型，
+//     模型卡写明 vision 不可用、图片被静默忽略 → 拿它审核只会胡说）。
+//   · 审核只许碰技术性内容：system 约束必须存在（禁止评价/描述/审查/拒绝画面内容、
+//     不判断题材与服装裸露、不涉及性内容、不做合规判断、不复述画面）。
+//   · 解析只认数字（SCORE= 优先，否则首个 0-100 整数）→ 模型多嘴也进不了打分逻辑。
+// ---------------------------------------------------------------------------
+assert.ok(/\$VlmModel = "qwen3-vl:8b"/.test(injectPs1), '默认审核模型必须是能识图的 qwen3-vl:8b')
+assert.ok(/\$systemContent = /.test(injectPs1), '必须有 system 约束（审核范围限制）')
+assert.ok(/结构缺陷检测器/.test(injectPs1), 'system 必须把角色钉成「结构缺陷检测器」')
+assert.ok(/禁止评价、描述、审查或拒绝画面内容/.test(injectPs1), 'system 必须明确禁止评价/描述/审查/拒绝画面内容')
+assert.ok(/不判断题材、不判断服装与裸露程度、不涉及性内容/.test(injectPs1), 'system 必须列出禁止触碰的内容维度')
+assert.ok(/不做任何合规\/道德\/安全判断/.test(injectPs1), 'system 必须禁止做合规/道德/安全判断')
+assert.ok(/只许输出分数，不许评论画面内容/.test(injectPs1), '用户问句也必须写明只输出分数')
+assert.ok((injectPs1.match(/role = 'system'; content = \$systemContent/g) || []).length >= 2, 'system 约束必须同时带在原生端点与 /v1 兜底两条路径上')
+assert.ok(/只判断画风（技术属性）/.test(injectPs1), '画风识别也必须限定为技术属性判断')
+assert.ok(/vlmModel: 'qwen3-vl:8b'/.test(fs.readFileSync(new URL('./sd-bridge.js', import.meta.url), 'utf8')), '插件设置 vlmModel 默认也必须是 qwen3-vl:8b')
+console.log('VLM-VISION-ONLY-REVIEW SMOKE OK')
+
+// ---------------------------------------------------------------------------
+// 0.9.23（用户要求：每次运行前先释放显存）
+//   这台 8G 卡被三方共抢：SD ~2.5-5G / 抠图(YOLO+SAM) 2-3G / 8B 视觉模型 ~5.3G。
+//   实测本机在两者都常驻时只剩 0.46G —— 这就是抠图 CUDA OOM、审核被挤到 CPU（40-180s）的根因。
+//   现在每个"要显存"的步骤开跑前按需释放对面那一边：
+//     · 抠图前、审核前 → 让 A1111 卸载 checkpoint（出图时自动重载）
+//     · 素体/最终出图前 → 让 Ollama 卸载常驻模型（keep_alive:0）
+//     · 收工后 → 再把本地模型卸掉，别长期占卡
+//   实测释放效果：0.46G → 7.02G（+6.56G）。
+// ---------------------------------------------------------------------------
+assert.ok(/function Ensure-Vram/.test(injectPs1), '必须有「开跑前确保显存」的入口')
+assert.ok(/function Release-SdVram/.test(injectPs1) && /unload-checkpoint/.test(injectPs1), '必须能让 A1111 卸载 checkpoint 释放显存')
+assert.ok(/function Release-OllamaVram/.test(injectPs1) && /keep_alive = 0/.test(injectPs1), '必须能让本地模型服务卸掉常驻模型（keep_alive:0）')
+assert.ok(/\[switch\]\$NoVramRelease/.test(injectPs1) && /\[double\]\$VramMinFreeGb/.test(injectPs1), '必须有开关与阈值参数（-NoVramRelease / -VramMinFreeGb）')
+assert.ok(/if \(\$free -ge \$NeedGb\)/.test(injectPs1), '显存够用时不得乱释放（避免无谓重载）')
+assert.ok(/Ensure-Vram -For 'sd' -Note '自动抠图'/.test(injectPs1), '抠图前必须释放 SD 显存（SAM OOM 的根因）')
+assert.ok(/Ensure-Vram -For 'sd' -Note '视觉审核'/.test(injectPs1), '审核前必须释放 SD 显存（否则模型被挤到 CPU）')
+assert.ok((injectPs1.match(/\$null = Release-OllamaVram/g) || []).length >= 3, '出图前/素体前/收工后都要卸载本地模型')
+assert.ok(/老规矩|不阻断/.test(injectPs1) || /return -1/.test(injectPs1), '拿不到显存信息时必须静默跳过（不能因此中断出图）')
+
+const vramPs1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-vram-release.ps1')
+assert.ok(fs.existsSync(vramPs1), 'test-vram-release.ps1 必须随包发布（显存释放真跑测试）')
+const vramRun = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', vramPs1], { encoding: 'utf8', timeout: 300000 })
+assert.equal(vramRun.status, 0, `显存释放真跑测试必须通过：\n${vramRun.stdout || ''}\n${vramRun.stderr || ''}`)
+assert.ok(/VRAM-RELEASE TEST OK|MASK-QA TEST SKIP/.test(vramRun.stdout || ''), '显存释放测试必须给出 OK 或 SKIP')
+console.log('VRAM-RELEASE SMOKE OK')
+
+// ---------------------------------------------------------------------------
+// 0.9.24（用户要求：C 档参数表里两个提示词框最后加逗号）
+//   坑：框内容在「切画风」时会被重写，而 Add-StyleWords / Remove-StyleWords **都不带尾部逗号**
+//   → 打开时看到的逗号在切一次画风后就没了。现在每次重写后都过一遍 Add-TrailingComma，
+//   表单确认取 Pos/Neg 时再兜一次 —— 框里显示什么、后面就用什么，一定以逗号结尾。
+// ---------------------------------------------------------------------------
+assert.ok(/function Add-TrailingComma/.test(injectPs1), '必须有「补后缀逗号」的函数')
+assert.ok((injectPs1.match(/Add-TrailingComma \(Add-StyleWords/g) || []).length >= 4, '切画风注入/重注入的两条路径都要补逗号')
+assert.ok((injectPs1.match(/Add-TrailingComma \(Remove-StyleWords/g) || []).length >= 2, '切画风移除旧画风词后也要补逗号')
+assert.ok(/Pos     = \(Add-TrailingComma \$txtPos\.Text\)\.TrimEnd\(\)/.test(injectPs1), '确认时正向框必须兜一次后缀逗号')
+assert.ok(/Neg     = \(Add-TrailingComma \$txtNeg\.Text\)\.TrimEnd\(\)/.test(injectPs1), '确认时负向框必须兜一次后缀逗号')
+assert.ok(/\$formPositive = \$formPositive\.TrimEnd\(\) \+ ", "/.test(injectPs1) && /\$formNegative = \$formNegative\.TrimEnd\(\) \+ ", "/.test(injectPs1), '预填时两个框也必须带逗号（原有行为不能丢）')
+
+const commaPs1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-trailing-comma.ps1')
+assert.ok(fs.existsSync(commaPs1), 'test-trailing-comma.ps1 必须随包发布（后缀逗号真跑测试）')
+const commaRun = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', commaPs1], { encoding: 'utf8', timeout: 180000 })
+assert.equal(commaRun.status, 0, `后缀逗号真跑测试必须通过：\n${commaRun.stdout || ''}\n${commaRun.stderr || ''}`)
+assert.ok(/TRAILING-COMMA TEST OK/.test(commaRun.stdout || ''), '后缀逗号测试必须打印 TRAILING-COMMA TEST OK')
+console.log('TRAILING-COMMA SMOKE OK')

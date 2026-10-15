@@ -23,12 +23,51 @@ import json
 import os
 import sys
 
+# 必须在 import torch / ultralytics **之前**设：显存碎片化是 8G 卡上「同一个命令时好时坏」的主因
+# （实测：22:10 能抠、23:16 直接 CUDA OOM / 进程异常退出、PowerShell 侧只看到「没有输出」）。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def _free_vram_gb():
+    """剩余显存（GB）；取不到返回 -1。"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return -1
+        return torch.cuda.mem_get_info()[0] / (1024.0 ** 3)
+    except Exception:
+        return -1
+
+
+def pick_device(args):
+    """检测/分割用哪个设备：显存不够就整条走 CPU。
+
+    YOLO-World 的**加载与首次推理**同样会抢显存（不只是 SAM）。实测截图里那次失败就是
+    「脚本跑到 YOLO-World 检测那一步就没输出了」——进程被 CUDA 崩掉，PowerShell 只能报
+    「抠图脚本没有输出」。所以这里统一按剩余显存决定，宁可慢（CPU 也能跑）也不崩。
+    """
+    if getattr(args, "device", "auto") == "cpu":
+        return "cpu"
+    if getattr(args, "device", "auto") == "cuda":
+        return "cuda"
+    free = _free_vram_gb()
+    if free < 0:
+        return "cpu"
+    if free < getattr(args, "vram_min_gb", 3.0):
+        return "cpu"
+    return "cuda"
+
+
 TARGET_LABELS = {
     # YOLO-World 实测：多词一起喂会互相稀释（命中率骤降），必须**单词逐个试**。
-    # 下面按「野外命中率」排序，命中即停（最多取 2 个词的结果）。
-    "衣服": ["dress", "jacket", "coat", "uniform", "kimono", "sweater", "hoodie",
+    # 下面按「野外命中率」排序，命中即停（最多取 --max-boxes 个词的结果）。
+    # 2026-10-16 补（用户反馈：换衣服后「袖子 / 兜帽 / 披风」这些**不属于连衣裙的部件**没进蒙版，
+    # 重绘完身上还挂着半截袖子）：把 detached sleeves / hood / cloak / shawl / scarf 这类
+    # 「同一套衣服的其它部件」加进词表，让检测器也能框到它们，后面的多件合一再并成一套。
+    "衣服": ["dress", "sleeves", "detached sleeves", "hood", "cloak", "cape", "shawl", "scarf",
+             "jacket", "coat", "uniform", "kimono", "sweater", "hoodie",
              "swimsuit", "swimwear", "bodysuit", "leotard", "wetsuit", "jumpsuit",
-             "shirt", "skirt", "pants", "shorts", "raincoat", "cape", "clothing", "clothes", "outfit"],
+             "shirt", "skirt", "pants", "shorts", "raincoat", "clothing", "clothes", "outfit"],
     "脸": ["face", "head"],
     "背景": ["person"],
     "主体": ["person"],
@@ -95,6 +134,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--sd-dir", default="")
     ap.add_argument("--sam", default="", help="指定 SAM 权重路径（留空自动找）")
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="检测/分割设备：auto=按剩余显存决定（默认，8G 卡上 SD 常驻时会走 CPU 保命）")
     ap.add_argument("--boxes", default="", help="可选：手工框 x1,y1,x2,y2[;x1,y1,x2,y2]（跳过 YOLO-World）")
     ap.add_argument("--box-threshold", type=float, default=0.03, help="检测阈值（YOLO-World 用低阈值才容易命中服饰词）")
     ap.add_argument("--max-side", type=int, default=2048, help="检测最长边（实测 1600 会漏检服饰，2048 才稳）")
@@ -108,9 +148,17 @@ def main():
     ap.add_argument("--grow", action="store_true", help="衣服：颜色一致性生长（默认关；守岸人那张实测会长进薄纱/浅色头发）")
     ap.add_argument("--sam-side", type=int, default=1024, help="SAM 在多大分辨率上分割（默认 1024，省显存；蒙版会放回原尺寸）")
     ap.add_argument("--points", default="", help="SAM 点提示（图像像素坐标）：x,y;x,y …；给了就跳过检测直接点选")
-    ap.add_argument("--max-words", type=int, default=10, help="逐词检测最多试几个词（命中即停）")
+    ap.add_argument("--max-words", type=int, default=12, help="逐词检测最多试几个词（命中即停）")
+    ap.add_argument("--max-boxes", type=int, default=3, help="最多收集几个词的检测框（衣服是多件套：连衣裙/袖套/兜帽各算一件，实测只收 2 个会漏掉袖套）")
+    ap.add_argument("--vram-min-gb", type=float, default=3.0, help="SAM 上 cuda 前要求的最低剩余显存（实测 2.57G 剩余时 ViT-L 仍会 CUDA OOM）")
+    ap.add_argument("--vram-cpu-gb", type=float, default=3.0, help="剩余显存低于这个值就直接改走 CPU 分割（ViT-L 慢但绝不会 OOM）")
+    ap.add_argument("--vram-full-gb", type=float, default=4.5, help="剩余显存高于这个值才按 sam-side 全分辨率在 cuda 上分割，否则降到 640px")
     args = ap.parse_args()
 
+
+    # 检测器设备：与 SAM 同一套显存判断。YOLO-World 的加载/首推同样会抢显存，实测就是它把进程崩掉的。
+    DEV = pick_device(args)
+    print(f"[抠图] 检测设备：{DEV}（剩余显存 {_free_vram_gb():.1f}G）", file=sys.stderr, flush=True)
 
     print("[抠图] 开始（加载检测模型约 10-20 秒，请稍候…）", file=sys.stderr, flush=True)
     result = {"ok": False, "engine": "", "boxes": 0, "coverage": 0.0,
@@ -180,12 +228,12 @@ def main():
                 im = cv2.resize(img_bgr, None, fx=scale, fy=scale) if scale < 1 else img_bgr
                 # 单词逐个试：YOLO-World 多词混喂会稀释分数（实测 15 词 0 命中、单词命中）
                 for word in labels[: args.max_words]:
-                    if len(boxes) >= 2:
+                    if len(boxes) >= max(1, args.max_boxes):
                         break
                     try:
                         m = YOLO(world_weights[0])     # 每个词新建实例：重复 set_classes 会触发 CUDA/CPU 设备错位
                         m.set_classes([word])
-                        pred = m.predict(im, conf=args.box_threshold, verbose=False)[0]
+                        pred = m.predict(im, conf=args.box_threshold, verbose=False, device=DEV)[0]
                         got = 0
                         for b in pred.boxes:
                             x1, y1, x2, y2 = [float(v) / scale for v in b.xyxy[0].tolist()]
@@ -215,7 +263,7 @@ def main():
             try:
                 from ultralytics import YOLO
                 fm = YOLO(face_models[0])
-                pred = fm.predict(img_bgr, conf=0.3, verbose=False)[0]
+                pred = fm.predict(img_bgr, conf=0.3, verbose=False, device=DEV)[0]
                 for b in pred.boxes:
                     boxes.append([float(v) for v in b.xyxy[0].tolist()])
                 if boxes:
@@ -233,7 +281,7 @@ def main():
             try:
                 from ultralytics import YOLO
                 pm = YOLO(seg_models[0])
-                pred = pm.predict(img_bgr, conf=0.25, verbose=False)[0]
+                pred = pm.predict(img_bgr, conf=0.25, verbose=False, device=DEV)[0]
                 if pred.masks is not None and len(pred.masks.data):
                     person_mask = np.zeros((H, W), dtype=np.uint8)
                     for mm in pred.masks.data:
@@ -278,7 +326,7 @@ def main():
             try:
                 from ultralytics import YOLO
                 pm_ = YOLO(seg_ms[0])
-                pr_ = pm_.predict(img_bgr, conf=0.25, verbose=False)[0]
+                pr_ = pm_.predict(img_bgr, conf=0.25, verbose=False, device=DEV)[0]
                 if pr_.masks is not None and len(pr_.masks.data):
                     _pmask = np.zeros((H, W), dtype=np.uint8)
                     for _mm in pr_.masks.data:
@@ -307,7 +355,7 @@ def main():
             try:
                 from ultralytics import YOLO
                 _fmod = YOLO(_fm[0])
-                _fp = _fmod.predict(img_bgr, conf=0.3, verbose=False)[0]
+                _fp = _fmod.predict(img_bgr, conf=0.3, verbose=False, device=DEV)[0]
                 if _fp.boxes is not None and len(_fp.boxes):
                     _fb = _fp.boxes.xyxy.cpu().numpy()
                     face_box = (float(_fb[:, 0].min()), float(_fb[:, 1].min()),
@@ -362,9 +410,32 @@ def main():
             else:
                 kind = "vit_l"
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            # 显存自适应：A1111 常驻时这张 7.9G 卡的**剩余显存是漂的**。真机实测（2026-10-15 23:16）：
+            # 同一个参考图、同一个命令，22:10 能抠出蒙版，23:16 就报
+            # "CUDA out of memory ... 2.57 GiB free" → SAM 整段失败 → 换衣服/换背景拿不到蒙版。
+            # 所以不再盲上 cuda：先读实际剩余显存，不够就降分辨率，再不够直接走 CPU。
+            side_used = float(args.sam_side)
+            if device == "cuda":
+                try:
+                    _free_b = torch.cuda.mem_get_info()[0]
+                    _free_gb = _free_b / (1024.0 ** 3)
+                    if _free_gb < args.vram_cpu_gb:
+                        device = "cpu"
+                        side_used = min(side_used, 768.0)
+                        notes.append(f"显存只剩 {_free_gb:.1f}G → SAM 改走 CPU（实测 2.57G 剩余时 ViT-L 仍 CUDA OOM，宁可慢也不让蒙版整条失败）")
+                    elif _free_gb < args.vram_full_gb:
+                        side_used = min(side_used, 640.0)
+                        notes.append(f"显存只剩 {_free_gb:.1f}G → SAM 降到 {int(side_used)}px（省显存）")
+                    else:
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             # 在缩小图上分割，掩膜再放回原尺寸：省显存（A1111 常驻时 7.9G 卡很容易 OOM），也快得多。
             # 蒙版最终会被插件缩放到出图尺寸，所以这里降分辨率不影响最终精度。
-            work_scale = min(1.0, float(args.sam_side) / max(H, W))
+            work_scale = min(1.0, side_used / max(H, W))
             img_work = cv2.resize(img_bgr, None, fx=work_scale, fy=work_scale, interpolation=cv2.INTER_AREA) if work_scale < 1 else img_bgr
             sam = sam_model_registry[kind](checkpoint=sam_path).to(device)
             predictor = SamPredictor(sam)
@@ -428,11 +499,18 @@ def main():
                                 if _facepx / float(_tot) > 0.08:
                                     continue      # 这块压到脸了，不是衣服
                             # 硬约束：衣服不可能在头顶 —— 蒙版上沿若高于「人物上沿 + 8% 身高」就丢掉
+                            # 硬约束：衣服不可能长在头顶 —— 但**肩线附近的部件是合法的**。
+                            # 2026-10-16 修（用户反馈：换完衣服还挂着半截袖子）：旧判据是「上沿不得高于
+                            # 人物上沿 + 8% 身高」，而**袖套/兜帽/披风**正好卡在这条线上 → 整块被丢，
+                            # 蒙版只剩连衣裙本体，袖子留在身上。改成「不得高于下巴」（有脸框就用脸框底边，
+                            # 没有才退回旧判据），既挡住头/头发，也放行肩部服饰。
                             if person_box is not None and not args.no_shoulder_guard:
                                 _m = cv2.resize(arr_full, (W, H), interpolation=cv2.INTER_NEAREST)
                                 _ys3, _ = np.where(_m > 127)
                                 if len(_ys3):
-                                    top_limit = person_box[0] + 0.08 * (person_box[1] - person_box[0])
+                                    # 4%（原来 8%）＝ 把「肩线附近」的袖套/披风放行；头发/头饰从人物上沿
+                                    # 就开始（0-3%），所以 4% 仍然挡得住 —— 再加下面那道脸部重叠 ≤8% 双保险。
+                                    top_limit = person_box[0] + 0.04 * (person_box[1] - person_box[0])
                                     if float(_ys3.min()) < top_limit:
                                         continue
                             if cov <= 0.18 and all(float((p > 127).mean()) != cov or True for p in parts):
@@ -470,6 +548,57 @@ def main():
                 pass
         except Exception as e:
             notes.append(f"SAM 失败：{type(e).__name__}: {e}")
+            # SAM 挂掉绝不能把「换衣服 / 换背景」整条路径废掉（实测：这里一失败，
+            # PowerShell 侧就报「没抠出任何区域」→ 用户看到的是「蒙版没生效」）。
+            # 兜底分两层，尽量别退成「一个长方形罩住整个人」：
+            #   ① 先补一次人物剪影（有剪影就与框相交，蒙版不出人体）；
+            #   ② 若粗蒙版纵向吞掉了整个人（含头/脚），按躯干带裁一刀 —— 换衣服只该动躯干那一段。
+            if boxes:
+                if person_mask_for_points is None:
+                    try:
+                        _seg2 = find_file([args.sd_dir or ""], ["*person*yolov8*-seg.pt"], min_mb=1)
+                        if _seg2:
+                            from ultralytics import YOLO as _YOLO2
+                            _pm2 = _YOLO2(_seg2[0])
+                            _pr2 = _pm2.predict(img_bgr, conf=0.25, verbose=False, device=DEV)[0]
+                            if _pr2.masks is not None:
+                                _acc = np.zeros((H, W), dtype=np.uint8)
+                                for _mm in _pr2.masks.data:
+                                    _arr = (_mm.cpu().numpy() > 0.5).astype(np.uint8) * 255
+                                    _acc = np.maximum(_acc, cv2.resize(_arr, (W, H), interpolation=cv2.INTER_NEAREST))
+                                if _acc.max() > 0:
+                                    person_mask_for_points = _acc
+                                    _ysp, _ = np.where(_acc > 127)
+                                    if len(_ysp):
+                                        person_box = (int(_ysp.min()), int(_ysp.max()))
+                                    notes.append("兜底：已补人物剪影用于裁边")
+                            del _pm2
+                    except Exception:
+                        pass
+                for bx in boxes:
+                    try:
+                        _x1, _y1, _x2, _y2 = [int(round(float(v))) for v in bx[:4]]
+                    except Exception:
+                        continue
+                    _x1 = max(0, min(W - 4, _x1)); _y1 = max(0, min(H - 4, _y1))
+                    _x2 = max(_x1 + 4, min(W, _x2)); _y2 = max(_y1 + 4, min(H, _y2))
+                    mask_full[_y1:_y2, _x1:_x2] = 255
+                if person_mask_for_points is not None:
+                    mask_full = cv2.bitwise_and(mask_full, person_mask_for_points)
+                if (args.target == "衣服" and person_box is not None and mask_full.max() > 0):
+                    _t, _b = person_box
+                    _hh = max(1, _b - _t)
+                    _lim0 = int(_t + 0.08 * _hh)      # 肩线以上不留（那是头/头发）
+                    _lim1 = int(_t + 0.82 * _hh)      # 小腿以下不留（换衣服不动脚）
+                    _band = np.zeros((H, W), dtype=np.uint8)
+                    _band[max(0, _lim0):min(H, _lim1), :] = 255
+                    _clipped = cv2.bitwise_and(mask_full, _band)
+                    if _clipped.max() > 0 and float((_clipped > 127).mean()) < float((mask_full > 127).mean()):
+                        notes.append(f"粗蒙版裁到躯干带（{float((mask_full > 127).mean()):.1%} → {float((_clipped > 127).mean()):.1%}），避免整个人被重画")
+                        mask_full = _clipped
+                if mask_full.max() > 0:
+                    sam_used = True
+                    notes.append(f"已用 {len(boxes)} 个检测框生成粗蒙版兜底（非精细分割，边缘是直的）")
 
     # SAM 不可用时：退回 person 专用分割模型（只对「人」有效，用于背景/主体）
     if not sam_used:
@@ -479,7 +608,7 @@ def main():
             try:
                 from ultralytics import YOLO
                 m = YOLO(seg_models[0])
-                pred = m.predict(img_bgr, conf=args.box_threshold, verbose=False)[0]
+                pred = m.predict(img_bgr, conf=args.box_threshold, verbose=False, device=DEV)[0]
                 if pred.masks is not None:
                     for mm in pred.masks.data:
                         arr = (mm.cpu().numpy() > 0.5).astype(np.uint8) * 255
@@ -582,14 +711,35 @@ def main():
         except Exception:
             pass
 
-    # 只留最大连通块（去掉蝴蝶/花点等误检碎块；碎块会让无关区域被重画）
+    # 连通块筛选：去掉蝴蝶/花点等误检碎块（碎块会让无关区域被重画），但**衣服不能只留最大那块** ——
+    # 真机实测（2026-10-15 23:10 那轮）：一件连衣裙被 SAM 拆成 7 块，旧逻辑只留最大的一块，
+    # 袖子那一侧与裙摆整个没进蒙版；人工审阅叠加图看到的就是「裙子边缘一圈没被罩住」，
+    # 出图自然就「衣服没换干净 + 残留碎片」。衣服改成按「面积比例 + 总覆盖上限」保留同件的多块。
     try:
         n_lab, labels, stats, _ = cv2.connectedComponentsWithStats((mask_full > 127).astype(np.uint8), connectivity=8)
         if n_lab > 2:
-            areas = stats[1:, cv2.CC_STAT_AREA]
-            keep = 1 + int(np.argmax(areas))
-            mask_full = np.where(labels == keep, 255, 0).astype(np.uint8)
-            notes.append(f"已只留最大连通块（原 {n_lab - 1} 块）")
+            areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float64)
+            order = np.argsort(-areas)
+            if args.target == "衣服":
+                top = float(areas[order[0]])
+                keep_ids = []
+                cum = 0.0
+                limit = 0.32 * H * W
+                for idx in order:
+                    a = float(areas[idx])
+                    if keep_ids and a < max(0.002 * H * W, 0.18 * top):
+                        continue                      # 小碎块（蝴蝶/花点）：丢掉
+                    if keep_ids and cum + a > limit:
+                        continue                      # 总覆盖上限：别把身体一起罩进去
+                    keep_ids.append(int(idx) + 1)
+                    cum += a
+                mask_full = np.where(np.isin(labels, keep_ids), 255, 0).astype(np.uint8)
+                _area_txt = ",".join(f"{100.0 * a / (H * W):.2f}%" for a in areas[order[:8]])
+                notes.append(f"衣服：保留 {len(keep_ids)}/{n_lab - 1} 块（合并同一件衣服的分散部件，总覆盖 {cum / (H * W):.1%}；各块面积 {_area_txt}）")
+            else:
+                keep = 1 + int(np.argmax(areas))
+                mask_full = np.where(labels == keep, 255, 0).astype(np.uint8)
+                notes.append(f"已只留最大连通块（原 {n_lab - 1} 块）")
     except Exception:
         pass
     if args.dilate > 0:

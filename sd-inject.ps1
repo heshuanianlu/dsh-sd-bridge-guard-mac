@@ -31,7 +31,12 @@ param(
     [string]$QwenApiKey = "ollama",                    # API Key（Ollama 任意非空即可）
     [int]$IterateRounds = 3,                           # 素体自检迭代轮数上限（每轮换 seed + 面部修复，脸部过关即停）
     [switch]$NoIterate,                                # 加 -NoIterate 则跳过素体自检迭代，直接出一张（老行为）
-    [string]$VlmModel = "qwen3-vl:8b",                 # 脸部质检用的本地视觉模型（留空 "" = 自动挑本机 vl/vision 模型）
+    [string]$VlmModel = "qwen3-vl:8b",                  # 人物肢体审核用的本地**能识图**的视觉模型（留空 "" = 自动挑本机 vl/vision 模型）
+    [switch]$NoVlmReview,                              # 加 -NoVlmReview 则关闭视觉模型审核（不质检、也不做画风识别），出满 N 张由你自己挑
+    [int]$VlmTimeoutSec = 300,                         # 单次审核（一张图一次打分）的超时秒数
+    [int]$VlmImageMaxSide = 768,                       # 送审前把图压到长边不超过这个像素（判结构够用，能救「CPU 上跑不完」）
+    [switch]$NoVramRelease,                            # 加 -NoVramRelease 则不做「开跑前先释放显存」的动作
+    [double]$VramMinFreeGb = 4.0,                      # 开跑前剩余显存低于这个值就先释放对面那一侧（SD / 本地模型服务）
     [int]$SdPort = 7860,                               # SD API 端口（拉取 LoRA 列表用）
     [int]$Width = 512,
     [int]$Height = 768,
@@ -47,6 +52,10 @@ param(
     [string]$Mode = "",                                # 任务类型（由对话判断后提交）：文生图 / 图生图；留空 = 表单默认（文生图）
     [string]$MaskSpec = "",                            # 蒙版区域（C-1 替换用，对话提交）：上半（脸）/下半（衣服）/中间（主体）/四周（背景）及反选，或蒙版图路径
     [string]$IterDir = "",                             # 迭代中间图目录（必须可写）：留空 = <工作区>\.sd-inject-iter → 脚本目录 → 系统 temp
+    [switch]$NoVlmStart,                              # 加 -NoVlmStart 则不自动冷启动本地视觉模型（Ollama 没开时不再替你拉起）
+    [int]$VlmStartTimeout = 60,                       # 冷启动等待 Ollama 就绪的秒数（就绪后再等首次推理加载模型）
+    [switch]$KeepWorkFiles,                            # 加 -KeepWorkFiles 则保留本次产生的中间图（预蒙版/命中率总览图），默认跑完自动清掉
+    [switch]$NoAutoMask,                               # 加 -NoAutoMask 则不跑自动抠图（跳过 YOLO-World/SAM），只用几何区域蒙版（上半/下半/中间/四周）或你手填的框
     [switch]$NoOpen                                   # 加 -NoOpen 则跑完不自动打开这张图
 )
 
@@ -383,6 +392,18 @@ function Remove-StyleWords {
     return $t.Trim()
 }
 
+# 提示词框的后缀逗号（用户要求 2026-10-16）：两个框的内容**始终以逗号结尾**。
+# 为什么要它：① 用户在框里接着追加时不会和上一个标签粘成一个词；② 整段复制出去拼接也省事；
+# ③ 画风切换/模式切换会重写框内容（Add-StyleWords / Remove-StyleWords 都不带尾部逗号），
+#    所以每次重写后都要补回来——这是之前"框里时有时无"的原因。
+function Add-TrailingComma {
+    param([string]$Text)
+    $t = "$Text"
+    if (-not $t.Trim()) { return $t }
+    if ($t -match ',\s*$') { return $t }      # 已经有逗号（后面可有空格）→ 原样
+    return ($t.TrimEnd() + ", ")
+}
+
 # ---- 参考图解析（决策 C-1：文生图 / 图生图·一致 / 图生图·替换）----
 # 一致从哪里来？优先级：
 #   ① 参考图自带 A1111 元数据（我们自己出的图）→ 直接拿到它的模型 + 原提示词/负向词，一致性最强；
@@ -463,10 +484,12 @@ function Get-ImageStyleByVlm {
     param([string]$Path)
     $styles = "保持画风/二次元/写实二次元/彩色哥特/国风/赛博朋克/写实/厚涂/水彩/像素风"
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    if ($NoVlmReview) { return '' }   # 视觉审核整体关闭（插件设置 vlmReview=false）→ 连画风识别也不调模型
+    if (-not (Test-VlmApi)) { $null = Start-OllamaService -TimeoutSec $VlmStartTimeout }   # 冷启动：没起就替你拉起来
     if (-not (Test-VlmApi)) { return '' }
     $b64 = $null
     try { $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) } catch { return '' }
-    $ask = "这张图属于下面哪个画风？只能回答其中一个词，不要解释：$styles"
+    $ask = "只判断画风（技术属性），不评价画面内容、不描述画面里有什么。这张图属于下面哪个画风？只能回答其中一个词，不要解释：$styles"
     try {
         $body = @{
             model = $VlmModel
@@ -500,12 +523,34 @@ function Get-ImageSizePx {
     } catch { return @{ W = 512; H = 768 } }
 }
 
+# 参考图原生尺寸 → 最终出图尺寸（8 的倍数、长边 ≤1536）。C-1a / C-1b **共用这一个尺寸**：
+# 区域蒙版必须按它来画，否则 boxpx 会被当成「表单尺寸」的像素、区域名还要被最近邻再缩放一次
+# （长宽比不一致时就把区域拉歪 —— 用户反馈的「蒙版位置有问题」）。
+function Get-RefOutputSize {
+    param([string]$Path)
+    $rs = Get-ImageSizePx -Path $Path
+    $w = [int]([Math]::Floor($rs.W / 8) * 8)
+    $h = [int]([Math]::Floor($rs.H / 8) * 8)
+    $mx = [Math]::Max($w, $h)
+    if ($mx -gt 1536) {
+        $k = 1536.0 / $mx
+        $w = [int]([Math]::Floor(($rs.W * $k) / 8) * 8)
+        $h = [int]([Math]::Floor(($rs.H * $k) / 8) * 8)
+    }
+    return @{ W = $w; H = $h; SrcW = $rs.W; SrcH = $rs.H }
+}
+
 # 区域蒙版生成（白 = 重绘区，黑 = 保留区）。Spec 认不出的形状返回 ''。
 # 支持：上半（脸）/ 下半（衣服）/ 中间 / 四周（背景），后缀「反选」= 取补集。
 function New-RegionMask {
     param([string]$Spec, [int]$W, [int]$H, [string]$OutPath)
     $s = "$Spec"
     if (-not $s) { return '' }
+    # 必须先初始化成数组：`$rects += @{...}` 从 $null 起步会得到一个 Hashtable，
+    # 再加第二块时 PowerShell 会抛「Item has already been added. Key in dictionary: 'Y'」
+    # → 环形（四周/背景）与它的反选整条路径直接死掉（单块形状只是碰巧能用）。
+    $rects = @()
+    $shape = ''
     $invert = $false
     if ($s -match '反选|invert') { $invert = $true; $s = ($s -replace '反选', '') -replace 'invert', '' }
     # 精确坐标框（对话可以据此提交任意区域）：box:x,y,w,h（0-1 归一化）或 boxpx:x,y,w,h（像素）
@@ -537,7 +582,7 @@ function New-RegionMask {
     $black = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Black)
     $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
     $g.Clear([System.Drawing.Color]::Black)
-    if ($shape -eq 'box') { $rects = $rects }   # box 分支已经在上面算好矩形了
+    if ($shape -eq 'box') { }   # box 分支已经在上面算好矩形了（$rects 已是数组）
     switch ($shape) {
         # 区域框刻意收窄：铺满整幅会把背景/头发一起重画（实测那样出来的是糊块）
         'upper'  { $rects += @{ X = [int]($W * 0.25); Y = [int]($H * 0.04); Wd = [int]($W * 0.5); Ht = [int]($H * 0.32) } }
@@ -565,6 +610,53 @@ function New-RegionMask {
         $bmp.Dispose()
         return $OutPath
     } catch { $bmp.Dispose(); return '' }
+}
+
+# 蒙版命中率体检：C-1b 出图后自动跑一次，客观回答「蒙版准不准」。
+# 为什么必要：光看生成结果会被「模型自己画了什么」骗 —— 实测用「脱衣服」提示词测蒙版时，
+# 模型会把衣服画成「半脱状态」，看着像蒙版漏了，其实那块像素**已经改过**（蒙版命中了）。
+# 这里直接量「蒙版内变没变 / 蒙版外动没动」，与提示词无关。走 --json（纯 ASCII）回传，避免中文乱码。
+function Invoke-MaskQaReport {
+    param([string]$RefPath, [string]$MaskPath, [string]$OutPath, [string]$QaDir = "")
+    if (-not $RefPath -or -not $MaskPath -or -not $OutPath) { return }
+    foreach ($p in @($RefPath, $MaskPath, $OutPath)) { if (-not (Test-Path -LiteralPath $p)) { return } }
+    $scriptDir = $PSScriptRoot
+    if (-not $scriptDir) { try { $scriptDir = Split-Path -Parent $PSCommandPath } catch { } }
+    $helper = Join-Path $scriptDir 'sd-mask-qa.py'
+    if (-not (Test-Path -LiteralPath $helper)) { return }
+    $py = Find-SdPython
+    if (-not $py) { return }
+    $qaArgs = @($helper, '--ref', $RefPath, '--mask', $MaskPath, '--out', $OutPath, '--json')
+    if ($QaDir) { $qaArgs += @('--qa-dir', $QaDir) }
+    try {
+        $raw = & $py @qaArgs 2>$null
+        $j = "$raw" | ConvertFrom-Json
+        if ($j -and $j.ok) {
+            $inMask = [Math]::Max(0.000001, [double]$j.mask)
+            $outMask = [Math]::Max(0.000001, 1.0 - [double]$j.mask)
+            Write-Host ("  蒙版覆盖 {0:N2}%｜命中 {1:N2}%（占蒙版 {2:N1}%）｜蒙版内未改 {3:N2}%（占蒙版 {4:N1}%）｜外溢 {5:N2}%｜蒙版外保留 {6:N2}%" -f `
+                    (100 * [double]$j.mask), (100 * [double]$j.hit), (100 * [double]$j.hit / $inMask), `
+                    (100 * [double]$j.ineffective), (100 * [double]$j.ineffective / $inMask), `
+                    (100 * [double]$j.leak), (100 * [double]$j.kept)) -ForegroundColor DarkGray
+            if ([double]$j.suspect -gt 0.005) {
+                Write-Host ("  疑似漏掉的衣料：{0:N2}%（{1} 块 >0.3%）→ 复核总览图里的品红区" -f (100 * [double]$j.suspect), [int]$j.suspect_blobs) -ForegroundColor Yellow
+            }
+            if ($j.overlay -and (Test-Path -LiteralPath $j.overlay)) {
+                # 总览图默认写在迭代临时目录里（随目录一起清掉 —— 产物目录只留成品）；
+                # -KeepWorkFiles 时复制一份到产物目录，方便慢慢看。
+                if ($KeepWorkFiles -and $OutDir) {
+                    try {
+                        $keepOv = Join-Path $OutDir (Split-Path $j.overlay -Leaf)
+                        Copy-Item -LiteralPath $j.overlay -Destination $keepOv -Force
+                        $null = Add-RunWorkFile $keepOv
+                        Write-Host "  命中率总览图：$keepOv（绿=蒙版内已改 / 黄=蒙版内未改 / 红=外溢 / 品红=疑似漏掉衣料）" -ForegroundColor DarkGray
+                    } catch { }
+                } else {
+                    Write-Host "  （命中率总览图写在迭代临时目录里，跑完随目录一起清掉；要留图请加 -KeepWorkFiles）" -ForegroundColor DarkGray
+                }
+            }
+        }
+    } catch { }
 }
 
 # 从用户写的指令里判断「是不是替换动作」以及「替换的是哪一块」（决定默认蒙版区域）。
@@ -711,10 +803,20 @@ function New-AutoMaskFromImage {
         [string]$OutPath,
         [int]$Dilate = 8,
         [int]$Feather = 4,
-        [string]$HelperPath = ""   # 留空 = 脚本同目录下的 sd-auto-mask.py
+        [string]$HelperPath = "",  # 留空 = 脚本同目录下的 sd-auto-mask.py
+        [switch]$ForceCpu          # CUDA 崩掉后的自动重试：强制 CPU 跑检测/分割
     )
     $script:AutoMaskNote = ''
+    if ($NoAutoMask) {
+        # 插件页开关（maskAutoSegment=false）或命令里显式带的 -NoAutoMask：整条自动抠图不跑，
+        # 直接走几何区域蒙版（按画面比例画的上半/下半/中间/四周），不加载任何检测模型。
+        $script:AutoMaskNote = '已关闭自动抠图（-NoAutoMask / 插件设置 maskAutoSegment=false）→ 用几何区域蒙版'
+        Write-Host "  [抠图] $($script:AutoMaskNote)" -ForegroundColor DarkGray
+        return ''
+    }
     if (-not $ImagePath -or -not (Test-Path -LiteralPath $ImagePath)) { $script:AutoMaskNote = '参考图不存在'; return '' }
+    # 抠图要 YOLO-World + SAM（约 2-3G）：先让 SD 卸载模型把显存腾出来（这正是之前 SAM OOM 的根因）
+    Ensure-Vram -For 'sd' -Note '自动抠图'
     $scriptDir = $PSScriptRoot
     if (-not $scriptDir) { try { $scriptDir = Split-Path -Parent $PSCommandPath } catch { } }
     if (-not $scriptDir) { try { $scriptDir = (Get-Location).Path } catch { } }
@@ -724,6 +826,7 @@ function New-AutoMaskFromImage {
     if (-not $py) { $script:AutoMaskNote = '找不到可用的 python（SD 目录下 python\python.exe）'; return '' }
     $args = @($helper, '--image', $ImagePath, '--target', $Target, '--out', $OutPath, '--dilate', "$Dilate", '--feather', "$Feather")
     if ($Target -eq '衣服') { $args += '--fill-sheer' }   # 补薄纱/透视布料（有 2.2 倍与 22% 双上限保护）
+    if ($ForceCpu) { $args += @('--device', 'cpu') }      # 自动重试：这条路径明确绕开 CUDA
     # 权重/模型都靠这个根目录：-SdDir 为空时必须用探测出来的 SD 根（否则报「没找到 YOLO-World 权重」）
     $sdRootForHelper = $SdDir
     if (-not $sdRootForHelper) {
@@ -736,6 +839,20 @@ function New-AutoMaskFromImage {
     $errFile = "$outFile.err"
     $proc = $null
     try {
+        # HuggingFace 缓存：不设 HF_HOME 时 python 会去 %USERPROFILE%\.cache\huggingface，
+        # 那里往往缺 CLIP 文字编码器 → set_classes 会去联网下载（300MB+）→ 网络一卡就死在检测那一步。
+        # SD 启动器给自己设了 HF_HOME，所以 SD 目录下的缓存才是齐的，这里显式沿用。
+        $hfRoot = ""
+        if ($sdRootForHelper) { $hfRoot = Join-Path $sdRootForHelper '.cache\huggingface' }
+        if ($hfRoot -and (Test-Path -LiteralPath $hfRoot)) {
+            $env:HF_HOME = $hfRoot
+            $env:HUGGINGFACE_HUB_CACHE = Join-Path $hfRoot 'hub'
+            $hubDir = Join-Path $hfRoot 'hub'
+            $hasClip = $false
+            try { $hasClip = [bool](Get-ChildItem -LiteralPath $hubDir -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*clip*' }) } catch { }
+            if ($hasClip) { $env:HF_HUB_OFFLINE = '1' }   # 模型齐了 → 断网，缺就立刻报错而不是挂住
+            Write-Host "  [抠图] 模型缓存：$hfRoot（离线=$([bool]$env:HF_HUB_OFFLINE)）" -ForegroundColor DarkGray
+        }
         # 子进程 python 的 stdout 默认跟系统 ANSI 代码页（中文机是 GBK）走 → 中文变乱码、JSON 解析失败。
         # 强制 UTF-8（进程级，跑完还原）。
         $env:PYTHONIOENCODING = 'utf-8'
@@ -763,6 +880,15 @@ function New-AutoMaskFromImage {
         $raw = @()
         if (Test-Path -LiteralPath $outFile) { $raw = @(Get-Content -LiteralPath $outFile -Encoding UTF8 -ErrorAction SilentlyContinue) }   # JSON 是 UTF8，按 GBK 读会把中文读成乱码导致解析失败
         $out = "$(($raw | Where-Object { $_ -like '{*' } | Select-Object -Last 1))".Trim()
+        # 失败诊断：拉不到 JSON 时必须说清**为什么**（退出码 + stderr 尾巴），
+        # 而不是只丢一句「抠图脚本没有输出」——用户反馈里这句话等于没有信息。
+        $script:AutoMaskExit = -1
+        try { if ($proc.HasExited) { $script:AutoMaskExit = [int]$proc.ExitCode } } catch { }
+        $script:AutoMaskErrTail = @()
+        if (Test-Path -LiteralPath $errFile) {
+            $script:AutoMaskErrTail = @(Get-Content -LiteralPath $errFile -Encoding UTF8 -ErrorAction SilentlyContinue |
+                    Where-Object { "$_".Trim() } | Select-Object -Last 6)
+        }
     } catch {
         $script:AutoMaskNote = "抠图脚本调用失败：$($_.Exception.Message)"
         Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
@@ -770,9 +896,36 @@ function New-AutoMaskFromImage {
     } finally {
         $env:PYTHONIOENCODING = $null
         $env:PYTHONUTF8 = $null
+        $env:HF_HOME = $null
+        $env:HUGGINGFACE_HUB_CACHE = $null
+        $env:HF_HUB_OFFLINE = $null
         Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
     }
-    if (-not $out) { $script:AutoMaskNote = '抠图脚本没有输出'; return '' }
+    if (-not $out) {
+        $why = "抠图脚本没有输出（python 退出码 $($script:AutoMaskExit)"
+        if ($script:AutoMaskExit -eq 3221225477 -or $script:AutoMaskExit -eq -1073741819) {
+            $why += " 0xC0000005 异常退出 —— 多半是显存不足/CUDA 崩溃（SD 常驻时检测模型也会抢显存）"
+        } elseif ($script:AutoMaskExit -eq 1) {
+            $why += "，脚本报错退出"
+        } elseif ($script:AutoMaskExit -eq -1) {
+            $why += "，进程状态未知"
+        }
+        $why += ")"
+        if ($script:AutoMaskErrTail -and @($script:AutoMaskErrTail).Count -gt 0) {
+            $why += "；最后输出：" + ((@($script:AutoMaskErrTail) | ForEach-Object { "$_".Trim() }) -join ' | ')
+        }
+        $script:AutoMaskNote = $why
+        # CUDA 原生崩溃时子进程**连 JSON 都没打**（PowerShell 抓不到栈）——实测复现：同一张图、
+        # 同样命令，cuda 下进程直接消失，`--device cpu` 下 100% 成功且结果逐像素一致（覆盖 13.01%）。
+        # 所以这里自动用 CPU 重试一次，而不是把「没有输出」甩给用户去猜（截图里那次就是这个坑）。
+        if (-not $ForceCpu) {
+            Write-Host "  [抠图] $why" -ForegroundColor Yellow
+            Write-Host "  [抠图] 自动改用 CPU 重试一次（GPU 侧的检测模型崩了；CPU 结果一致，只是慢些）…" -ForegroundColor Cyan
+            return (New-AutoMaskFromImage -ImagePath $ImagePath -Target $Target -OutPath $OutPath `
+                    -Dilate $Dilate -Feather $Feather -HelperPath $HelperPath -ForceCpu)
+        }
+        return ''
+    }
     $json = $null
     try { $json = $out | ConvertFrom-Json } catch {
         # 双保险：万一是「UTF-8 被按 GBK 读」造成的乱码，用已有的修复函数救一次
@@ -1092,21 +1245,21 @@ function Show-ParamForm {
     $script:injectedStyleNeg = ""
     $cboStyle.Add_SelectedIndexChanged({
         if ($script:injectedStylePos -and $txtPos.Text.Contains($script:injectedStylePos)) {
-            $txtPos.Text = Remove-StyleWords -Text $txtPos.Text -Words $script:injectedStylePos
+            $txtPos.Text = Add-TrailingComma (Remove-StyleWords -Text $txtPos.Text -Words $script:injectedStylePos)
         }
         if ($script:injectedStyleNeg -and $txtNeg.Text.Contains($script:injectedStyleNeg)) {
-            $txtNeg.Text = Remove-StyleWords -Text $txtNeg.Text -Words $script:injectedStyleNeg
+            $txtNeg.Text = Add-TrailingComma (Remove-StyleWords -Text $txtNeg.Text -Words $script:injectedStyleNeg)
         }
         $st = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
         $script:injectedStylePos = ""
         $script:injectedStyleNeg = ""
         if ($st.Pos) {
             $script:injectedStylePos = $st.Pos
-            $txtPos.Text = Add-StyleWords -Text $txtPos.Text -Words $st.Pos
+            $txtPos.Text = Add-TrailingComma (Add-StyleWords -Text $txtPos.Text -Words $st.Pos)
         }
         if ($st.Neg) {
             $script:injectedStyleNeg = $st.Neg
-            $txtNeg.Text = Add-StyleWords -Text $txtNeg.Text -Words $st.Neg
+            $txtNeg.Text = Add-TrailingComma (Add-StyleWords -Text $txtNeg.Text -Words $st.Neg)
         }
     })
 
@@ -1175,11 +1328,11 @@ function Show-ParamForm {
         $st0 = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
         if ($st0.Pos) {
             $script:injectedStylePos = $st0.Pos
-            $txtPos.Text = Add-StyleWords -Text $txtPos.Text -Words $st0.Pos
+            $txtPos.Text = Add-TrailingComma (Add-StyleWords -Text $txtPos.Text -Words $st0.Pos)
         }
         if ($st0.Neg) {
             $script:injectedStyleNeg = $st0.Neg
-            $txtNeg.Text = Add-StyleWords -Text $txtNeg.Text -Words $st0.Neg
+            $txtNeg.Text = Add-TrailingComma (Add-StyleWords -Text $txtNeg.Text -Words $st0.Neg)
         }
     } catch { }
 
@@ -1221,8 +1374,9 @@ function Show-ParamForm {
     if ($denMatch.Success) { $null = [double]::TryParse($denMatch.Value, [ref]$den) }
     if ($den -lt 0) { $den = 0 } elseif ($den -gt 0.95) { $den = 0.95 }
     return @{
-        Pos     = $txtPos.Text.Trim()
-        Neg     = $txtNeg.Text.Trim()
+        # 确认时也兜一次后缀逗号（用户要求）：两个框最后一定是 "…," —— 框里显示什么、后面用什么。
+        Pos     = (Add-TrailingComma $txtPos.Text).TrimEnd()
+        Neg     = (Add-TrailingComma $txtNeg.Text).TrimEnd()
         Rounds  = $rounds
         Denoise = $den
         Ratio   = [string]$cboRatio.SelectedItem
@@ -1301,42 +1455,115 @@ function Get-VlmCandidates {
 }
 
 function Test-FaceQuality {
-    # 返回 0-100 整数分（解析失败返回 -1）。问句刻意只聊脸部与手部结构，不给模型任何「画面内容」的发挥空间。
-    # 用户要求（2026-10-15）：手部细节也纳入质检——手指数量/多指/少指/粘连/畸形，与脸部一起综合打分。
+    # 返回 0-100 整数分（解析失败返回 -1）。问句刻意只聊**人物肢体结构**（脸/手/四肢），
+    # 不给模型任何「画面内容」的发挥空间。
+    # 2026-10-15 用户要求：手部细节纳入质检；同日晚再扩到**整条肢体**——手臂/腿是否各两条、
+    # 左右对称、多肢少肢、关节反向错位、四肢畸形粘连、躯干与四肢比例失衡，与脸部一起综合打分。
     # 超时 180s：VLM 冷启动要把模型加载进显存，首问可能远慢于热状态（实测 8B 首问 >120s）。
     param([string]$ImagePath)
     try {
         $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ImagePath))
     } catch { return -1 }
-    $userContent = @"
-这张图里的人物脸部与手部结构健康吗？只检查两点：
-① 脸部：眼睛是否对称/无多余、五官是否扭曲错位、脸部是否畸形融化；
-② 手部：每只手是否五根手指齐全、有无多余或缺失的手指、手指是否扭曲粘连、手部是否畸形。
-脸部或手部任一处崩坏都要相应扣分。只回复一个 0-100 的整数分（100=完全健康，0=严重崩坏），除此之外一个字符都不要输出。
-"@
-    $body = @{
-        model = $VlmModel
-        messages = @(
-            @{ role = "user"; content = @(
-                @{ type = "text"; text = $userContent },
-                @{ type = "image_url"; image_url = @{ url = "data:image/png;base64,$b64" } }
-            ) }
-        )
-        temperature = 0.1
-        stream = $false
-    }
+    # 送审前**先降分辨率**（2026-10-16：实测 832x1216 原图在 8G 卡上、SD 常驻时 180s 都跑不完 →
+    # 每次质检都返回 -1，用户看到的就是「视觉审核一致失效」）。判「结构是否崩坏」不需要原分辨率，
+    # 长边压到 768 后像素数只有原来的 ~40%，CPU 也能在几十秒内出分。
     try {
-        $headers = @{ "Content-Type" = "application/json; charset=utf-8" }
-        if ($QwenApiKey) { $headers["Authorization"] = "Bearer $QwenApiKey" }
-        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 8))
-        $resp = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post -Headers $headers -Body $bodyBytes -TimeoutSec 180
-    } catch { return -1 }
-    $raw = Repair-Utf8Mojibake ([string]$resp.choices[0].message.content)
-    $m = [regex]::Match($raw, '\d{1,3}')
-    if (-not $m.Success) { return -1 }
-    $score = 0
-    if (-not [int]::TryParse($m.Value, [ref]$score)) { return -1 }
-    if ($score -lt 0 -or $score -gt 100) { return -1 }
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $srcImg = [System.Drawing.Image]::FromFile($ImagePath)
+        $maxSide = [Math]::Max($srcImg.Width, $srcImg.Height)
+        if ($maxSide -gt $VlmImageMaxSide) {
+            $k = [double]$VlmImageMaxSide / $maxSide
+            $nw = [int][Math]::Max(16, [Math]::Round($srcImg.Width * $k))
+            $nh = [int][Math]::Max(16, [Math]::Round($srcImg.Height * $k))
+            $bmp2 = New-Object System.Drawing.Bitmap($nw, $nh)
+            $g2 = [System.Drawing.Graphics]::FromImage($bmp2)
+            $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g2.DrawImage($srcImg, 0, 0, $nw, $nh)
+            $g2.Dispose(); $srcImg.Dispose()
+            $ms = New-Object System.IO.MemoryStream
+            $bmp2.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp2.Dispose()
+            $b64 = [Convert]::ToBase64String($ms.ToArray())
+            $ms.Dispose()
+        } else { $srcImg.Dispose() }
+    } catch { }
+    # 只给判据 + 「直接给分」，不要让模型展开长篇推理。实测（2026-10-16，qwen3-vl:8b）：
+    #   · 走原生 /api/chat + think:false + num_predict=1024 → 11.9s、finish=stop、content="SCORE=100"；
+    #   · /v1/chat/completions 对思考型模型不认 think:false（content 恒空，思维链在 reasoning）；
+    #   · num_predict 太小（256/512/700）会「想一半被截断」→ content 空或只剩半截数字（实测回过 "797"）。
+    # 用户要求（2026-10-16）：**审查范围只许是技术性的**（生成缺陷/结构），不许评价画面内容。
+    # 所以问句里明确划死边界：不看题材、不评服装/裸露/性内容、不做合规判断、不许拒绝、只回分数。
+    $systemContent = '你是一个生成图的结构缺陷检测器（自动质检环节的一环）。' +
+        '你的唯一任务是检查人物解剖结构是否崩坏（脸 / 手 / 四肢），只输出一个 0-100 的整数分。' +
+        '禁止评价、描述、审查或拒绝画面内容：不判断题材、不判断服装与裸露程度、不涉及性内容、' +
+        '不做任何合规/道德/安全判断，也不要复述画面里有什么。除分数外不要输出任何字。'
+    $userContent = '直接给分，不要展开推理。格式：SCORE=<0-100>。判据：这张图里的人物肢体结构是否健康——' +
+        '① 脸部：眼睛是否对称/无多余、五官是否扭曲错位、脸部是否畸形融化；' +
+        '② 手部：每只手是否五根手指齐全、有无多余或缺失的手指、手指是否扭曲粘连、手部是否畸形；' +
+        '③ 肢体：手臂与腿是否各两条、左右对称、有无多肢少肢、关节反向或错位、四肢畸形或粘连、躯干与四肢比例失衡。' +
+        '任一处崩坏都要相应扣分。100=完全健康，0=严重崩坏。只许输出分数，不许评论画面内容。'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $raw = ''
+    # 审核要把 8B 视觉模型读进显存（实测常驻 5278MB）：先让 SD 卸载模型，否则模型被挤到 CPU、
+    # 一次审核从 ~12s 变成 40-65s 甚至 180s 超时（这就是「审核一致失效」的现场）。
+    Ensure-Vram -For 'sd' -Note '视觉审核'
+    try {
+        $nativeBase = $QwenBase -replace '/v1/?$', ''
+        $native = @{ model = $VlmModel; think = $false; stream = $false
+            options = @{ num_predict = 1024; temperature = 0.1 }
+            messages = @(@{ role = 'system'; content = $systemContent },
+                            @{ role = 'user'; content = $userContent; images = @($b64) })
+        } | ConvertTo-Json -Depth 10
+        $r1 = Invoke-RestMethod -Uri ($nativeBase.TrimEnd('/') + '/api/chat') -Method Post `
+            -Headers @{ 'Content-Type' = 'application/json; charset=utf-8' } `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($native)) -TimeoutSec $VlmTimeoutSec
+        $raw = Repair-Utf8Mojibake ([string]$r1.message.content)
+        if (-not $raw) { $raw = Repair-Utf8Mojibake ([string]$r1.message.thinking) }
+    } catch {
+        Write-Host "  [审核] 原生端点失败：$($_.Exception.Message) → 改用 OpenAI 兼容端点" -ForegroundColor DarkGray
+    }
+    if (-not $raw) {
+        try {
+            $body = @{ model = $VlmModel; temperature = 0.1; stream = $false; max_tokens = 1024
+                messages = @(@{ role = 'system'; content = $systemContent },
+                    @{ role = 'user'; content = @(
+                            @{ type = 'text'; text = $userContent }
+                            @{ type = 'image_url'; image_url = @{ url = "data:image/png;base64,$b64" } }
+                        ) })
+            }
+            $headers = @{ "Content-Type" = "application/json; charset=utf-8" }
+            if ($QwenApiKey) { $headers["Authorization"] = "Bearer $QwenApiKey" }
+            $r2 = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post -Headers $headers `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 8))) -TimeoutSec $VlmTimeoutSec
+            $raw = Repair-Utf8Mojibake ([string]$r2.choices[0].message.content)
+            if (-not $raw) { $raw = Repair-Utf8Mojibake ([string]$r2.choices[0].message.reasoning) }
+        } catch {
+            $sw.Stop()
+            Write-Host "  [审核] 模型 $VlmModel 两个端点都没答上来（已用 $([math]::Round($sw.Elapsed.TotalSeconds,0))s）→ 本轮不打分" -ForegroundColor Yellow
+            return -1
+        }
+    }
+    $sw.Stop()
+    if (-not $raw) {
+        Write-Host "  [审核] $VlmModel 只吐了思考、没给分数（已用 $([math]::Round($sw.Elapsed.TotalSeconds,0))s）→ 本轮不打分" -ForegroundColor Yellow
+        return -1
+    }    $raw = ("$raw").Trim()
+    # 解析必须皮实：实测同一个模型会回 "SCORE=100"、只回 "813"、或只回一段思考。
+    # 规则：① 先认显式 SCORE=<n>；② 否则取**第一个 0-100 的整数**（813 这种跳过，别当 813 分）。
+    $score = -1
+    $mScore = [regex]::Match($raw, 'SCORE\s*[=:：]\s*(\d{1,3})')
+    if ($mScore.Success) { $null = [int]::TryParse($mScore.Groups[1].Value, [ref]$score) }
+    if ($score -lt 0 -or $score -gt 100) {
+        $score = -1
+        foreach ($mm in [regex]::Matches($raw, '\d{1,3}')) {
+            $v = 0
+            if ([int]::TryParse($mm.Value, [ref]$v) -and $v -ge 0 -and $v -le 100) { $score = $v; break }
+        }
+    }
+    if ($score -lt 0) {
+        Write-Host "  [审核] $VlmModel 没给出可用的 0-100 分数（已用 $([math]::Round($sw.Elapsed.TotalSeconds,0))s，回答：$(("" + $raw).Substring(0,[Math]::Min(70,("" + $raw).Length)))）" -ForegroundColor Yellow
+        return -1
+    }
     return $score
 }
 
@@ -1347,16 +1574,25 @@ function Invoke-BaseIterate {
     # 2026-10-15 修：质检不可用**不再直接 return $null**——那样图生图（Denoising > 0）会因为
     # 「没有素体成品」被静默降级成文生图（用户实测：C 档根本用不了图生图）。现在照样出一张底图。
     $vlmOk = $true
-    if (-not (Test-VlmApi)) {
-        Write-Host "本地视觉模型不可用（$QwenBase）→ 素体只出一张底图、不跑脸/手质检迭代（图生图底图照常可用）" -ForegroundColor Yellow
+    if ($NoVlmReview) {
+        # 插件设置 vlmReview=false（或命令里带 -NoVlmReview）：整条视觉审核不跑 —— 不探活、不冷启动、
+        # 不加载模型、不打分；照常出满 N 张并弹多选让你自己挑。
+        Write-Host "视觉模型审核已关闭（-NoVlmReview / 插件设置 vlmReview=false）→ 不跑质检，按迭代次数出满 N 张由你自己挑" -ForegroundColor Yellow
+        $vlmOk = $false
+    } elseif (-not (Test-VlmApi)) { $null = Start-OllamaService -TimeoutSec $VlmStartTimeout }   # 冷启动：先试着把本地视觉模型服务拉起来
+    if (-not $vlmOk) {
+        # 已明确关闭：不再打印「不可用」，直接走无质检路径
+    } elseif (-not (Test-VlmApi)) {
+        Write-Host "本地视觉模型不可用（$QwenBase）→ 素体只出一张底图、不跑肢体质检迭代（图生图底图照常可用）" -ForegroundColor Yellow
         $vlmOk = $false
     } elseif (-not $VlmModel -or ((Get-VlmCandidates) -notcontains $VlmModel)) {
-        $vlm = Get-VlmCandidates | Where-Object { $_ -match 'vl|vision' } | Select-Object -First 1
+        $vlm = Get-VlmCandidates | Where-Object { $_ -match 'vl|vision|llava|moondream|minicpm-v|internvl' } | Select-Object -First 1
         if (-not $vlm) {
-            Write-Host "本机没有视觉模型（vl/vision）→ 素体只出一张底图、不跑脸/手质检迭代；想质检请先：ollama pull qwen3-vl:8b" -ForegroundColor Yellow
+            Write-Host "本机没有视觉模型（vl/vision）→ 素体只出一张底图、不跑肢体质检迭代；想审核请先：ollama pull qwen3-vl:8b" -ForegroundColor Yellow
             $vlmOk = $false
         } elseif ($vlm -ne $VlmModel) {
-            Write-Host "质检模型已回退到 '$vlm'（要固定用 '$VlmModel' 先执行：ollama pull $VlmModel）" -ForegroundColor Yellow
+            Write-Host "本机没有『$VlmModel』（枚举到：$((Get-VlmCandidates | Select-Object -First 5) -join ' / ')）" -ForegroundColor Yellow
+            Write-Host "质检模型已回退到 '$vlm'；要固定用『$VlmModel』：先 ollama pull $VlmModel（本地自制模型用 ollama create $VlmModel -f Modelfile）" -ForegroundColor Yellow
             $script:VlmModel = $vlm
         }
     }
@@ -1654,6 +1890,145 @@ function Find-Ollama {
     return ''
 }
 
+# 剩余显存（GB）：8G 卡上 SD 常驻时留给视觉模型的余地很小；取不到返回 -1（不阻断）。
+function Get-FreeVramGb {
+    try {
+        $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+        if (-not $smi) { return -1 }
+        $line = & $smi.Source --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+        if (-not $line) { return -1 }
+        return [Math]::Round(([double]("$line".Trim()) / 1024.0), 2)
+    } catch { return -1 }
+}
+
+# ---- 显存释放（用户要求 2026-10-16：每次运行前先释放显存）----
+# 这台 8G 卡上三方抢显存是反复踩坑的根源：
+#   · SD(A1111) 常驻 ~2.5-5G；· 抠图要 YOLO-World+SAM 约 2-3G；· 视觉审核 8B 模型 ~5.3G（实测 /api/ps 5278MB）。
+# 于是：抠图/SAM 会 CUDA OOM（进程被原生崩掉）、审核模型被挤到 CPU（一次 40-65s 甚至 180s 超时）。
+# 所以每个"要显存"的步骤开跑前先按需释放对面那一边：
+#   要为「抠图/审核」腾地方 → 让 A1111 卸载 checkpoint（POST /sdapi/v1/unload-checkpoint，出图时它会自动重载）；
+#   要为「SD 出图」腾地方 → 让 Ollama 卸载常驻模型（POST /api/generate {keep_alive:0}）。
+# 只在剩余显存低于阈值时才动手，避免无谓的重载开销。
+function Release-SdVram {
+    $done = @()
+    foreach ($ep in @('sdapi/v1/unload-checkpoint', 'sdapi/v1/free')) {
+        try {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/$ep" -Method Post -TimeoutSec 20
+            $done += $ep
+        } catch { }
+    }
+    if ($done.Count -gt 0) { Write-Host "  [显存] 已让 SD 卸载模型：$($done -join ' / ')（下次出图会自动重载）" -ForegroundColor DarkGray }
+    return ($done.Count -gt 0)
+}
+
+function Release-OllamaVram {
+    $base = $QwenBase -replace '/v1/?$', ''
+    $base = $base.TrimEnd('/')
+    $loaded = @()
+    try {
+        $ps = Invoke-RestMethod -Uri "$base/api/ps" -Method Get -TimeoutSec 8
+        if ($ps -and $ps.models) { $loaded = @($ps.models | ForEach-Object { [string]$_.name }) }
+    } catch { return $false }
+    $freed = 0
+    foreach ($m in $loaded) {
+        try {
+            $null = Invoke-RestMethod -Uri "$base/api/generate" -Method Post `
+                -Headers @{ 'Content-Type' = 'application/json; charset=utf-8' } `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes((@{ model = $m; keep_alive = 0 } | ConvertTo-Json -Depth 4))) -TimeoutSec 20
+            $freed++
+        } catch { }
+    }
+    if ($freed -gt 0) { Write-Host "  [显存] 已让本地模型服务卸载 $freed 个常驻模型（下次调用会自动重载）" -ForegroundColor DarkGray }
+    return ($freed -gt 0)
+}
+
+# 开跑前确保有足够剩余显存：不够就释放指定的一侧（默认双侧都试）。
+function Ensure-Vram {
+    param([string]$For = 'any', [double]$NeedGb = 0, [string]$Note = "")
+    if ($NoVramRelease) { return }
+    if ($NeedGb -le 0) { $NeedGb = $VramMinFreeGb }
+    $free = Get-FreeVramGb
+    if ($free -lt 0) { return }                       # 拿不到显存信息（没 nvidia-smi）→ 不折腾
+    if ($free -ge $NeedGb) {
+        Write-Host ("  [显存] 开跑前检查：剩余 {0}G（需要 {1}G）→ 够用，不释放" -f $free, $NeedGb) -ForegroundColor DarkGray
+        return
+    }
+    Write-Host ("  [显存] 开跑前检查：剩余 {0}G < 需要 {1}G → 先释放{2}{3}" -f $free, $NeedGb, $(if ($For -eq 'any') { '（SD / 本地模型）' } elseif ($For -eq 'sd') { ' SD 模型' } else { ' 本地模型服务' }), $(if ($Note) { "（$Note）" } else { '' })) -ForegroundColor Yellow
+    if ($For -eq 'sd' -or $For -eq 'any') { $null = Release-SdVram }
+    if ($For -eq 'ollama' -or $For -eq 'any') { $null = Release-OllamaVram }
+    Start-Sleep -Milliseconds 800
+    $after = Get-FreeVramGb
+    if ($after -ge 0) { Write-Host ("  [显存] 释放后剩余 {0}G" -f $after) -ForegroundColor DarkGray }
+}
+
+# 本地视觉模型冷启动（用户要求 2026-10-15）：Ollama 没起过就**替你拉起来**，和 SD 预热同一套路。
+# 为什么要它：脸/手质检与「画风=一致」的参考图识别都靠这个模型；以前 Ollama 没开就直接降级
+# （素体只出一张、最终出图变成「出满 N 张让你自己挑一个」），用户看到的就是「插件没质检 / 判不出画风」。
+# 注意：只拉起 `ollama serve`（不预加载模型）；首次推理仍要 1-3 分钟把模型读进显存，
+# 所以质检请求本身留 180s 超时（见 Test-FaceQuality）。
+function Start-OllamaService {
+    param([int]$TimeoutSec = 60)
+    if (Test-VlmApi) { return $true }
+    if ($NoVlmStart) {
+        Write-Host "本地视觉模型没在跑；已指定 -NoVlmStart → 不自动冷启动（质检/画风识别本次降级）" -ForegroundColor Yellow
+        return $false
+    }
+    if ($script:OllamaStartTried) { return (Test-VlmApi) }   # 一次进程只拉一次，别反复起
+    $script:OllamaStartTried = $true
+    $exe = Find-Ollama
+    if (-not $exe) {
+        Write-Host "没找到 ollama.exe（本地视觉模型服务）→ 本次跳过质检与画风识别；装好 Ollama 后会自动冷启动" -ForegroundColor Yellow
+        return $false
+    }
+    Write-Host "本地视觉模型没在跑 → 正在冷启动：$exe serve" -ForegroundColor Cyan
+    try {
+        $null = Start-Process -FilePath $exe -ArgumentList 'serve' -WindowStyle Hidden -PassThru
+    } catch {
+        Write-Host "拉起 Ollama 失败：$($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+    $deadline = (Get-Date).AddSeconds([Math]::Max(5, $TimeoutSec))
+    $i = 0
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 800
+        if (Test-VlmApi) {
+            Write-Host "  本地视觉模型服务已就绪（首次质检要把模型读进显存，可能 1-3 分钟）" -ForegroundColor Green
+            return $true
+        }
+        if ($i % 5 -eq 0) { Write-Host "  等待 ollama serve 起来…（最多 $TimeoutSec 秒）" -ForegroundColor DarkGray }
+        $i++
+    }
+    Write-Host "Ollama 在 $TimeoutSec 秒内没起来 → 本次质检/画风识别降级（不阻断出图）" -ForegroundColor Yellow
+    return $false
+}
+
+# ---- 本次跑出来的「中间图」记账（用户要求：C 档脚本跑完，产物目录只留成品）----
+# 预蒙版（premask-*.png / _overlay.png）是**表单要用的**，必须活到出图结束才能删；
+# 命中率总览图默认写进迭代临时目录（随目录一起清），-KeepWorkFiles 时才落到产物目录。
+$script:RunWorkFiles = New-Object System.Collections.Generic.List[string]
+function Add-RunWorkFile {
+    param([string]$Path)
+    if ($Path) { $script:RunWorkFiles.Add($Path) | Out-Null }
+    return $Path
+}
+function Remove-RunWorkFiles {
+    param([string[]]$KeepPaths = @())
+    if ($KeepWorkFiles) {
+        if ($script:RunWorkFiles.Count -gt 0) {
+            Write-Host "本次中间图（-KeepWorkFiles 保留）：" -ForegroundColor DarkGray
+            foreach ($p in $script:RunWorkFiles) { Write-Host "  $p" -ForegroundColor DarkGray }
+        }
+        return
+    }
+    $gone = 0
+    foreach ($p in $script:RunWorkFiles) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        if ($KeepPaths -contains $p) { continue }
+        try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop; $gone++; Write-Host "  已清理中间图: $(Split-Path $p -Leaf)" -ForegroundColor DarkGray } catch { }
+    }
+    if ($gone -gt 0) { Write-Host "已清理本次中间图 $gone 个（产物目录只留成品；要留着排查请加 -KeepWorkFiles）" -ForegroundColor DarkGray }
+}
+
 
 # ---- 0) 出图参数表单先弹（脚本一启动就弹，不等素体迭代）：正向/负向提示词 + 迭代次数 / Denoising / 比例 / 画风 / 画质 / LoRA / 模型 ----
 # 表单放最前面：用户先填参数 → 再跑素体迭代与最终出图，避免「屏幕静止几分钟像卡死」。
@@ -1680,6 +2055,19 @@ if (-not (Test-SdApiReady)) {
             Write-Host "SD 已就绪，正在拉取 LoRA / 模型列表..." -ForegroundColor Cyan
         }
     }
+}
+
+# 0a-2) 本地视觉模型（Ollama）也在这里冷启动（用户要求 2026-10-15）：表单确认后马上要拿它质检
+#       （脸/手打分）与识别参考图画风；等到「素体迭代」阶段才发现它没起，就只能降级成
+#       「出满 N 张让你自己挑」，用户看到的就是「插件没质检」。
+#       只拉 serve，不预加载模型；模型读进显存仍要 1-3 分钟（质检请求侧有 180s 超时兜着）。
+if (-not (Test-VlmApi)) { $null = Start-OllamaService -TimeoutSec $VlmStartTimeout }
+
+# 显存提醒（8G 卡实测：SD 常驻时视觉模型装不进显存）：说清「这次质检为什么慢」，
+# 免得用户以为卡死；质检请求本身有 180s 超时兜着。
+$freeVram = Get-FreeVramGb
+if ($freeVram -ge 0 -and $freeVram -lt 3.0) {
+    Write-Host "显存提醒：只剩 $freeVram GB —— 本地视觉模型（$VlmModel）会被 Ollama 放到 CPU / 部分卸载，质检会明显变慢（首次加载可能 1-3 分钟）" -ForegroundColor Yellow
 }
 
 # 迭代次数默认 3（用户指定；质检不稳定时降到 3 轮快速验证，多选时出 3 张让用户选）
@@ -1732,10 +2120,23 @@ if ($Mode -eq '图生图' -and $preInitPath) {
         if ($made) {
             $preMaskText = $made
             $lockMask = $true
+            # 记账（跑完删掉）：预蒙版与它的叠加预览在产物目录里都算「中间图」，不是成品
+            $null = Add-RunWorkFile $maskOut
+            $null = Add-RunWorkFile (Join-Path (Split-Path $maskOut -Parent) (([IO.Path]::GetFileNameWithoutExtension($maskOut)) + '_overlay.png'))
             Write-Host "对话侧：蒙版已生成并锁定 → $made" -ForegroundColor Cyan
             Write-Host "         $($script:AutoMaskNote)" -ForegroundColor DarkGray
         } else {
-            Write-Host "对话侧：蒙版没画出来（$($script:AutoMaskNote)）→ 表单蒙版栏保持可编辑，请你填 box:/路径/区域名" -ForegroundColor Yellow
+            # 自动抠图没成功：**别把表单留空**再让用户自己填（截图里那句「保持可编辑，请你填 box:/路径/区域名」
+            # 实测就是「用户不知道填什么」）。按替换目标预填一个几何区域名，用户点确定就能出图，仍可改。
+            $fallbackSpec = '下半（衣服）'
+            switch ("$tgt") {
+                '脸'   { $fallbackSpec = '上半（脸）' }
+                '背景' { $fallbackSpec = '四周（背景）' }
+                '主体' { $fallbackSpec = '中间（主体）' }
+            }
+            $preMaskText = $fallbackSpec
+            Write-Host "对话侧：自动抠图没成功（$($script:AutoMaskNote)）" -ForegroundColor Yellow
+            Write-Host "         → 已预填几何区域蒙版「$fallbackSpec」（按画面比例画，比抠图糙，可在表单里改）" -ForegroundColor Yellow
         }
     }
 }
@@ -1764,8 +2165,18 @@ if ($positive -and ($positive -notmatch $framingWords)) {
 
 # ---- 0b) 素体自检迭代（表单确认后再跑）：只跑基底，换 seed + 面部修复迭代到脸部过关 ----
 # 追加为空时迭代产物就是最终图；有追加/参数变化时用 winning seed/图锚定最终出图，保住过关的脸。
+# 2026-10-16 用户要求「素体不需要额外生成了」：**有参考图（图生图/蒙版重绘）时不再先生成素体** ——
+# 参考图本身就是底图，再跑一遍素体只会多出一张 inject_00N.png 并白烧时间/显存
+# （实测那轮产物目录里就多了一张 inject_001.png）。文生图（没有参考图）仍按原逻辑跑素体迭代。
 $baseWin = $null
-if (-not $NoIterate) {
+$skipBaseIterate = $false
+if ($NoIterate) { $skipBaseIterate = $true }
+elseif ($preInitPath -or ($Mode -eq '图生图' -and $InitImage)) {
+    $skipBaseIterate = $true
+    Write-Host "已有参考图 → 跳过素体自检迭代（不再额外生成素体底图，直接用参考图出图）" -ForegroundColor Cyan
+}
+if (-not $skipBaseIterate) {
+    $null = Release-OllamaVram      # 素体出图也要 SD 掌卡：先卸掉本地模型（用户要求：每次运行前先释放显存）
     $baseWin = Invoke-BaseIterate
     if ($baseWin) {
         Write-Host "素体迭代完成：$($baseWin.Path)（seed=$($baseWin.Seed)，脸/手 $($baseWin.Score)/100）" -ForegroundColor Green
@@ -2060,12 +2471,16 @@ if ($mode -eq '文生图') {
             if ($autoTarget -eq '衣服') { $autoPathUsedForClothes = $true }
             Write-Host "自动蒙版就绪：$($script:AutoMaskNote)" -ForegroundColor Cyan
         } else {
-            Write-Host "自动蒙版没成功：$($script:AutoMaskNote)" -ForegroundColor Red
-            Write-Host "      不会退回整图重绘（那会把背景/姿势一起换掉，等于废掉这张参考图）。请改用：" -ForegroundColor Yellow
-            Write-Host "      ① 蒙版填精确框 box:x,y,w,h（0-1 归一化）或 boxpx:x,y,w,h（像素）；② 直接填一张蒙版图路径；" -ForegroundColor Yellow
-            Write-Host "      ③ 或把蒙版改成一个区域名（上半（脸）/下半（衣服）/中间（主体）/四周（背景））。" -ForegroundColor Yellow
-            Remove-IterTempDir
-            exit 1
+            # 自动抠图失败：**不再 exit 1**（用户拿到的是「什么都没出」）。改用几何区域蒙版继续出图 ——
+            # 仍然兑现「不做整图重绘」的承诺：区域蒙版只重绘画面里那一块，画风/背景照样保留。
+            Write-Host "自动蒙版没成功：$($script:AutoMaskNote)" -ForegroundColor Yellow
+            switch ($autoTarget) {
+                '脸'   { $maskSpec = '上半（脸）' }
+                '背景' { $maskSpec = '四周（背景）' }
+                '主体' { $maskSpec = '中间（主体）' }
+                default { $maskSpec = '下半（衣服）' }
+            }
+            Write-Host "      → 已改用几何区域蒙版「$maskSpec」（按画面比例画，比抠图糙；也可以在表单里填 box:x,y,w,h 或蒙版图路径）" -ForegroundColor Yellow
         }
     }
     if (-not $finalMask -and -not $maskSpec -and $replaceTarget) {
@@ -2084,9 +2499,18 @@ if ($mode -eq '文生图') {
             if (Test-Path -LiteralPath $mp) { $finalMask = $mp } else { Write-Host "蒙版图不存在：$maskSpec → 改为按区域生成" -ForegroundColor Yellow }
         }
         if (-not $finalMask) {
+            # 先把尺寸定成「参考图的最终出图尺寸」再画蒙版：boxpx 才是参考图像素，
+            # 区域名也不用再被缩放一次（用户反馈「蒙版位置有问题」的一个来源）。
+            $refOut = Get-RefOutputSize -Path $refPath
+            if ($refOut.W -ge 64 -and $refOut.H -ge 64) { $size = @{ W = $refOut.W; H = $refOut.H } }
             $maskOut = Join-Path $script:IterTempDir 'region-mask.png'
             $finalMask = New-RegionMask -Spec $maskSpec -W $size.W -H $size.H -OutPath $maskOut
-            if (-not $finalMask) { Write-Host "蒙版区域认不出（$maskSpec）→ 退回整图重绘" -ForegroundColor Yellow }
+            if ($finalMask) {
+                Write-Host "区域蒙版已生成：$maskSpec（$($size.W)x$($size.H)）" -ForegroundColor DarkGray
+            } else {
+                # 认不出的区域名 → 落到 C-1a（图生图·一致 + denoising 收敛），**不是**把整张图重画一遍
+                Write-Host "蒙版区域认不出（$maskSpec）→ 改走图生图·一致（收敛 denoising，不做整图重绘）" -ForegroundColor Yellow
+            }
         }
     }
 
@@ -2101,20 +2525,12 @@ if ($mode -eq '文生图') {
         if ($autoPathUsedForClothes -and $finalDenoise -gt 0.62) {
             Write-Host "衣服重绘：denoising $finalDenoise 偏大（会把姿势/身体一起重画）→ 收敛到 0.6；要大改请手动填 0.7+ 或在提示词里写清" -ForegroundColor Yellow
             $finalDenoise = 0.6
-        }        $inpaintFill = 0                                       # 填充模式（实测 fill=2 潜空间噪声会在蒙版区留噪点）
-        # 出图尺寸 = 参考图原生尺寸（对齐到 8 的倍数）；蒙版**按这个尺寸**生成，两者必须一致，
-        # 否则 A1111 缩放蒙版时区域会错位（用户反馈的「蒙版位置有问题」）。
-        $refSize = Get-ImageSizePx -Path $refPath
-        $w2 = [int]([Math]::Floor($refSize.W / 8) * 8)
-        $h2 = [int]([Math]::Floor($refSize.H / 8) * 8)
-        $mx = [Math]::Max($w2, $h2)
-        if ($mx -gt 1536) {
-            $k = 1536.0 / $mx
-            $w2 = [int]([Math]::Floor(($refSize.W * $k) / 8) * 8)
-            $h2 = [int]([Math]::Floor(($refSize.H * $k) / 8) * 8)
         }
-        if ($w2 -ge 64 -and $h2 -ge 64) { $size = @{ W = $w2; H = $h2 } }
-        # 蒙版与出图尺寸对齐：用户给的蒙版图尺寸不符时按最近邻缩放（保证区域位置不漂）
+        $inpaintFill = 0                                       # 填充模式（实测 fill=2 潜空间噪声会在蒙版区留噪点）
+        # 出图尺寸 = 参考图原生尺寸（对齐到 8 的倍数、长边 ≤1536）；区域蒙版已在上面按**同一尺寸**画好，
+        # 这里只有「用户自带蒙版图」才可能尺寸不符 → 按最近邻缩放对齐，保证区域位置不漂。
+        $refOut = Get-RefOutputSize -Path $refPath
+        if ($refOut.W -ge 64 -and $refOut.H -ge 64) { $size = @{ W = $refOut.W; H = $refOut.H } }
         try {
             Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
             $mb = [System.Drawing.Bitmap]::FromFile($finalMask)
@@ -2143,20 +2559,14 @@ if ($mode -eq '文生图') {
             $finalDenoise = 0.65
         }
         # 尺寸跟着**参考图走**（原来用表单比例/画质，会把 1024x1024 压成 480x853 → 构图和原图对不上）
-        $refSize = Get-ImageSizePx -Path $finalInit
-        $w2 = [int]([Math]::Floor($refSize.W / 8) * 8)
-        $h2 = [int]([Math]::Floor($refSize.H / 8) * 8)
-        $mx = [Math]::Max($w2, $h2)
-        if ($mx -gt 1536) {
-            $k = 1536.0 / $mx
-            $w2 = [int]([Math]::Floor(($refSize.W * $k) / 8) * 8)
-            $h2 = [int]([Math]::Floor(($refSize.H * $k) / 8) * 8)
-        }
-        if ($w2 -ge 64 -and $h2 -ge 64) { $size = @{ W = $w2; H = $h2 } }
-        Write-Host "[决策 C-1a] 图生图：底图=$finalInit（原图 $($refSize.W)x$($refSize.H)），denoising=$finalDenoise，出图尺寸=$($size.W)x$($size.H)" -ForegroundColor Cyan
+        $refOut = Get-RefOutputSize -Path $finalInit
+        if ($refOut.W -ge 64 -and $refOut.H -ge 64) { $size = @{ W = $refOut.W; H = $refOut.H } }
+        Write-Host "[决策 C-1a] 图生图：底图=$finalInit（原图 $($refOut.SrcW)x$($refOut.SrcH)），denoising=$finalDenoise，出图尺寸=$($size.W)x$($size.H)" -ForegroundColor Cyan
     }
 }
 Write-Host "最终出图：$branchTag" -ForegroundColor Cyan
+# 出图要 SD 把模型读回显存：先把本地模型服务卸掉，别跟 SD 抢卡（用户要求：每次运行前先释放显存）
+$null = Release-OllamaVram
 $finalWin = Invoke-FinalIterate -InitImage $finalInit -Denoising $finalDenoise -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint -Mask $finalMask -InpaintFill $inpaintFill
 
 
@@ -2191,14 +2601,24 @@ if ($finalWin) {
         } else {
             Write-Host "仅生成 1 张，已保留。" -ForegroundColor DarkGray
         }
+        Remove-RunWorkFiles -KeepPaths @($saved)
     } else {
         # 正常模式：复制最高分那张
         $finalPath = Get-UniqueOutPath -BaseName $finalBaseName
         Copy-Item -LiteralPath $finalWin.Path -Destination $finalPath -Force
+        # 蒙版重绘的产物自动体检一次（在临时目录被清掉之前跑，蒙版就在那里面）
+        if ($finalMask -and $finalInit) {
+            Write-Host ""
+            Write-Host "蒙版命中率体检（换中性提示词时，未蒙版残留就是漏检）：" -ForegroundColor Cyan
+            Invoke-MaskQaReport -RefPath $finalInit -MaskPath $finalMask -OutPath $finalPath -QaDir $script:IterTempDir
+        }
         Remove-IterTempDir
         Write-Host ""
         Write-Host "最终成品: $finalPath（seed=$($finalWin.Seed)$(if ($finalWin.Score -ge 0) { "，脸/手 $($finalWin.Score)/100" })）" -ForegroundColor Green
         Write-Host "（迭代中间图已存于临时目录并清理，工作区只保留成品）" -ForegroundColor DarkGray
+        Remove-RunWorkFiles -KeepPaths @($finalPath)
+        # 收工：把本地视觉模型也卸掉，别让它长期占着显卡（下次审核会自动重载）
+        $null = Release-OllamaVram
         if (-not $NoOpen) {
             try {
                 Start-Process -FilePath $finalPath
@@ -2210,6 +2630,7 @@ if ($finalWin) {
     }
 } else {
     Remove-IterTempDir
+    Remove-RunWorkFiles
     Write-Host "最终出图未产出（迭代全部失败）" -ForegroundColor Red
     exit 1
 }

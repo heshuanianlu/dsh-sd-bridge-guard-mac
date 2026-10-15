@@ -98,6 +98,33 @@ const DEFAULTS = {
   /** 追加给 launch.py 的额外命令行参数（高级项） */
   extraArgs: [],
   /**
+   * C 档（sd-inject.ps1）是否允许自动冷启动本地视觉模型（Ollama）。
+   * true（默认）= 质检前探活失败就替你 `ollama serve`；false = 生成命令时追加 `-NoVlmStart`，
+   * 视觉模型没起就照旧降级（跳过质检 → 出满 N 张让你自己挑），绝不拉起本机模型服务。
+   */
+  vlmAutoStart: true,
+  /**
+   * C 档是否允许**自动抠图**（YOLO-World + SAM 现算蒙版）。
+   * true（默认）= 换衣服/换脸/换背景时按参考图内容自动抠出蒙版；
+   * false = 生成命令时追加 `-NoAutoMask`：完全不加载检测模型（不启动那条 python 链路），
+   *         改用几何区域蒙版（上半/下半/中间/四周，按画面比例画）或你在表单里手填的 box/蒙版图。
+   * 适合「抠图脚本在这台机器上老崩 / 不想让脚本去动 GPU」的场景。
+   */
+  maskAutoSegment: true,
+  /**
+   * C 档是否启用**视觉模型审核**（本地视觉模型给每轮候选图的**人物肢体**打分，取最高分那张）。
+   * true（默认）= 探活/冷启动 + 逐轮质检；false = 生成命令追加 `-NoVlmReview`：
+   * 不探活、不冷启动、不加载模型、不打分（连参考图画风识别也不调模型），
+   * 直接按迭代次数出满 N 张弹多选让你自己挑。
+   */
+  vlmReview: true,
+  /**
+   * 视觉审核用的模型名（默认 `qwen3-vl:8b` = **能识图**的本地视觉模型）；留空 = 自动挑本机第一个 vl/vision 模型。
+   * 注意：`itsailor/qwen3.6-fable` 那类量化创作模型**看不了图**（模型卡写明 vision 不可用、图片被静默忽略），
+   * 不能用来做审核；审核只做技术性检查（人物肢体结构），不评价画面内容。
+   */
+  vlmModel: 'qwen3-vl:8b',
+  /**
    * 生图产物目录：绝对路径原样使用，相对路径解析到**会话工作区**。
    * 默认 `SD-Picture` = 每台机器的工作区下自建 SD-Picture 目录，文件名 = 提示词总结_序号.png。
    */
@@ -2356,6 +2383,14 @@ const injectTool = {
     if (String(args.mask ?? '').trim()) parts.push('-MaskSpec', psQuote(String(args.mask).trim()))
     if (Number.isFinite(Number(args.cfg))) parts.push('-Cfg', String(Number(args.cfg)))
     if (String(args.sampler ?? '').trim()) parts.push('-Sampler', psQuote(String(args.sampler).trim()))
+    // 插件设置 vlmAutoStart=false：明确告诉脚本「别自动拉起本地视觉模型」（服务没起就跳过质检，
+    // 不偷偷在你机器上起 ollama）。要用回冷启动把设置改回 true，或在命令里删掉这个开关。
+    if (cfg.vlmAutoStart === false) parts.push('-NoVlmStart')
+    // 插件设置 maskAutoSegment=false：不加载检测模型，改用几何区域蒙版（上半/下半/中间/四周）。
+    if (cfg.maskAutoSegment === false) parts.push('-NoAutoMask')
+    // 视觉审核（人物肢体打分）：模型名从插件页来；关掉审核时明确告诉脚本别探活/别冷启动。
+    if (String(cfg.vlmModel ?? '').trim()) parts.push('-VlmModel', psQuote(String(cfg.vlmModel).trim()))
+    if (cfg.vlmReview === false) parts.push('-NoVlmReview')
     const command = parts.join(' ')
 
     // run=true：插件直接拉起脚本（独立 PowerShell 窗口，表单在用户桌面弹出，插件立即返回不等待）。
@@ -2749,6 +2784,22 @@ async function tryLoadConfigSchema() {
         .array(z.string())
         .default(DEFAULTS.extraArgs)
         .description('追加给 launch.py 的额外命令行参数（高级项，每项一个字符串）。'),
+      vlmAutoStart: z
+        .boolean()
+        .default(DEFAULTS.vlmAutoStart)
+        .description('C 档是否允许自动冷启动本地视觉模型（Ollama）：true = 没起就替你 ollama serve；false = 生成命令追加 -NoVlmStart，服务没起就跳过质检（不拉起本机模型服务）。'),
+      maskAutoSegment: z
+        .boolean()
+        .default(DEFAULTS.maskAutoSegment)
+        .description('C 档是否允许自动抠图（YOLO-World + SAM 现算蒙版）：true = 按参考图内容自动抠；false = 生成命令追加 -NoAutoMask，改用几何区域蒙版（上半/下半/中间/四周），完全不加载检测模型。'),
+      vlmReview: z
+        .boolean()
+        .default(DEFAULTS.vlmReview)
+        .description('C 档是否启用视觉模型审核（本地模型给候选图的「人物肢体」打分、取最高分那张）：true = 质检 + 冷启动；false = 生成命令追加 -NoVlmReview，不探活/不冷启动/不加载模型/不打分，出满 N 张由你自己挑。'),
+      vlmModel: z
+        .string()
+        .default(DEFAULTS.vlmModel)
+        .description('视觉审核用的模型名（默认 qwen3-vl:8b，能识图的本地视觉模型；随命令传给 -VlmModel）；留空 = 自动挑本机第一个 vl/vision 模型。审核只做技术性检查（人物肢体结构），不评价画面内容。'),
       outputDir: z
         .string()
         .default(DEFAULTS.outputDir)

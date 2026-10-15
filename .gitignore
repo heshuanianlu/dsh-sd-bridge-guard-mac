@@ -11,3 +11,6 @@ tmp/
 # 系统杂物
 .DS_Store
 Thumbs.db
+
+# 误落的 PowerShell 模块分析缓存（某次子进程把 HOME 指到了仓库里）
+Microsoft/

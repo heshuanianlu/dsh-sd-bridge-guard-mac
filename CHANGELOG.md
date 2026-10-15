@@ -1,5 +1,442 @@
 # Changelog
 
+## 1.0.0（首个正式版 · 2026-10-16）
+
+把 0.9.14 之后这一整轮真机修复收拢成正式版。**C 档（`sd_inject` → `sd-inject.ps1`）从「能出图」变成「可复现、可自查、失败有话说」**：
+
+- **蒙版**：`四周（背景）` 环形路径修复（`$rects` 未初始化导致整条路径静默死掉）；区域蒙版改按最终出图尺寸画；
+  衣服词表补 `sleeves / detached sleeves / hood / cloak / shawl / scarf`，检测框上限 `--max-boxes 3`，肩线守卫 8%→4%；
+  连通块按同件多块合并并打印各块面积。
+- **抠图健壮性**：SAM 显存自适应（≥4.5G cuda 全分辨率 / 3.0-4.5G 降到 640px / <3.0G 直接 CPU）；
+  SAM 崩掉时用检测框兜底（与人物剪影相交、必要时裁到躯干带）；拿到空输出时**自动用 CPU 重试一次**；
+  失败说明带 python 退出码 + stderr 尾巴。
+- **审核（本地视觉模型）**：冷启动 `ollama serve`；审核模型换成**能识图**的 `qwen3-vl:8b`；
+  走原生 `/api/chat` + `think:false` + `num_predict=1024`（原来走 `/v1` 时思考型模型的 `content` 恒为空 → 每次 -1）；
+  送审前把图压到长边 768；**审核范围只限技术性**（system 约束禁止评价/描述/审查画面内容）；
+  解析只认 `SCORE=<n>` 或首个 0-100 整数。
+- **显存**：每个「要显存」的步骤开跑前按需释放对面那一侧（抠图/审核前卸载 SD checkpoint，出图前/收工后卸载本地模型）——
+  实测释放效果 **0.46G → 7.02G（+6.56G）**。
+- **产物目录只留成品**：预蒙版、命中率总览图等中间图跑完自动清理（`-KeepWorkFiles` 可保留）。
+- **蒙版命中率体检**（`sd-mask-qa.py`）：拿「参考图 / 蒙版 / 成品」逐像素判 命中 / 命中未改 / 外溢 / 正确保留，
+  出数字 + 总览图，C-1b 出图后自动跑。
+- **C 档参数表**：两个提示词框末尾始终带逗号（含切画风重写后的兜底）。
+- **有参考图时跳过素体自检迭代**（不再多出一张 `inject_00N.png`）。
+- **插件页开关**：`vlmReview`（是否启用视觉审核）/ `vlmModel`（审核模型，默认能识图的 qwen3-vl:8b）/
+  `vlmAutoStart`（是否自动冷启动本地模型服务）/ `maskAutoSegment`（是否自动抠图）。
+
+**回归基线**：`node smoke-skill.mjs` **18 段全绿**；另有 5 个真跑测试随包发布
+（`test-region-mask.ps1` 13/13、`test-mask-qa.ps1`、`test-vlm-cleanup.ps1` 9/9、
+`test-automask-retry.ps1` 8/8、`test-vram-release.ps1`、`test-trailing-comma.ps1` 10/10）；
+PS 5.1 `parse errors = 0`（UTF-8 BOM 在位）。## 0.9.24（C 档参数表的两个提示词框：末尾始终带逗号）
+
+**需求（用户原话）**：在 c 档参数表中两个提示词框最后加逗号。
+
+**为什么之前会「时有时无」**：预填那一步本来就补了逗号（`$formPositive/$formNegative` → 末尾补 `, `），
+但**切画风会重写两个框**，而 `Add-StyleWords` / `Remove-StyleWords` 的返回值**都不带尾部逗号** ——
+于是打开表单时看到的逗号，切一次画风就消失了。
+
+**修法**：新增 `Add-TrailingComma`（已有逗号则原样，空串原样），并让**所有**写框的地方都过一遍：
+
+- 切画风时移除旧画风词 → `Add-TrailingComma`；
+- 切画风时注入新画风词 → `Add-TrailingComma`；
+- 表单打开时的初始注入（`$st0`）→ `Add-TrailingComma`；
+- 确认取 `Pos` / `Neg`（`$txtPos.Text` / `$txtNeg.Text`）→ 再兜一次（`(Add-TrailingComma …).TrimEnd()`）。
+
+结果：**框里显示什么、后面就用什么**，两个框（正向 / 负向）最终一定以逗号结尾（框内是 `", "`，
+提交值是 `","`）；空框不会被塞进一个逗号。
+
+**验证**（`test-trailing-comma.ps1`，新增，真跑）
+
+```
+ok  plain text gets a comma                 ok  after style inject the box ends with a comma
+ok  existing comma is untouched             ok  after style remove the box still ends with a comma
+ok  comma without space is untouched        ok  negative box ends with a comma too
+ok  empty stays empty                       ok  submitted value ends with a comma (no trailing space)
+TRAILING-COMMA TEST OK                      ← 10/10
+```
+
+**回归**：`node smoke-skill.mjs` 十八段全绿，新增 `TRAILING-COMMA SMOKE OK`（6 条源码断言：函数在、
+四条重写路径都补逗号、确认两处都兜、预填行为未丢）；PS 5.1 `parse errors = 0`；三份脚本 SHA256 一致。
+
+## 0.9.23（每次运行前先释放显存）
+
+**需求（用户原话）**：每次运行前先释放显存。
+
+**为什么这条是刚需（本机实测）**：这张 8G 卡被三方共抢 —— SD(A1111) 常驻 2.5-5G、
+抠图（YOLO-World + SAM）2-3G、8B 视觉模型 **5278MB**（`/api/ps` 实测）。
+两者都常驻时实测**只剩 0.46G** → 抠图 CUDA OOM（python 进程被原生崩掉、只报「没有输出」）、
+审核模型被挤到 CPU（一次 40-65s，慢到撞 180s 超时）。
+**实测释放效果：0.46G → 7.02G（+6.56G）。**
+
+**实现（`sd-inject.ps1`）**
+
+- `Release-SdVram`：`POST /sdapi/v1/unload-checkpoint`（+ `/sdapi/v1/free`）让 A1111 交还显存；
+  出图时 A1111 会**自动重载**，用户无感。
+- `Release-OllamaVram`：`GET /api/ps` 列出常驻模型 → 逐个 `POST /api/generate {keep_alive:0}` 卸掉。
+- `Ensure-Vram -For sd|ollama|any`：**只在剩余显存低于阈值时**才释放（`-VramMinFreeGb`，默认 4.0G），
+  够用就打印「够用，不释放」直接走人，避免无谓的重载开销；拿不到显存信息（无 nvidia-smi）时静默跳过，不阻断出图。
+- 开关 `-NoVramRelease`（完全关掉这套动作）。
+
+**接在四个点上（每个"要显存"的步骤开跑前）**
+
+| 时机 | 动作 | 理由 |
+| --- | --- | --- |
+| 自动抠图前 | 释放 **SD** | YOLO-World + SAM 要 2-3G（之前 OOM 崩掉的现场） |
+| 视觉审核前 | 释放 **SD** | 8B 模型要 5.3G，SD 占着就只能走 CPU → 40-180s |
+| 素体迭代前 | 释放 **Ollama** | 出图要 SD 掌卡 |
+| 最终出图前 | 释放 **Ollama** | 同上 |
+| 收工后 | 释放 **Ollama** | 不让本地模型长期占卡（下次调用自动重载） |
+
+**真机验证**（`test-vram-release.ps1`，新增，真跑 + 量 nvidia-smi）
+
+```
+free VRAM at start     : 4.98 GB
+ok  NoVramRelease frees nothing
+free VRAM after release: 7.08 GB (delta 2.10 GB), ollama loaded=0
+VRAM-RELEASE TEST OK
+```
+
+另一次（两者都常驻时）：`before 0.46G → after 7.02G，delta 6.56G`。
+
+**回归**：`node smoke-skill.mjs` 十七段全绿，新增 `VRAM-RELEASE SMOKE OK`
+（10 条源码断言 + spawn 真跑测试）；PS 5.1 `parse errors = 0`；三份脚本 SHA256 一致。
+
+## 0.9.22（审核模型换成能识图的视觉模型 + 审核范围限制在技术性内容）
+
+**需求（用户原话）**：模型换成能识图的模型，而且要制止他审查图片除了技术性之外的内容。
+
+### ① 模型：默认 `qwen3.6-fable` → `qwen3-vl:8b`（能识图）
+
+- 依据：`itsailor/qwen3.6-fable` 的模型卡原文写着 “**Vision does NOT work in this build.** … images are silently
+  ignored and the model hallucinates a description. **Treat this as a text-only model.**” —— 它看不了图，
+  拿它做审核只会得到胡说（`parable/qwen3-fable` 同理，2.33GB 文本模型）。**审核必须用能识图的模型。**
+- 改动：`sd-inject.ps1` 的 `-VlmModel` 默认值、`sd-bridge.js` 的插件设置 `vlmModel` 默认值都改成 **`qwen3-vl:8b`**；
+  插件页仍可改；「指定模型不在本机」时照旧回退到本机第一个 `vl`/`vision` 模型并提示怎么拉/怎么建。
+- 本机 profile 补丁层已钉死：`vlmModel: qwen3-vl:8b`（配合 `vlmReview: true` / `vlmAutoStart: true`）。
+
+### ② 审核范围：只许技术性，禁止碰画面内容
+
+- **新增 system 约束（两个端点都带）**：
+  > 你是一个生成图的结构缺陷检测器（自动质检环节的一环）。你的唯一任务是检查人物解剖结构是否崩坏（脸 / 手 / 四肢），
+  > 只输出一个 0-100 的整数分。**禁止评价、描述、审查或拒绝画面内容**：不判断题材、不判断服装与裸露程度、
+  > 不涉及性内容、不做任何合规 / 道德 / 安全判断，也不要复述画面里有什么。除分数外不要输出任何字。
+- **用户问句**同步收紧：结尾加「只许输出分数，不许评论画面内容」；判据仍只有三类结构（脸 / 手 / 四肢）。
+- **画风识别**那条（`Get-ImageStyleByVlm`）也加了「只判断画风（技术属性），不评价画面内容、不描述画面里有什么」。
+- **解析只认数字**（结构性防线，模型多嘴也进不了打分逻辑）：先认 `SCORE=<n>`；否则取**第一个 0-100 的整数**
+  （813 这类跳过）；空白回答先 `Trim()` 再判空（PowerShell 里空白串是真值）。
+- 这样做的好处：审核输出的**唯一产物就是一个分数**，不会在日志/界面里留下任何对画面内容的评价或合规判断。
+
+### 真机验证
+
+```
+review score = 100   (>=75 过关)   elapsed=40.7s     ← VLM-REVIEW TEST OK
+```
+
+**回归**：`node smoke-skill.mjs` 全绿（新增断言：默认模型必须是 qwen3-vl:8b、system 约束必须存在、
+问句必须含「不许评论画面内容」、画风问句必须含「不评价画面内容」、解析必须是「首个 0-100 整数」）。
+PS 5.1 `parse errors = 0`；包内/工作区/release 三份脚本 SHA256 一致。
+
+## 0.9.21（素体不再额外生成 / 蒙版补部件 / 视觉审核失效的真因与修法）
+
+**需求（用户原话）**：1 重新调试蒙版，同上，忽略裸体内容；2 qwen3.6-fable 在 ollama 里面模糊搜索，素体不需要额外生成了；3 视觉审核一致失效。
+
+### ① 视觉审核「一致失效」——真机复现 + 三层修（最高优先）
+
+真机复现（本机 qwen3-vl:8b 在册、Ollama 已就绪，对 832×1216 的成品送审）：
+
+```
+review score = -1   （= 模型没回答）   elapsed = 180.1s   ← 正好撞满 180s 超时
+```
+
+**根因**：送审的是**原分辨率**大图，8G 卡上 SD 常驻时 8B 视觉模型只能走 CPU / 部分卸载 →
+一次推理跑不完 180 秒 → 每次都返回 `-1`。旧代码把 `-1` 静默当成「质检没工作」，
+于是每一轮都不打分 → 用户看到的就是「视觉审核一致失效」。
+
+修法（`Test-FaceQuality`）：
+
+1. **送审前降分辨率**：长边压到 `-VlmImageMaxSide`（默认 768）再 base64 —— 像素数只剩约 40%，
+   判「结构是否崩坏」够用，CPU 上也能在几十秒内出分。
+2. **改走原生端点并关思考**：`/v1/chat/completions` 对思考型模型**不认 `think:false`** —— `content` 恒为空、
+   思维链全在 `reasoning` 字段里。改成首选 `POST /api/chat`（`think:false` + `options.num_predict = 1024`）：
+   实测 **11.9s、finish=stop、content="SCORE=100"**。num_predict 给太小（256/512/700）会「想一半被截断」，
+   content 空或只剩半截数字（实测回过 "797"）；给到 1024 才收得住。
+3. **解析与判空都修**：① 先认显式 `SCORE=<n>`，再退化为「第一个 0-100 的整数」（813 这种跳过）；
+   ② 空白回答在 PowerShell 里是**真值**，`-not $raw` 判空失效 → 先 `Trim()`；
+   ③ 超时可配 `-VlmTimeoutSec`（默认 300，原来写死 180）；拿不到分数会打印**模型原话 + 耗时**。
+   真机最终结果：`review score = 100  (>=75 pass)  elapsed=65.2s` → **VLM-REVIEW TEST OK**。
+
+### ② qwen3.6-fable 到底是哪个模型（模糊搜索结果）
+
+- **它是社区模型，不是官方库模型**：`ollama pull qwen3.6-fable` 会 404，正确名字是
+  **[`itsailor/qwen3.6-fable`](https://ollama.com/itsailor/qwen3.6-fable)**（22GB，256K 上下文；另有 `:27b-mlx`）。
+  同名的另一个是 [`parable/qwen3-fable`](https://ollama.com/parable/qwen3-fable)（2.33GB）。
+- ⚠️ **它做不了看图审核**：itsailor 那份的**模型卡原文**写着
+  “**Vision does NOT work in this build.** … images are silently ignored and the model hallucinates a description.
+  **Treat this as a text-only model.**” —— 它是 Qwen3.6-27B 的 NVFP4(MLX) 量化版、uncensored 创作/角色扮演模型，
+  22GB 也不是 8G 卡能常驻的。
+- 所以：**审核继续用本机现成的视觉模型**（`qwen3-vl:8b`）；`vlmModel` 想写 `qwen3.6-fable` 也可以，
+  但脚本发现它不在本机时会回退到第一个 `vl`/`vision` 模型并打印「枚举到哪些 + 怎么拉/怎么建」。
+
+### ③ 素体不再额外生成（用户明确要求）
+
+- 现象：那轮产物目录里多出一张 `inject_001.png` —— 那是**素体自检迭代**先生成的素体底图。
+- 修：**有参考图时（对话给了 `-InitImage`，或表单选「图生图」）直接跳过素体自检迭代** ——
+  参考图本身就是底图，再跑一遍只会多一张图 + 白烧时间/显存；日志会打印
+  「已有参考图 → 跳过素体自检迭代」。文生图（没有参考图）仍然照旧跑素体迭代。
+
+### ④ 蒙版重新调试（按上一轮同样的极端用例：把衣服蒙版重绘掉，看残留）
+
+真机测量（同一张参考图 + 同一套参数，步骤逐项可核对）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 检测词命中 | `dress / detached sleeves / kimono`（**袖套这次框到了** —— 词表已补 `sleeves`/`detached sleeves`/`hood`/`cloak`/`shawl`/`scarf`） |
+| 检测框上限 | 写死的 2 → `--max-boxes`（默认 3）：多件套不再只收两个词 |
+| 多件合一 | 5 件 → 并集覆盖 7.5% |
+| 行内桥接 | 7.6% → 9.4% |
+| 去脸区 | 9.4% → 9.1% |
+| 连通块 | 保留 1/7 块（各块面积已写进 notes：9.11%, 0.01%, 0.00%… —— 其余 6 块是蝶/花碎块） |
+| 薄纱补全 | 11.8% → 13.0%（最终覆盖 13.01%，与分辨率无关，稳定可复现） |
+| 肩线守卫 | 8% → **4%**（实测 8% 会把「肩线附近」的袖套/披风整块丢掉；头发从人物上沿就开始，4% 仍挡得住） |
+| 上一轮输出（007/008/009）命中率体检 | 蒙版内已改 **83.5% / 88.0% / 87.8%**，疑似漏衣料只剩 **0.80-0.84%**（上一轮是 2.32%） |
+
+**仍要如实说的**：参考图里那条**兜帽/披风长布**不是连衣裙部件，检测器给它的词框不到 →
+需要它一起重绘时请把蒙版填成 `box:` 或直接给蒙版图（或把目标改成「主体」）。
+蒙版本身没有漏检问题（外溢 0.03% 那一轮已证明边界是干净的）。
+
+**回归**：`node smoke-skill.mjs` 十四段全绿，新增 `BASE-SKIP+MASK-V2 SMOKE OK`（素体跳过条件、
+衣服词表补部件、`--max-boxes`、肩线 4%、连通块面积日志）。PS 5.1 `parse errors = 0`。
+
+## 0.9.20（插件页开关「视觉模型审核是否启动」+ 模型换 qwen3.6-fable + 审核人物肢体）
+
+**需求（用户原话）**：在插件页加个开关吧，视觉模型审核是否启动可以自己选，模型换成 qwen3.6-fable，审查人物肢体。
+
+1. **插件页开关 `vlmReview`（默认 `true`）** —— 视觉模型审核是否启动。
+   设 `false` → `sd_inject` 生成的命令追加 **`-NoVlmReview`**：
+   **不探活、不冷启动、不加载模型、不打分**（连「画风=一致」的参考图识别也不调模型，见 `Get-ImageStyleByVlm` 的提前返回），
+   直接按迭代次数出满 N 张弹多选让你自己挑。日志会明确打印「视觉模型审核已关闭（-NoVlmReview / 插件设置 vlmReview=false）」。
+2. **模型默认换成 `qwen3.6-fable`**（`sd-inject.ps1` 的 `-VlmModel` 默认值 + 插件设置 `vlmModel`，会写成 `-VlmModel "<模型名>"`）。
+   ⚠️ 如实说明两点：
+   - 本机现有模型是 `qwen3-vl:8b` / `qwen3.5:latest` / `qwen2.5-coder:7b` / `qwen2.5-abliterate:14b`，**没有 `qwen3.6-fable`**；
+   - Ollama 官方库里也查不到这个名字（`https://registry.ollama.ai/v2/library/qwen3.6-fable/manifests/latest` → **HTTP 404**），
+     所以 `ollama pull qwen3.6-fable` 会失败；要真用它得 `ollama create qwen3.6-fable -f Modelfile` 自建/导入，
+     或者把插件页 `vlmModel` 改成已有模型（例如 `qwen3-vl:8b`）。
+   - 脚本侧已做的兜底：指定模型不在本机时打印「本机枚举到哪些 + ollama pull / ollama create 两条路」，
+     然后回退到本机第一个 `vl`/`vision` 模型继续出图（不阻断）。
+3. **审核范围扩到整条人物肢体**（问句从「脸 + 手」扩到三类）：
+   ① 脸部（对称/无多余/五官错位/畸形融化）② 手部（五指齐全/多指少指/扭曲粘连）
+   ③ **肢体（手臂与腿是否各两条、左右对称、多肢少肢、关节反向错位、四肢畸形粘连、躯干与四肢比例失衡）**。
+   `-FaceBoostTags` 与出图参数不受影响（审核只打分，不改提示词）。
+
+**验证**：`node smoke-skill.mjs` 十三段全绿——新增 `VLM-REVIEW-SWITCH SMOKE OK`
+（源码断言：`-NoVlmReview` 开关、默认模型 `qwen3.6-fable`、问句三类齐全、`ollama create` 提示、
+关掉审核后画风识别提前返回；运行断言：`vlmReview=false` → 命令带 `-NoVlmReview`；
+`vlmModel='my-vl:7b'` → 命令带 `-VlmModel "my-vl:7b"`；默认命令带 `-VlmModel "qwen3.6-fable"` 且不带 `-NoVlmReview`）。
+文档同步：README（模型表/问句/降级表/参数表/插件设置表）、`docs/models-loras.md` 第 4 节（视觉审核 + 自建/回退说明）。
+
+## 0.9.19（插件页开关「是否启动」你自己选 + 修掉「抠图脚本没有输出」）
+
+**需求（用户原话 + 截图）**：截图里对话侧走到「按参考图内容抠『衣服』蒙版」这一步失败，
+日志最后一句是「对话侧：蒙版没画出来（抠图脚本没有输出）→ 表单蒙版栏保持可编辑，请你填 box:/路径/区域名」；
+用户要求：在插件页加个开关，是否启动可以自己选。
+
+**① 插件页新增开关 `maskAutoSegment`（默认 `true`）**
+
+- `sd-bridge.js` 新增配置项：C 档是否允许**自动抠图**（YOLO-World + SAM 现算蒙版）。
+  设为 `false` 时 `sd_inject` 生成的命令追加 **`-NoAutoMask`**：整条抠图不跑（**不加载检测模型、
+  不启动那条 python 链路**），改用几何区域蒙版（上半/下半/中间/四周）或表单里手填的 `box:` / 蒙版图。
+- 与 v0.9.18 的 `vlmAutoStart` 并列，两个开关都在插件设置页上（配置 schema 注册，改完重启 dsh 生效）。
+
+**② 「抠图脚本没有输出」的真根因（本机复现并已修）**
+
+真机复现（同一条命令、同一张参考图）：
+
+| 尝试 | 结果 |
+| --- | --- |
+| `--device auto`（当时剩余显存 6.9G → 走 cuda） | **进程原生崩掉**：stderr 停在 `YOLO-World 文字提示检测中…`，stdout **一行 JSON 都没有** → PowerShell 只能报「抠图脚本没有输出」 |
+| `--device cpu` | **`ok:true`，覆盖 13.01%**（与之前 cuda 成功那轮的结果一致） |
+
+也就是说：**崩的不是 SAM，是检测模型（YOLO-World）那一侧的 CUDA**，而且崩得没有栈、没有退出码可读。
+
+修法（三层）：
+
+1. **失败说明不再是一句话**：`AutoMaskNote` 现在带 **python 退出码**（并对 `0xC0000005` 这类异常退出直接点明
+   「多半是显存不足/CUDA 崩溃」）+ **stderr 最后 6 行**。
+2. **自动用 CPU 重试一次**：`New-AutoMaskFromImage` 拿到空输出时自动带 `--device cpu` 重跑，
+   并把「自动改用 CPU 重试一次」打印给用户（实测 CPU 结果与 GPU 逐像素一致，只是慢些）。
+3. **抠图失败不再 `exit 1`**：以前引用 `不会退回整图重绘…请改用 ① ② ③` 后直接退出，用户拿到的是「什么都没出」；
+   现在按替换目标预填几何区域蒙版（下半（衣服）/ 上半（脸）/ 四周（背景）/ 中间（主体））继续出图，
+   既不做整图重绘，也不让表单空着。对话侧预生成蒙版那条路径同样改成预填区域名。
+
+**③ 顺带**：`sd-auto-mask.py` 新增 `--device auto|cuda|cpu`（默认 auto：按剩余显存决定，不够就整条走 CPU），
+所有 ultralytics `predict` 调用都吃这个设备；并去掉 Windows 上不受支持的
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments`（PyTorch 会为它打一条 UserWarning，解决不了这里的崩溃）。
+
+**回归**：`node smoke-skill.mjs` 十一段全绿——新增 `MASK-AUTOSEGMENT-SWITCH SMOKE OK`
+（断言默认命令不带 `-NoAutoMask`、`maskAutoSegment=false` 时必须带上且结构不破坏），
+并新增 8 条源码断言（`-NoAutoMask` / `--device cpu` 重试 / 退出码说明 / 预填区域名 / 不再 exit 1）。
+
+## 0.9.18（本地视觉模型关掉：插件侧开关 vlmAutoStart）
+
+**需求（用户原话）**：本地视觉模型关掉。
+
+**做了两件事**
+
+1. **立刻停掉**：`Get-Process ollama | Stop-Process -Force` → 探活确认 `http://127.0.0.1:11434/v1/models`
+   已不可达。冷启动这条链路本身保留（v0.9.17 刚加的），只是这次不拉。
+2. **给「关掉」一个可持久化的开关**（否则下次 C 档一跑又会自动起）：
+   - `sd-bridge.js` 新增插件设置 **`vlmAutoStart`**（默认 `true`）。设为 `false` 时，`sd_inject`
+     生成的命令会在末尾追加 **`-NoVlmStart`**：服务没起就跳过质检（出满 N 张让你自己挑），
+     **绝不偷偷拉起本机模型服务**。
+   - 本机已直接把 profile 补丁层写成关：
+     `C:\Users\zhang\.dsh\profiles\desktop\cordis.patch.yml`
+     ```yaml
+     - id: sd-bridge
+       disabled: false
+       config:
+         vlmAutoStart: false
+     ```
+     （补丁层是**启动时**读的，所以这条要**重启 dsh** 才在会话里生效；要恢复冷启动把 `false` 改回 `true`
+     或删掉这段 `config`。）
+   - 也可以在单条命令上临时覆盖：命令里带 `-NoVlmStart` 即关，带不带开关都不影响出图。
+
+**回归**：`node smoke-skill.mjs` 十段全绿，新增 `VLM-AUTOSTART-SWITCH SMOKE OK`——
+断言「默认命令**不带** `-NoVlmStart`」与「`vlmAutoStart=false` 时命令**必须以 `-NoVlmStart` 结尾**
+且结构不被破坏」。PS 5.1 `parse errors = 0`；包内/工作区/release 三份脚本 SHA256 一致。
+
+## 0.9.17（本地视觉模型加入冷启动 + C 档跑完只留成品）
+
+**需求（用户原话）**：本地视觉模型加入冷启动，然后在 c 档脚本完成后删除产生的额外图片。
+
+**① 本地视觉模型（Ollama）冷启动**
+
+- 问题：脸/手质检与「画风=一致」的参考图识别都靠本机 Ollama 上的 `qwen3-vl:8b`。以前它没起就直接降级——
+  打印「本地视觉模型不可用」→ 素体只出一张、最终出图变成**「出满 N 张让你自己挑」**。用户看到的就是「插件没质检」。
+  README 里那套 `-NoQwenStart` / `-QwenStartTimeout`（翻译链路）**早已整体移除**（回归断言在守着），
+  所以解析侧一直没有任何自动拉起本地模型的逻辑。
+- 修：新增 `Start-OllamaService`（`sd-inject.ps1`）——探活失败就 `Find-Ollama` 找 `ollama.exe` →
+  `Start-Process -WindowStyle Hidden ollama serve` → 轮询到就绪（默认 60s，`-VlmStartTimeout` 可调），
+  失败只降级不阻断。开关 `-NoVlmStart`（不自动拉起）。**接在三处**：
+  1. SD 预热之后、弹表单之前（表单确认后马上要质检，别等素体迭代才发现没起）；
+  2. 素体质检前置（`Invoke-BaseIterate` 的 `$vlmOk` 判定）；
+  3. `Get-ImageStyleByVlm`（画风=一致 的参考图识别）。
+- 另加 `Get-FreeVramGb` 显存提醒：8G 卡上 SD 常驻时，8B 视觉模型装不进显存（会走 CPU / 部分卸载），
+  这时明确打印「这次质检会明显变慢」，而不是让用户以为卡死（质检请求本身 180s 超时兜着）。
+- **真机验证（本机 Ollama 当时是停的）**：`Test-VlmApi` 先为 False → 冷启动 → **7.9 秒就绪** →
+  枚举到 `qwen3-vl:8b | huihui_ai/qwen2.5-abliterate:14b | qwen2.5-coder:7b | qwen3.5:latest`，
+  目标视觉模型 `qwen3-vl:8b` 在机内。也就是说这条链路以前是「静默降级」，现在会真的跑起来。
+
+**② C 档跑完只留成品（中间图自动清理）**
+
+- 以前产物目录会堆**中间图**：对话侧预生成的蒙版 `premask-<hash>-<target>.png` 与它的叠加预览
+  `..._overlay.png` 落在产物目录里；命中率总览图也会落在那。用户要的是「跑完只剩成品」。
+- 修：新增 `Add-RunWorkFile` / `Remove-RunWorkFiles` 记账式清理。
+  - 预蒙版仍**必须先留在产物目录**（表单要把它填进「蒙版」栏并用它出图），所以是**跑完再删**；
+  - 命中率总览图改为写进迭代临时目录（随目录一起清），`-KeepWorkFiles` 时才复制到产物目录；
+  - 成品保存 / 质检降级多选 / 最终失败（退出前）三条路径都会清一遍；`-KeepWorkFiles` 则保留并列出路径备查；
+  - 清理时逐个打印「已清理中间图: xxx」，不做静默删除。
+- 真机验证：`test-vlm-cleanup.ps1`（新增，真跑）——合成「成品 + 预蒙版 + 预蒙版叠加图 + 命中率总览图」，
+  断言默认只留成品、`-KeepWorkFiles` 全留并列出、`-NoVlmStart` 不 spawn serve、
+  冷启动 spawn 后超时能优雅降级且不抛异常。
+
+**回归**：`node smoke-skill.mjs` 九段全绿（新增 `VLM-COLDSTART+CLEANUP SMOKE OK`，并校验旧回归
+「翻译链路已移除」不被新参数名污染）· `test-region-mask.ps1` 13/13 · `test-mask-qa.ps1` 全绿 ·
+`test-vlm-cleanup.ps1` 9/9 · PS 5.1 `parse errors = 0`（BOM 在位）。
+
+## 0.9.16（抠图不再被显存打挂 + 衣服多块合并 + 新增「蒙版命中率体检」）
+
+**用户场景**：拿「把衣服蒙版重绘成裸体」当极端用例，人工审阅蒙版命中率（残留衣料一眼可见）。结果「生成还是混乱」。
+
+**先说结论（用像素量出来的，不是猜）**：这一轮的蒙版**本身是好的**，混乱不是蒙版漏检造成的。
+
+| 指标（832×1216 那轮） | 数值 | 含义 |
+| --- | --- | --- |
+| 蒙版覆盖 | 13.01% | 罩住裙子本体 |
+| 蒙版内**已改** | 9.48%（占蒙版 **72.9%**） | 蒙版命中了 |
+| 蒙版内未改 | 3.53%（占蒙版 27.1%） | 那块本来就是要留的躯干/肌肤 |
+| **蒙版外被改（外溢）** | **0.03%（占蒙版外 0.02%）** | 边界干净，几乎没有外溢 |
+| 蒙版外保留 | 86.96%（占蒙版外 99.98%） | 画风/背景天然不变 |
+
+也就是说：**乱的那部分全在蒙版内**，是模型对提示词的回答 —— 提示词写的是
+`nude, naked, topless, undressed, no clothes, removing clothes, clothes off, undressing, strip, revealing outfit`，
+于是它老老实实画了「正在脱衣服」：半脱的布料、残留的暗色衣影。
+用「脱衣」提示词去测蒙版有个自带陷阱：**模型会主动画出「半脱的衣服」**，看起来像蒙版漏了，其实那块像素**已经改过**。
+
+**这一轮真正发现并修掉的两个真 bug（都复现过）**：
+
+1. **SAM 抠图被显存打挂 → 整条替换路径拿不到蒙版**。
+   同一个参考图、同一条命令：22:10 抠得出（13.01%），23:16 直接 `RuntimeError: CUDA error: out of memory`
+   （notes 原文：`2.57 GiB free`，ViT-L 需要更多）。旧代码只把异常写进 notes，然后 `ok:false` →
+   PowerShell 侧报「没抠出任何区域」→ **用户看到的就是「蒙版没生效」**，而且**时好时坏**。
+   - 修：`sd-auto-mask.py` 加显存自适应阶梯 —— 剩余 ≥4.5G 才按 `--sam-side` 全分辨率跑 cuda；
+     3.0–4.5G 降到 640px；**<3.0G 直接改走 CPU**（ViT-L 慢但绝不 OOM）。
+   - 再兜底：SAM 万一还是挂，用 YOLO-World 的检测框生成**粗蒙版**（与人物剪影相交、必要时裁到躯干带），
+     `ok:true` 而不是整条失败。
+   - 验证：修后同一条命令重跑 → `ok:true`，coverage 13.01%（31.8s），与 22:10 那轮一致。
+
+2. **衣服蒙版「只留最大连通块」**：同一件衣服被 SAM 拆成多块时，旧逻辑只保留最大的一块，袖子/裙摆那一侧整个丢掉。
+   （实测这张图 7 块里 6 块都小于最大块的 18%，确实是蝴蝶/花点碎块，所以这一条**对这张图不改结果**，
+   但同类图——多件套、披风、围巾——会直接丢掉一块。）
+   - 修：衣服按「≥ 最大块 18% 且总覆盖 ≤32%」保留同件的多块；其他目标维持「只留最大块」。
+
+**新增：蒙版命中率体检（`sd-mask-qa.py`）—— 不再靠「极端提示词 + 肉眼」**
+
+- 输入「参考图 / 本次蒙版 / 本次成品」三方，逐像素判四类：**命中 / 命中未改 / 外溢 / 正确保留**，
+  另附「疑似漏掉衣料」（蒙版外、没变、比局部更暗、贴着蒙版），输出数字 + 一张总览图
+  （绿=蒙版内已改 / 黄=蒙版内未改 / 红=外溢 / 品红=疑似漏掉衣料）。
+- **C-1b 出图后自动跑**：日志里直接给百分比与总览图路径（产品旁边一张 `qa-<成品名>.png`），
+  换中性提示词（如「把衣服换成红色长裙」）时，蒙版外的残留衣料就是漏检 —— 不需要任何极端内容。
+- 新增真跑测试 `test-mask-qa.ps1`：合成一张「已知答案」的三联图（蒙版 24.41%、命中 24.41%、
+  外溢 0.81%、保留 74.77%），断言工具报出的数字与解析解一致；已接入 `smoke-skill.mjs`。
+
+**验证**：`node smoke-skill.mjs` 八段全绿（新增 `MASK-QA SMOKE OK`）· `test-region-mask.ps1` 13/13 ·
+PS 5.1 Parser `parse errors = 0`（BOM 在位）· 真机复跑抠图 `ok:true`。
+
+## 0.9.15（C 档蒙版真跑修复：`四周（背景）`整条路径静默死掉 / 区域蒙版改按最终出图尺寸画 / 补真跑回归）
+
+**症状（用户）**：C 档蒙版功能不完善——选「四周（背景）」或让脚本自动判成换背景时，蒙版起不到作用（拿不到蒙版 → 退到整图重绘那一档，原图等于白给）。
+
+**根因（已用真跑确认，不是猜的）**：`sd-inject.ps1` 的 `New-RegionMask` 里 **`$rects` 从来没初始化**。
+
+- `$rects += @{...}` 从 `$null` 起步，PowerShell 得到的是 **Hashtable**，不是数组；
+- 环形（`四周（背景）` / `边缘`）要连加 4 块矩形，加到第二块就抛
+  `Item has already been added. Key in dictionary: 'Y'`；
+- 这个异常把 `New-RegionMask -Spec '四周（背景）'` 整句打断 → `$finalMask` 为空 →
+  决策树落到 C-1a（提示「蒙版区域认不出 → 退回整图重绘」）→ **用户看到的就是「蒙版没生效、原图被重画」**；
+- 单矩形形状（上半/下半/中间/box）只是**碰巧**还能用：`foreach` 一个 Hashtable 会把它自己当一项，而 `.X` 恰好就是键访问——所以之前的「像素校验」才会全绿，坑一直藏到环形。
+
+**修复（`sd-inject.ps1`）**：
+
+1. `New-RegionMask` 开头补 `$rects = @()` 与 `$shape = ''`，并删掉 `if ($shape -eq 'box') { $rects = $rects }` 这句空操作（那正是忘写初始化的痕迹）。
+2. **区域蒙版改按「参考图的最终出图尺寸」生成**：原先按表单比例/画质尺寸画，然后出图尺寸又被参考图覆写、蒙版再被最近邻缩放一次——`boxpx:x,y,w,h` 会被当成**表单尺寸**的像素（区域整个错位），区域名也要多挨一次缩放。现在抽出 `Get-RefOutputSize`，C-1a / C-1b **共用同一个尺寸**，蒙版在画之前就把尺寸定好；只有「用户自带蒙版图」才走缩放对齐。
+3. 文案不再误导：区域名认不出时打印的是「改走图生图·一致（收敛 denoising）」，不再宣称「退回整图重绘」（实际并没有整图重绘）。
+
+**回归（新增真跑测试，这是本次最该补的一课）**：
+
+- 新文件 `test-region-mask.ps1`：用 **PowerShell AST 从 `sd-inject.ps1` 抽出真函数**（不复制代码，避免两份漂移），对 9 种蒙版写法逐个生成蒙版并**量白像素比例**，另测 `Get-RefOutputSize` 的 8 倍数 / 长边 ≤1536 / 长宽比不失真；任一不符就 `exit 1`。
+- `smoke-skill.mjs` 新增：源码断言（`$rects = @()` 必须存在、环形必须真有 4 块矩形进了 `$rects`、区域蒙版必须按最终出图尺寸生成）+ **spawn 真跑 `test-region-mask.ps1`**。
+  —— 以前这个函数只有源码正则、一行都没真跑过，这就是它能一路发版的原因；现在测试本身会跑出 `REGION-MASK TEST OK`。
+
+**验证（真跑数字，512×768）**：
+
+| 蒙版写法 | 白像素 | 说明 |
+| --- | --- | --- |
+| `box:0.2,0.45,0.6,0.5` | 30.1% | 0.6×0.5=30% ✅ |
+| `boxpx:100,200,400,300` | 30.5% | 400×300/512×768 ✅ |
+| `box:0.2,0.45,0.6,0.5` + 反选 | 69.9% | 补集 ✅ |
+| 下半（衣服） | 30.1% | ✅ |
+| 上半（脸） | 16.1% | ✅ |
+| 中间（主体） | 36.7% | ✅ |
+| **四周（背景）** | **51.3%** | 修复前 **抛异常**；环形面积 1−(328×584)/(512×768)=51.3% ✅ |
+| **四周（背景）反选** | **48.7%** | 修复前 **抛异常**；补集 ✅ |
+| 乱填 | 空 | 认不出 → 返回空（落到 C-1a）✅ |
+
+尺寸推导：1024×1024 → 1024×1024；1200×2000 → 920×1536；2496×3648 → 1048×1536；100×100 → 96×96（8 的倍数、长边 ≤1536、长宽比不漂）。
+
+回归面：`node smoke-skill.mjs` 全绿（含新 `REGION-MASK SMOKE OK`）、`test-install-record.mjs` 全绿、`test-settings.mjs` 全绿、PS 5.1 Parser `parse errors = 0`（UTF-8 BOM 已确认在位）。
+
+**已知与本修复无关**：`test-install-catalog.mjs` 的干跑用例（`install-sd.ps1` 干跑）在本机超过它自己 120 秒的 timeout 被 kill（`status=null`）；手动跑同一命令 >400 秒仍未结束，属于安装器预检慢的环境问题，与蒙版改动无关。
+
 ## 0.9.14（图生图「和原图没关系」三连修：底图必须真正生效 / C-1a 跟参考图尺寸 / 蒙版坐标框）
 
 **症状（用户）**：图生图和原图完全没关系了。
