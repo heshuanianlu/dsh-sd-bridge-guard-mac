@@ -38,11 +38,12 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
       - name: 升级 npm（可信发布需要 npm >= 11.5.1）
-        run: npm install -g npm@latest
+        # 别用 npm@latest：npm 12 要求 node >= 22.22.2，会在 node 20/较早的 22 上 EBADENGINE
+        run: npm install -g npm@11
 
       - name: 不出图的测试（不需要本机 SD）
         run: |
@@ -52,4 +53,8 @@ jobs:
           node test-install-catalog.mjs
 
       - name: 发布到 npm（无需 NODE_AUTH_TOKEN）
+        # setup-node 会把 NODE_AUTH_TOKEN 设成 GITHUB_TOKEN；留着会让 npm 走 token 认证而不是 OIDC，
+        # 所以显式清空——可信发布靠 id-token: write 换临时凭证。
         run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ''
