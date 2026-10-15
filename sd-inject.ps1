@@ -334,6 +334,212 @@ function Remove-StyleWords {
     return $t.Trim()
 }
 
+# ---- 参考图解析（决策 C-1：文生图 / 图生图·一致 / 图生图·替换）----
+# 一致从哪里来？优先级：
+#   ① 参考图自带 A1111 元数据（我们自己出的图）→ 直接拿到它的模型 + 原提示词/负向词，一致性最强；
+#   ② A1111 反推（deepdanbooru / clip）→ 拿到主体标签（用户给的是照片/网图时走这条）；
+#   ③ 本地视觉模型判画风（Ollama 在跑时才有）→ 拿到「二次元/写实/厚涂…」这类画风档位。
+# 三条都不通也不报错：只按用户自己写的提示词出图，并明确打印「一致：未取到」。
+
+# 读 PNG 里的 A1111 元数据（tEXt 关键字 parameters）→ @{ Model; Positive; Negative; Seed; Size }；读不到返回 $null。
+# 注意：PNG 的 chunk 长度是**大端**，用 BitConverter（小端）会读成垃圾长度——这是第一次尝试踩的坑。
+function Get-PngGenParams {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    $b = $null
+    try { $b = [System.IO.File]::ReadAllBytes($Path) } catch { return $null }
+    if ($b.Length -lt 32 -or $b[0] -ne 0x89 -or $b[1] -ne 0x50 -or $b[2] -ne 0x4E -or $b[3] -ne 0x47) { return $null }
+    $pos = 8
+    while ($pos + 8 -le $b.Length) {
+        $len = ([int]$b[$pos] -shl 24) -bor ([int]$b[$pos + 1] -shl 16) -bor ([int]$b[$pos + 2] -shl 8) -bor ([int]$b[$pos + 3])
+        if ($len -lt 0 -or ($pos + 12 + $len) -gt $b.Length) { break }
+        $type = [System.Text.Encoding]::ASCII.GetString($b, $pos + 4, 4)
+        if ($type -eq 'tEXt' -or $type -eq 'iTXt') {
+            $data = [System.Text.Encoding]::UTF8.GetString($b, $pos + 8, $len)
+            if ($data.StartsWith('parameters')) {
+                $txt = $data.Substring(10).TrimStart([char]0, ' ')
+                $res = @{ Model = ''; Positive = ''; Negative = ''; Seed = ''; Size = '' }
+                $m = [regex]::Match($txt, 'Model:\s*([^,\r\n]+)')
+                if ($m.Success) { $res.Model = $m.Groups[1].Value.Trim() }
+                $m = [regex]::Match($txt, 'Seed:\s*(\d+)')
+                if ($m.Success) { $res.Seed = $m.Groups[1].Value }
+                $m = [regex]::Match($txt, 'Size:\s*(\d+x\d+)')
+                if ($m.Success) { $res.Size = $m.Groups[1].Value }
+                $negIdx = $txt.IndexOf('Negative prompt:')
+                if ($negIdx -ge 0) {
+                    $res.Positive = $txt.Substring(0, $negIdx).Trim()
+                    $negRest = $txt.Substring($negIdx + 16)
+                    $stepsIdx = $negRest.IndexOf("`nSteps:")
+                    if ($stepsIdx -lt 0) { $stepsIdx = $negRest.IndexOf('Steps:') }
+                    if ($stepsIdx -ge 0) { $negRest = $negRest.Substring(0, $stepsIdx) }
+                    $res.Negative = $negRest.Trim()
+                } else {
+                    $stepsIdx = $txt.IndexOf("`nSteps:")
+                    if ($stepsIdx -ge 0) { $res.Positive = $txt.Substring(0, $stepsIdx).Trim() } else { $res.Positive = $txt.Trim() }
+                }
+                return $res
+            }
+        }
+        if ($type -eq 'IEND') { break }
+        $pos += 12 + $len
+    }
+    return $null
+}
+
+# A1111 反推提示词标签（deepdanbooru 适合动漫图、clip 适合照片）。$PreferClip = 参考图没有 A1111 元数据时用 clip。
+function Get-ImageTags {
+    param([string]$Path, [bool]$PreferClip = $false)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return '' }
+    $b64 = $null
+    try { $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) } catch { return '' }
+    $order = @('deepdanbooru', 'clip')
+    if ($PreferClip) { $order = @('clip', 'deepdanbooru') }
+    foreach ($model in $order) {
+        try {
+            $body = @{ image = $b64; model = $model } | ConvertTo-Json -Compress
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$SdPort/sdapi/v1/interrogate" -Method Post `
+                -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 90
+            $cap = Repair-Utf8Mojibake ([string]$resp.caption)
+            if ($cap) {
+                Write-Host "参考图反推（$model）：$($cap.Substring(0, [Math]::Min(110, $cap.Length)))…" -ForegroundColor DarkGray
+                return $cap
+            }
+        } catch { }
+    }
+    return ''
+}
+
+# 本地视觉模型判画风（可选）：让 qwen3-vl 从我们的画风清单里挑一个；取不到返回 ''
+function Get-ImageStyleByVlm {
+    param([string]$Path)
+    $styles = "保持画风/二次元/写实二次元/彩色哥特/国风/赛博朋克/写实/厚涂/水彩/像素风"
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    if (-not (Test-VlmApi)) { return '' }
+    $b64 = $null
+    try { $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) } catch { return '' }
+    $ask = "这张图属于下面哪个画风？只能回答其中一个词，不要解释：$styles"
+    try {
+        $body = @{
+            model = $VlmModel
+            messages = @(@{ role = "user"; content = @(
+                @{ type = "text"; text = $ask },
+                @{ type = "image_url"; image_url = @{ url = "data:image/png;base64,$b64" } }
+            ) })
+            temperature = 0.1
+            stream = $false
+        }
+        $resp = Invoke-RestMethod -Uri "$QwenBase/chat/completions" -Method Post `
+            -Headers @{ "Content-Type" = "application/json; charset=utf-8"; "Authorization" = "Bearer $QwenApiKey" } `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes(($body | ConvertTo-Json -Depth 8))) -TimeoutSec 120
+        $raw = Repair-Utf8Mojibake ([string]$resp.choices[0].message.content)
+        foreach ($s in @('写实二次元', '彩色哥特', '赛博朋克', '二次元', '国风', '厚涂', '水彩', '像素风', '写实')) {
+            if ($raw -like "*$s*") { return $s }
+        }
+    } catch { }
+    return ''
+}
+
+# 图片像素尺寸（生成区域蒙版要按原图尺寸画）
+function Get-ImageSizePx {
+    param([string]$Path)
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $img = [System.Drawing.Image]::FromFile($Path)
+        $r = @{ W = [int]$img.Width; H = [int]$img.Height }
+        $img.Dispose()
+        return $r
+    } catch { return @{ W = 512; H = 768 } }
+}
+
+# 区域蒙版生成（白 = 重绘区，黑 = 保留区）。Spec 认不出的形状返回 ''。
+# 支持：上半（脸）/ 下半（衣服）/ 中间 / 四周（背景），后缀「反选」= 取补集。
+function New-RegionMask {
+    param([string]$Spec, [int]$W, [int]$H, [string]$OutPath)
+    $s = "$Spec"
+    if (-not $s) { return '' }
+    $invert = $false
+    if ($s -match '反选|invert') { $invert = $true; $s = ($s -replace '反选', '') -replace 'invert', '' }
+    $shape = ''
+    if ($s -match '上半|脸|face|head') { $shape = 'upper' }
+    elseif ($s -match '下半|衣服|服装|clothes|outfit|body') { $shape = 'lower' }
+    elseif ($s -match '中间|主体|center|centre') { $shape = 'center' }
+    elseif ($s -match '四周|背景|background|bg|边缘') { $shape = 'ring' }
+    if (-not $shape) { return '' }
+
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+    $bmp = New-Object System.Drawing.Bitmap($W, $H)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $black = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Black)
+    $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+    $g.Clear([System.Drawing.Color]::Black)
+    $rects = @()
+    switch ($shape) {
+        # 区域框刻意收窄：铺满整幅会把背景/头发一起重画（实测那样出来的是糊块）
+        'upper'  { $rects += @{ X = [int]($W * 0.25); Y = [int]($H * 0.04); Wd = [int]($W * 0.5); Ht = [int]($H * 0.32) } }
+        'lower'  { $rects += @{ X = [int]($W * 0.2); Y = [int]($H * 0.45); Wd = [int]($W * 0.6); Ht = [int]($H * 0.5) } }
+        'center' { $rects += @{ X = [int]($W * 0.22); Y = [int]($H * 0.18); Wd = [int]($W * 0.56); Ht = [int]($H * 0.66) } }
+        'ring'   {
+            $band = [int]($W * 0.18)
+            $rects += @{ X = 0; Y = 0; Wd = $W; Ht = $band }
+            $rects += @{ X = 0; Y = ($H - $band); Wd = $W; Ht = $band }
+            $rects += @{ X = 0; Y = 0; Wd = $band; Ht = $H }
+            $rects += @{ X = ($W - $band); Y = 0; Wd = $band; Ht = $H }
+        }
+    }
+    if ($invert) {
+        # 取补集：整张涂白，再把上面的形状画黑（比逐像素取反省事且边缘干净）
+        $g.Clear([System.Drawing.Color]::White)
+        foreach ($r in $rects) { $g.FillRectangle($black, $r.X, $r.Y, $r.Wd, $r.Ht) }
+    } else {
+        foreach ($r in $rects) { $g.FillRectangle($white, $r.X, $r.Y, $r.Wd, $r.Ht) }
+    }
+    $g.Dispose(); $black.Dispose(); $white.Dispose()
+    try {
+        $bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+        return $OutPath
+    } catch { $bmp.Dispose(); return '' }
+}
+
+# 从用户写的指令里判断「是不是替换动作」以及「替换的是哪一块」（决定默认蒙版区域）。
+function Get-ReplaceTarget {
+    param([string]$Text)
+    $t = "$Text"
+    if (-not $t) { return '' }
+    $isReplace = ($t -match '换|替换|改成|改为|变成|变为|穿上|脱掉|replace|change|swap|put on|wearing now')
+    if (-not $isReplace) { return '' }
+    if ($t -match '衣服|服装|裙|上衣|衬衫|外套|内衣|泳装|制服|和服|汉服|dress|clothes|clothing|outfit|shirt|skirt|jacket|uniform|swimsuit|lingerie|bra|panties|kimono') { return '衣服' }
+    if ($t -match '背景|场景|环境|background|scene|setting|backdrop') { return '背景' }
+    if ($t -match '脸|五官|面容|表情|发型|头发|face|eyes|expression|hairstyle|bangs') { return '脸' }
+    return '未指定'
+}
+
+# 一致模式：拿参考图的词当基底，剥掉与「替换目标」冲突的旧标签，用户新指令放最前。
+# 目的就是用户要的效果：**换衣服但画风/主体不变**（旧衣服标签若留着会和用户的新指令打架）。
+function Merge-ConsistencyPrompt {
+    param([string]$UserPos, [string]$RefPos, [string]$Target)
+    $conflict = ''
+    switch ("$Target") {
+        '衣服' { $conflict = 'dress|clothes|clothing|outfit|shirt|skirt|jacket|coat|uniform|swimsuit|bikini|lingerie|bra|panties|kimono|hanfu|sleeves|apron|socks|shoes|裙子|衣服|上衣|外套|内衣|泳装|制服|和服|汉服|鞋|袜' }
+        '背景' { $conflict = 'background|sky|cloud|tree|forest|flower|blossom|room|city|street|beach|mountain|window|wall|室内|背景|天空|树|花|房间|城市|街|海|山|窗|墙' }
+        '脸'   { $conflict = 'face|eyes|expression|mouth|bangs|hair style|表情|五官' }
+    }
+    $keep = @()
+    if ($RefPos) {
+        foreach ($tok in ($RefPos -split ',')) {
+            $t = $tok.Trim()
+            if (-not $t) { continue }
+            if ($conflict -and ($t -match $conflict)) { continue }
+            $keep += $t
+        }
+    }
+    $merged = "$UserPos"
+    if ($keep.Count -gt 0) { $merged = (($merged.TrimEnd(',', ' ') + ', ' + ($keep -join ', '))) }
+    if ($conflict) { Write-Host "一致：已剔除参考图里与「$Target」冲突的标签 $($keep.Count) 个保留 / 原 $((($RefPos -split ',').Count)) 个" -ForegroundColor DarkGray }
+    return ($merged -replace '(\s*,\s*)+', ', ').Trim()
+}
+
+# LoRA 片段：<lora:名称:权重>；名称带 .safetensors 后缀时保留原样（SD 两种都认）
 function Format-LoraFragment {
     param([string]$LoraName, [double]$Weight)
     if (-not $LoraName) { return "" }
@@ -396,6 +602,10 @@ function Get-StylePrompt {
             $pos = "cyberpunk, neon lights, rain-slick night city, holographic signs, (high-tech low-life:1.1), volumetric neon fog, reflective wet streets"
             $neg = "daylight, rural, countryside, (flat lighting:1.1)"
         }
+        '一致（自动检测参考图）' {
+            # 决策 C-1a：不注入固定画风词——画风与主体从**参考图**里自动检测（PNG 元数据 → A1111 反推 → VLM），
+            # 由主流程在出图前写进提示词。这里保持空映射是语义，不是漏写。
+        }
         '保持画风' {
             # 明确「不注入任何画风词」：维持底图/LoRA/用户自己的提示词——保持空映射是这个档位的语义，
             # 不是漏写（下方 厚涂/水彩/像素风 同理只补对应风格的词）。
@@ -431,7 +641,7 @@ function Show-ParamForm {
     )
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "sd-inject 出图参数"
-    $form.ClientSize = New-Object System.Drawing.Size(350, 646)
+    $form.ClientSize = New-Object System.Drawing.Size(350, 726)
     $form.FormBorderStyle = 'FixedDialog'
     $form.StartPosition = 'CenterScreen'
     $form.MaximizeBox = $false
@@ -463,7 +673,7 @@ function Show-ParamForm {
     $form.Controls.Add($txtNeg)
 
     # 1-7) 参数行（y 从 240 起，行距 40）
-    $labels = @('迭代次数：', 'Denoising：', '底图：', '比例：', '画风：', '画质：', 'LoRA：', '模型：')
+    $labels = @('模式：', '底图：', '蒙版：', 'Denoising：', '迭代次数：', '比例：', '画风：', '画质：', 'LoRA：', '模型：', '命名：')
     for ($i = 0; $i -lt $labels.Count; $i++) {
         $lb = New-Object System.Windows.Forms.Label
         $lb.Text = $labels[$i]
@@ -471,43 +681,28 @@ function Show-ParamForm {
         $form.Controls.Add($lb)
     }
 
-    # 1) 迭代次数（可编辑下拉：默认 32）
-    $cboRounds = New-Object System.Windows.Forms.ComboBox
-    $cboRounds.DropDownStyle = 'DropDown'
-    foreach ($n in @(1, 2, 3, 4, 5, 8, 12, 16, 24, 32)) { $null = $cboRounds.Items.Add("$n") }
-    $cboRounds.Text = "$DefaultRounds"
-    $cboRounds.SetBounds(120, (240 + 0 * 40), 190, 24)
-    $form.Controls.Add($cboRounds)
+    # 0) 模式（只读下拉：文生图 / 图生图）—— 决策 C-0 / C-1 的总开关
+    $cboMode = New-Object System.Windows.Forms.ComboBox
+    $cboMode.DropDownStyle = 'DropDownList'
+    foreach ($m in @('文生图', '图生图')) { $null = $cboMode.Items.Add($m) }
+    $cboMode.SelectedIndex = 0
+    $cboMode.SetBounds(120, (240 + 0 * 40), 190, 24)
+    $form.Controls.Add($cboMode)
+    $lbModeHint = New-Object System.Windows.Forms.Label
+    $lbModeHint.Text = '（图生图用底图重绘；替换衣服/脸/背景请配合蒙版）'
+    $lbModeHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
+    $lbModeHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbModeHint.SetBounds(120, (240 + 0 * 40 + 24), 220, 16)
+    $form.Controls.Add($lbModeHint)
 
-    # 2) Denoising（**恒可编辑**下拉：默认 0 = 文生图，不用素体底图；>0 = 拿素体 winning 图当底图走图生图）
-    # 坑：表单在素体自检迭代**之前**弹出，那时 $HasBaseImage 恒为 $false；旧代码据此把控件 Enabled=$false，
-    #     结果用户每次看到的都是灰掉的 Denoising（值改不了、手填也没用）——这就是「被错误锁定」的根因。
-    #     现在恒定 Enabled=$true + DropDown（可下拉可手填任意 0-0.95），锁定逻辑整段删除。
-    $cboDenoise = New-Object System.Windows.Forms.ComboBox
-    $cboDenoise.DropDownStyle = 'DropDown'
-    foreach ($v in @('0（文生图·不用底图）', '0.3', '0.4', '0.5', '0.6', '0.7', '0.8', '0.9')) { $null = $cboDenoise.Items.Add($v) }
-    $cboDenoise.Text = '0（文生图·不用底图）'   # 默认 = 现状行为（文生图），改大才走图生图
-    $cboDenoise.SetBounds(120, (240 + 1 * 40), 190, 24)
-    $cboDenoise.Enabled = $true
-    $form.Controls.Add($cboDenoise)
-
-    # 灰字提示：说清 0 与 >0 的差别（用户可手填 0-0.95 之间任意值）
-    $lbDenoiseHint = New-Object System.Windows.Forms.Label
-    $lbDenoiseHint.Text = '（0=文生图；0.3-0.5 贴底图；≥0.7 重画）'
-    $lbDenoiseHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
-    $lbDenoiseHint.ForeColor = [System.Drawing.Color]::Gray
-    $lbDenoiseHint.SetBounds(120, (240 + 1 * 40 + 24), 220, 16)
-    $form.Controls.Add($lbDenoiseHint)
-
-    # 2.5) 底图（图生图用）：留空 = 用素体自检迭代的成品；「最近」= 输出目录里最新一张；
-    #      也可以手填图片路径，或点「浏览…」选一张。填了底图 + Denoising > 0 就真的走图生图。
+    # 1) 底图（图生图用）：留空 = 最近一张；「最近」= 输出目录最新一张；也可填路径或点「浏览…」选图
     $txtInit = New-Object System.Windows.Forms.TextBox
     $txtInit.Text = "$InitImageDefault"
-    $txtInit.SetBounds(120, (240 + 2 * 40), 120, 24)
+    $txtInit.SetBounds(120, (240 + 1 * 40), 120, 24)
     $form.Controls.Add($txtInit)
     $btnInitBrowse = New-Object System.Windows.Forms.Button
     $btnInitBrowse.Text = '浏览…'
-    $btnInitBrowse.SetBounds(246, (240 + 2 * 40), 64, 24)
+    $btnInitBrowse.SetBounds(246, (240 + 1 * 40), 64, 24)
     $btnInitBrowse.Add_Click({
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
         $ofd.Title = '选一张底图（图生图用）'
@@ -516,45 +711,133 @@ function Show-ParamForm {
     })
     $form.Controls.Add($btnInitBrowse)
     $lbInitHint = New-Object System.Windows.Forms.Label
-    $lbInitHint.Text = '（留空=素体成品；「最近」=最新一张）'
+    $lbInitHint.Text = '（留空=最近一张；或填路径）'
     $lbInitHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
     $lbInitHint.ForeColor = [System.Drawing.Color]::Gray
-    $lbInitHint.SetBounds(120, (240 + 2 * 40 + 24), 220, 16)
+    $lbInitHint.SetBounds(120, (240 + 1 * 40 + 24), 220, 16)
     $form.Controls.Add($lbInitHint)
 
-    # 3) 比例（只读下拉：常见比例）
+    # 2) 蒙版（决策 C-1b：替换衣服/脸/背景时只重绘这一块，其余像素原样保留 → 画风天然一致）
+    $cboMask = New-Object System.Windows.Forms.ComboBox
+    $cboMask.DropDownStyle = 'DropDown'
+    foreach ($v in @('无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）', '上半（脸）反选', '四周（背景）反选')) { $null = $cboMask.Items.Add($v) }
+    $cboMask.Text = '无（整图重绘）'
+    $cboMask.SetBounds(120, (240 + 2 * 40), 190, 24)
+    $form.Controls.Add($cboMask)
+    $lbMaskHint = New-Object System.Windows.Forms.Label
+    $lbMaskHint.Text = '（白色=重绘区；也可填蒙版图路径）'
+    $lbMaskHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
+    $lbMaskHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbMaskHint.SetBounds(120, (240 + 2 * 40 + 24), 220, 16)
+    $form.Controls.Add($lbMaskHint)
+
+    # 3) Denoising（**恒可编辑**下拉：0 = 文生图；>0 = 重绘幅度）
+    $cboDenoise = New-Object System.Windows.Forms.ComboBox
+    $cboDenoise.DropDownStyle = 'DropDown'
+    foreach ($v in @('0（文生图·不用底图）', '0.3', '0.4', '0.45', '0.5', '0.6', '0.7', '0.8', '0.9')) { $null = $cboDenoise.Items.Add($v) }
+    $cboDenoise.Text = '0（文生图·不用底图）'
+    $cboDenoise.SetBounds(120, (240 + 3 * 40), 190, 24)
+    $cboDenoise.Enabled = $true
+    $form.Controls.Add($cboDenoise)
+    $lbDenoiseHint = New-Object System.Windows.Forms.Label
+    $lbDenoiseHint.Text = '（图生图：0.4-0.5 贴底图；≥0.7 大改）'
+    $lbDenoiseHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
+    $lbDenoiseHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbDenoiseHint.SetBounds(120, (240 + 3 * 40 + 24), 220, 16)
+    $form.Controls.Add($lbDenoiseHint)
+
+    # 4) 迭代次数（可编辑下拉）
+    $cboRounds = New-Object System.Windows.Forms.ComboBox
+    $cboRounds.DropDownStyle = 'DropDown'
+    foreach ($n in @(1, 2, 3, 4, 5, 8, 12, 16, 24, 32)) { $null = $cboRounds.Items.Add("$n") }
+    $cboRounds.Text = "$DefaultRounds"
+    $cboRounds.SetBounds(120, (240 + 4 * 40), 190, 24)
+    $form.Controls.Add($cboRounds)
+
+    # 5) 比例（只读下拉）
     $cboRatio = New-Object System.Windows.Forms.ComboBox
     $cboRatio.DropDownStyle = 'DropDownList'
     foreach ($r in @('9:16', '1:1', '3:4', '4:3', '16:9', '2:3', '3:2', '21:9')) { $null = $cboRatio.Items.Add($r) }
-    $cboRatio.SelectedIndex = 0   # 默认 9:16
-    $cboRatio.SetBounds(120, (240 + 3 * 40), 190, 24)
+    $cboRatio.SelectedIndex = 0
+    $cboRatio.SetBounds(120, (240 + 5 * 40), 190, 24)
     $form.Controls.Add($cboRatio)
 
-    # 4) 画风（只读下拉：图生图默认「保持画风」，文生图默认「二次元」）
+    # 6) 画风（只读下拉）：首项「一致（自动检测参考图）」= 决策 C-1a，从参考图反推画风/主体；
+    #    「保持画风」= 不注入任何画风词；其余档位 = 注入对应画风词（见 Get-StylePrompt）。
     $cboStyle = New-Object System.Windows.Forms.ComboBox
     $cboStyle.DropDownStyle = 'DropDownList'
-    # 画风清单（C 档选项表·画风部分）：前三个是用户自己调出来的画风（2026-10-15 本机实测配方），
-    # 后面是通用画风；「釉彩调色盘」= 用户自调的本地 LoRA 画风（釉彩·麻袋调色盘）。
-    foreach ($s in @('保持画风', '二次元', '写实二次元', '写实二次元·东亚脸', '彩色哥特', '釉彩调色盘', '国风', '赛博朋克', '写实', '厚涂', '水彩', '像素风')) { $null = $cboStyle.Items.Add($s) }
-    if ($HasBaseImage) { $cboStyle.SelectedIndex = 0 } else { $cboStyle.SelectedIndex = 1 }
-    $cboStyle.SetBounds(120, (240 + 4 * 40), 190, 24)
+    foreach ($s in @('一致（自动检测参考图）', '保持画风', '二次元', '写实二次元', '写实二次元·东亚脸', '彩色哥特', '釉彩调色盘', '国风', '赛博朋克', '写实', '厚涂', '水彩', '像素风')) { $null = $cboStyle.Items.Add($s) }
+    $cboStyle.SelectedIndex = 2   # 默认「二次元」（文生图的默认档；切到图生图会自动改「一致」）
+    $cboStyle.SetBounds(120, (240 + 6 * 40), 190, 24)
     $form.Controls.Add($cboStyle)
 
-    # 画风联动：切换画风时，把该画风对应的正向/负向提示词**幂等写入**两个提示词框。
-    # 用户要求（2026-10-15）：C 档弹表单时，根据画风在两个提示词框里加入对应画风提示词（用户看得见、可改）。
-    # 实现：脚本作用域记录「上次注入的（正/负）画风词」，切换时先按原样剥掉旧词，再追加新词——
-    # 这样用户手动改过的手写词不受影响，只有画风词那段被替换。
+    # 7) 画质（只读下拉）
+    $cboQuality = New-Object System.Windows.Forms.ComboBox
+    $cboQuality.DropDownStyle = 'DropDownList'
+    foreach ($q in @('480p', '640p', '768p', '1024p', '1280p', '1440p', '2160p（4K）')) { $null = $cboQuality.Items.Add($q) }
+    $cboQuality.SelectedIndex = 0
+    $cboQuality.SetBounds(120, (240 + 7 * 40), 190, 24)
+    $form.Controls.Add($cboQuality)
+
+    # 8) LoRA（可编辑下拉）
+    $cboLora = New-Object System.Windows.Forms.ComboBox
+    $cboLora.DropDownStyle = 'DropDown'
+    $null = $cboLora.Items.Add('（不用 LoRA）')
+    foreach ($l in $LoraList) { $null = $cboLora.Items.Add("$l 0.8") }
+    $cboLora.SelectedIndex = 0
+    $cboLora.SetBounds(120, (240 + 8 * 40), 190, 24)
+    $form.Controls.Add($cboLora)
+    if ($LoraList.Count -eq 0) {
+        $lbLoraHint = New-Object System.Windows.Forms.Label
+        $lbLoraHint.Text = '（SD 未运行，拉不到列表；可手填「名称 权重」）'
+        $lbLoraHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
+        $lbLoraHint.ForeColor = [System.Drawing.Color]::Gray
+        $lbLoraHint.SetBounds(120, (240 + 8 * 40 + 26), 220, 18)
+        $form.Controls.Add($lbLoraHint)
+    }
+
+    # 9) 模型（只读下拉）：首项显示真实当前模型；第 2 项「一致（照参考图）」= 用参考图自带的模型（PNG 元数据）
+    $cboModel = New-Object System.Windows.Forms.ComboBox
+    $cboModel.DropDownStyle = 'DropDownList'
+    $curModelLabel = '（当前模型）'
+    if ($CurrentModel) { $curModelLabel = "（当前模型：$CurrentModel）" }
+    $null = $cboModel.Items.Add($curModelLabel)
+    $null = $cboModel.Items.Add('一致（照参考图）')
+    foreach ($m in $CheckpointList) { $null = $cboModel.Items.Add($m) }
+    $cboModel.SelectedIndex = 0
+    $cboModel.SetBounds(120, (240 + 9 * 40), 190, 24)
+    $form.Controls.Add($cboModel)
+    if ($CheckpointList.Count -eq 0) {
+        $lbModelHint = New-Object System.Windows.Forms.Label
+        $lbModelHint.Text = '（SD 未运行，拉不到列表）'
+        $lbModelHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
+        $lbModelHint.ForeColor = [System.Drawing.Color]::Gray
+        $lbModelHint.SetBounds(120, (240 + 9 * 40 + 26), 220, 18)
+        $form.Controls.Add($lbModelHint)
+    }
+
+    # 10) 命名（留空 = 按提示词总结命名）
+    $txtName = New-Object System.Windows.Forms.TextBox
+    $txtName.Text = ''
+    $txtName.SetBounds(120, (240 + 10 * 40), 190, 24)
+    $form.Controls.Add($txtName)
+    $lbNameHint = New-Object System.Windows.Forms.Label
+    $lbNameHint.Text = '（留空 = 自动总结提示词命名）'
+    $lbNameHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
+    $lbNameHint.ForeColor = [System.Drawing.Color]::Gray
+    $lbNameHint.SetBounds(120, (240 + 10 * 40 + 26), 220, 18)
+    $form.Controls.Add($lbNameHint)
+
+    # 画风联动：切换画风时把该画风的词**幂等**写进两个提示词框（剥旧词 → 加新词，不重复、不留 ",,"）
     $script:injectedStylePos = ""
     $script:injectedStyleNeg = ""
     $cboStyle.Add_SelectedIndexChanged({
-        # 1) 剥掉上一次注入的画风词（若存在）
         if ($script:injectedStylePos -and $txtPos.Text.Contains($script:injectedStylePos)) {
             $txtPos.Text = Remove-StyleWords -Text $txtPos.Text -Words $script:injectedStylePos
         }
         if ($script:injectedStyleNeg -and $txtNeg.Text.Contains($script:injectedStyleNeg)) {
             $txtNeg.Text = Remove-StyleWords -Text $txtNeg.Text -Words $script:injectedStyleNeg
         }
-        # 2) 注入当前画风的词
         $st = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
         $script:injectedStylePos = ""
         $script:injectedStyleNeg = ""
@@ -568,9 +851,20 @@ function Show-ParamForm {
         }
     })
 
-    # 初始档位也要注入一次（2026-10-15 修）：上面的 SelectedIndex 是在挂事件**之前**设的，
-    # 不补这一下，用户「不动下拉直接点确定」时默认档（无底图 = 二次元）就一个词都没有
-    # —— 现象正是「选了二次元却画不出二次元」。
+    # 模式联动：切到「图生图」→ 默认画风「一致（自动检测参考图）」+ Denoising 0.45；
+    #            切回「文生图」→ 默认画风「二次元」+ Denoising 0（不用底图）。
+    $cboMode.Add_SelectedIndexChanged({
+        $st = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
+        if ([string]$cboMode.SelectedItem -eq '图生图') {
+            if ([string]$cboStyle.SelectedItem -ne '一致（自动检测参考图）') { $cboStyle.SelectedIndex = 0 }
+            if ($cboDenoise.Text -notmatch '^0?\.') { $cboDenoise.Text = '0.45' }
+        } else {
+            if ([string]$cboStyle.SelectedItem -eq '一致（自动检测参考图）') { $cboStyle.SelectedIndex = 2 }
+            $cboDenoise.Text = '0（文生图·不用底图）'
+        }
+    })
+
+    # 初始档位也要注入一次（SelectedIndex 是在挂事件之前设的，不补这一下默认档就没有词）
     try {
         $st0 = Get-StylePrompt -Style ([string]$cboStyle.SelectedItem)
         if ($st0.Pos) {
@@ -583,82 +877,21 @@ function Show-ParamForm {
         }
     } catch { }
 
-    # 5) 画质（只读下拉：短边像素档位）
-    $cboQuality = New-Object System.Windows.Forms.ComboBox
-    $cboQuality.DropDownStyle = 'DropDownList'
-    foreach ($q in @('480p', '640p', '768p', '1024p', '1280p', '1440p', '2160p（4K）')) { $null = $cboQuality.Items.Add($q) }
-    $cboQuality.SelectedIndex = 0   # 默认 480p
-    $cboQuality.SetBounds(120, (240 + 5 * 40), 190, 24)
-    $form.Controls.Add($cboQuality)
-
-    # 6) LoRA（可编辑下拉：SD 在跑时自动拉取本机列表；留空 = 不用；格式「名称 x权重」如「xxx 0.8」）
-    $cboLora = New-Object System.Windows.Forms.ComboBox
-    $cboLora.DropDownStyle = 'DropDown'
-    $null = $cboLora.Items.Add('（不用 LoRA）')
-    foreach ($l in $LoraList) { $null = $cboLora.Items.Add("$l 0.8") }
-    $cboLora.SelectedIndex = 0
-    $cboLora.SetBounds(120, (240 + 6 * 40), 190, 24)
-    $form.Controls.Add($cboLora)
-    if ($LoraList.Count -eq 0) {
-        $lbLoraHint = New-Object System.Windows.Forms.Label
-        $lbLoraHint.Text = '（SD 未运行，拉不到列表；可手填「名称 权重」）'
-        $lbLoraHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
-        $lbLoraHint.ForeColor = [System.Drawing.Color]::Gray
-        $lbLoraHint.SetBounds(120, (240 + 6 * 40 + 26), 220, 18)
-        $form.Controls.Add($lbLoraHint)
-    }
-
-    # 7) 模型（只读下拉：SD 在跑时自动拉取 checkpoint 列表；首项「（当前模型）」= 不切换）
-    $cboModel = New-Object System.Windows.Forms.ComboBox
-    $cboModel.DropDownStyle = 'DropDownList'
-    # 首项直接写出**真实当前模型**：画风自动切模型是持久的，用户看不到底子就很容易
-    # 「选着二次元、其实还在写实底上出图」（2026-10-15 的故障现象）。
-    $curModelLabel = '（当前模型）'
-    if ($CurrentModel) { $curModelLabel = "（当前模型：$CurrentModel）" }
-    $null = $cboModel.Items.Add($curModelLabel)
-    foreach ($m in $CheckpointList) { $null = $cboModel.Items.Add($m) }
-    $cboModel.SelectedIndex = 0
-    $cboModel.SetBounds(120, (240 + 7 * 40), 190, 24)
-    $form.Controls.Add($cboModel)
-    if ($CheckpointList.Count -eq 0) {
-        $lbModelHint = New-Object System.Windows.Forms.Label
-        $lbModelHint.Text = '（SD 未运行，拉不到列表）'
-        $lbModelHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
-        $lbModelHint.ForeColor = [System.Drawing.Color]::Gray
-        $lbModelHint.SetBounds(120, (240 + 7 * 40 + 26), 220, 18)
-        $form.Controls.Add($lbModelHint)
-    }
-
-    # 8) 命名（文本框，可留空：留空 = 用提示词总结 + 序号；自定义名重复时自动加序号递增）
-    $lbName = New-Object System.Windows.Forms.Label
-    $lbName.Text = '命名：'
-    $lbName.SetBounds(20, (240 + 8 * 40), 90, 22)
-    $form.Controls.Add($lbName)
-    $txtName = New-Object System.Windows.Forms.TextBox
-    $txtName.Text = ''
-    $txtName.SetBounds(120, (240 + 8 * 40), 190, 24)
-    $form.Controls.Add($txtName)
-    $lbNameHint = New-Object System.Windows.Forms.Label
-    $lbNameHint.Text = '（留空 = 自动总结提示词命名）'
-    $lbNameHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7.5)
-    $lbNameHint.ForeColor = [System.Drawing.Color]::Gray
-    $lbNameHint.SetBounds(120, (240 + 8 * 40 + 26), 220, 18)
-    $form.Controls.Add($lbNameHint)
-
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text = '确定出图'
-    $btnOk.SetBounds(110, 604, 100, 30)
+    $btnOk.SetBounds(110, 684, 100, 30)
     $form.AcceptButton = $btnOk
     $form.Controls.Add($btnOk)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = '取消'
-    $btnCancel.SetBounds(220, 604, 100, 30)
+    $btnCancel.SetBounds(220, 684, 100, 30)
     $form.Controls.Add($btnCancel)
 
     $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
     $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
     $form.CancelButton = $btnCancel
+
     # 诊断日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-form-diag.log
     try {
         $dlgResult = $form.ShowDialog()
@@ -693,6 +926,8 @@ function Show-ParamForm {
         Model   = [string]$cboModel.SelectedItem
         Name    = $txtName.Text.Trim()
         InitImg = $txtInit.Text.Trim()
+        Mode    = [string]$cboMode.SelectedItem
+        Mask    = $cboMask.Text.Trim()
     }
 }
 
@@ -929,7 +1164,9 @@ function Invoke-FinalIterate {
         [int]$Rounds = 1,
         [int]$W = 512,
         [int]$H = 768,
-        [string]$Checkpoint = ""
+        [string]$Checkpoint = "",
+        [string]$Mask = "",           # 蒙版图（白=重绘区）：决策 C-1b 替换衣服/脸/背景时走蒙版重绘
+        [int]$InpaintFill = 0         # 蒙版区底色：0=填充（默认，替换最稳）1=保留原图 2=潜空间噪声（会在蒙版区留噪点）
     )
     $bestPath = ''
     $bestSeed = -1
@@ -951,10 +1188,14 @@ function Invoke-FinalIterate {
         if ($Checkpoint) { $finalArgs += @("-Checkpoint", "`"$Checkpoint`"") }
         if ($InitImage -and (Test-Path -LiteralPath $InitImage)) {
             $finalArgs += @("-InitImage", "`"$InitImage`"", "-Denoising", "$Denoising")
+            if ($Mask -and (Test-Path -LiteralPath $Mask)) {
+                $finalArgs += @("-Mask", "`"$Mask`"", "-InpaintFill", "$InpaintFill", "-InpaintPadding", "32")
+            }
         }
         if ($SdDir) { $finalArgs += @("-SdDir", "`"$SdDir`"") }
         $finalArgs += "-NoOpen"
-        Write-Host "出图第 $round/$Rounds 轮$(if ($InitImage) { "（图生图 denoising=$Denoising）" })..." -ForegroundColor Cyan
+        $roundMode = if ($Mask) { "蒙版重绘 denoising=$Denoising" } elseif ($InitImage) { "图生图 denoising=$Denoising" } else { "文生图" }
+        Write-Host "出图第 $round/$Rounds 轮（$roundMode）..." -ForegroundColor Cyan
         $finalOut = & powershell @finalArgs 2>&1
         $finalOut | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) {
@@ -1337,44 +1578,144 @@ if ($finalNegative -and ($finalNegative -notmatch ',\s*$')) { $finalNegative = $
 if ($positive) { $positive = (($positive -replace '(\s*,\s*)+', ', ').Trim().TrimEnd(',')).Trim() + ", " }
 if ($finalNegative) { $finalNegative = (($finalNegative -replace '(\s*,\s*)+', ', ').Trim().TrimEnd(',')).Trim() + ", " }
 
-# 最终出图：底图 + Denoising 决定走不走图生图（2026-10-15 第二轮修：C 档实测「填了 Denoising 还是文生图」）。
-#   底图优先级：表单「底图」栏（路径 /「最近」/ 浏览选图） > 素体自检迭代的 winning 图 > 现场补一张素体底图。
-#   只要最终拿到一张底图、且 Denoising > 0（或填了底图没填 Denoising → 按图生图默认 0.55），就走图生图。
-$initRaw = ''
-if ($P.ContainsKey('InitImg')) { $initRaw = "$($P.InitImg)" }
-$finalInit = Resolve-InitImagePath -Raw $initRaw -OutDirPath $OutDir
+# ---- 决策树：C-0 文生图 / C-1a 图生图·一致 / C-1b 图生图·替换（蒙版重绘）----
+# 表单的「模式」是总开关：
+#   C-0  文生图                → 忽略底图与蒙版，用完整提示词直出
+#   C-1  图生图 + 画风=一致     → 从**参考图**自动检测画风/主体/模型并写进提示词，denoising 0.4-0.5 保画风
+#   C-1b 图生图 + 替换（衣服/脸/背景）→ **蒙版重绘**：只重绘目标区域，未蒙版区域像素原样保留
+#        （画风天然一致；这正是「换个衣服结果画风也变了」的正解）
+$mode = "$($P.Mode)"
+$maskSpecRaw = "$($P.Mask)"
+$initRaw = "$($P.InitImg)"
+$refPath = Resolve-InitImagePath -Raw $initRaw -OutDirPath $OutDir
+$finalInit = ""
 $finalDenoise = 0.0
-if ($finalInit) {
-    $finalDenoise = [double]$P.Denoise
-    if ($finalDenoise -le 0) {
-        $finalDenoise = 0.55
-        Write-Host "表单填了底图但 Denoising 是 0 → 按图生图默认 0.55 用（免得等于不重绘）" -ForegroundColor DarkGray
-    }
-    Write-Host "最终出图走图生图：底图 = $finalInit（denoising = $finalDenoise）" -ForegroundColor Cyan
-} elseif ($P.Denoise -gt 0) {
-    if ($baseWin -and (Test-Path -LiteralPath $baseWin.Path)) {
-        $finalInit = $baseWin.Path
-        $finalDenoise = [double]$P.Denoise
-        Write-Host "最终出图走图生图：底图 = 素体成品（seed=$($baseWin.Seed)），denoising = $finalDenoise" -ForegroundColor Cyan
-    } elseif ($NoIterate) {
-        Write-Host "没有底图可选：本次传了 -NoIterate（不跑素体），要图生图请在表单「底图」栏填路径或「最近」" -ForegroundColor Yellow
+$finalMask = ""
+$inpaintFill = 0
+$branchTag = "C-0 文生图"
+
+if ($mode -eq '图生图' -and -not $refPath) {
+    # 图生图没给底图 → 自动退到「输出目录最新一张」；再没有就明确报错，不默默改成文生图
+    $refPath = Resolve-InitImagePath -Raw '最近' -OutDirPath $OutDir
+    if ($refPath) {
+        Write-Host "图生图：表单没填底图 → 自动用输出目录最新一张：$refPath" -ForegroundColor DarkGray
     } else {
-        # 素体阶段没产出（异常路径）→ 现场补一张底图，否则用户填的 Denoising 形同虚设
-        Write-Host "没有可用底图 → 现场补一张素体底图（单轮出图）…" -ForegroundColor Cyan
-        $fallbackBase = Invoke-BaseIterate
-        if ($fallbackBase -and (Test-Path -LiteralPath $fallbackBase.Path)) {
-            $finalInit = $fallbackBase.Path
-            $finalDenoise = [double]$P.Denoise
-            if (-not $baseWin) { $baseWin = $fallbackBase }
-            Write-Host "底图就位：$finalInit（denoising = $finalDenoise）" -ForegroundColor Cyan
+        Write-Host "错误：选了「图生图」但没有可用底图（表单「底图」留空，输出目录里也没有图片）。" -ForegroundColor Red
+        Write-Host "      请填底图路径 / 点「浏览…」选一张，或先出一张图再重试。" -ForegroundColor Yellow
+        Remove-IterTempDir
+        exit 1
+    }
+}
+
+if ($mode -eq '文生图') {
+    Write-Host "[决策 C-0] 文生图：忽略底图与蒙版，用完整提示词直出" -ForegroundColor Cyan
+} else {
+    $finalInit = $refPath
+    $pngParams = Get-PngGenParams -Path $refPath          # ① 参考图自带 A1111 元数据（最强一致）
+    $refTags = ''
+    $styleFromRef = ''
+    $styleBasis = @()
+    if ($pngParams) {
+        if ($pngParams.Model) { $styleBasis += "PNG 元数据 Model=$($pngParams.Model)" }
+        if ($pngParams.Positive) { $styleBasis += 'PNG 元数据 原提示词' }
+    }
+
+    # 画风=一致 → 自动检测（元数据 → VLM → A1111 反推），并把参考图的词并进提示词
+    if ("$($P.Style)" -eq '一致（自动检测参考图）') {
+        if ($pngParams -and $pngParams.Model) {
+            if (Test-RealisticCheckpoint $pngParams.Model) { $styleFromRef = '写实二次元' } else { $styleFromRef = '二次元' }
+        }
+        if (-not $styleFromRef) { $styleFromRef = Get-ImageStyleByVlm -Path $refPath }
+        if (-not $refTags) { $refTags = Get-ImageTags -Path $refPath -PreferClip ([bool](-not $pngParams)) }
+        if (-not $styleFromRef -and $refTags) {
+            if ($refTags -match 'photo|realistic|photograph|portrait photo') { $styleFromRef = '写实' } else { $styleFromRef = '二次元' }
+        }
+        if ($styleFromRef) {
+            Write-Host "画风一致：检测到「$styleFromRef」（依据：$($styleBasis -join ' / ')）" -ForegroundColor DarkGray
+            # 用检测到的画风补一套画风词（之前注入的是空的「一致」档，这里补上）
+            $stRef = Get-StylePrompt -Style $styleFromRef
+            if ($stRef.Pos) { $positive = Add-StyleWords -Text $positive -Words $stRef.Pos }
+            if ($stRef.Neg) { $negative = Add-StyleWords -Text $negative -Words $stRef.Neg }
+            if (-not $formCheckpoint) {
+                if ($styleFromRef -eq '写实二次元') {
+                    $animeCk = Get-AnimeCheckpoint -Checkpoints $sdCheckpoints
+                    if ($animeCk) { $formCheckpoint = $animeCk }
+                } elseif ($styleFromRef -eq '二次元') {
+                    $animeCk = Get-AnimeCheckpoint -Checkpoints $sdCheckpoints
+                    if ($animeCk) { $formCheckpoint = $animeCk }
+                } elseif ($styleFromRef -eq '写实') {
+                    $realCk = @($sdCheckpoints | Where-Object { $_ -match 'majicMIX|majicmix|realistic|麦橘|写实' } | Select-Object -First 1)
+                    if ($realCk.Count -gt 0) { $formCheckpoint = [string]$realCk[0] }
+                }
+            }
         } else {
-            Write-Host "底图仍不可用 → 本次回落文生图（Denoising 不生效）" -ForegroundColor Yellow
+            Write-Host "画风一致：没能从参考图判出画风（元数据/反推/VLM 都不可用），按当前设置出图" -ForegroundColor Yellow
         }
     }
-} else {
-    Write-Host "最终出图走文生图（Denoising 0 + 未填底图）" -ForegroundColor DarkGray
+
+    # 主体/画风一致性：把参考图的词并进提示词（剥掉与「替换目标」冲突的旧标签 → 换衣服不改画风）
+    $replaceTarget = Get-ReplaceTarget -Text $positive
+    $refBase = ''
+    if ($pngParams -and $pngParams.Positive) { $refBase = $pngParams.Positive } elseif ($refTags) { $refBase = $refTags }
+    if ($refBase) {
+        $positive = Merge-ConsistencyPrompt -UserPos $positive -RefPos $refBase -Target $replaceTarget
+        if ($pngParams -and $pngParams.Negative) { $negative = Add-StyleWords -Text $negative -Words $pngParams.Negative }
+        Write-Host "一致性：已把参考图的词并入提示词（$(if ($replaceTarget) { "替换目标=$replaceTarget" } else { '整体一致' })）" -ForegroundColor DarkGray
+    }
+
+    # 模型=一致（照参考图）→ 用参考图自带模型
+    if ("$($P.Model)" -like '一致*' -and $pngParams -and $pngParams.Model) {
+        $formCheckpoint = $pngParams.Model
+        Write-Host "模型一致：按参考图元数据切换 → $formCheckpoint" -ForegroundColor DarkGray
+    }
+
+    # 蒙版（C-1b）：显式填了就用；填「无」但检测到替换动作 → 按目标自动选区域
+    $maskSpec = $maskSpecRaw
+    if ($maskSpec -match '^无' -or $maskSpec -eq '') { $maskSpec = '' }
+    if (-not $maskSpec -and $replaceTarget) {
+        switch ($replaceTarget) {
+            '衣服' { $maskSpec = '下半（衣服）' }
+            '脸'   { $maskSpec = '上半（脸）' }
+            '背景' { $maskSpec = '四周（背景）' }
+            default { $maskSpec = '中间（主体）' }
+        }
+        Write-Host "检测到替换动作（$replaceTarget）→ 自动选用蒙版区域：$maskSpec" -ForegroundColor DarkGray
+    }
+    if ($maskSpec) {
+        if ($maskSpec -match '\.(png|jpg|jpeg|webp|bmp)$') {
+            $mp = $maskSpec
+            if (-not [System.IO.Path]::IsPathRooted($mp)) { $mp = Join-Path $OutDir $mp }
+            if (Test-Path -LiteralPath $mp) { $finalMask = $mp } else { Write-Host "蒙版图不存在：$maskSpec → 改为按区域生成" -ForegroundColor Yellow }
+        }
+        if (-not $finalMask) {
+            $refSize = Get-ImageSizePx -Path $refPath
+            $maskOut = Join-Path $script:IterTempDir 'region-mask.png'
+            $finalMask = New-RegionMask -Spec $maskSpec -W $refSize.W -H $refSize.H -OutPath $maskOut
+            if (-not $finalMask) { Write-Host "蒙版区域认不出（$maskSpec）→ 退回整图重绘" -ForegroundColor Yellow }
+        }
+    }
+
+    if ($finalMask) {
+        # 蒙版重绘：只改目标区域，其余像素原样 → 画风/背景天然一致
+        $branchTag = "C-1b 图生图·替换$(if ($replaceTarget) { "（$replaceTarget）" })"
+        $finalDenoise = [double]$P.Denoise
+        if ($finalDenoise -lt 0.55) { $finalDenoise = 0.75 }   # 蒙版内要盖住旧内容，太小的 denoising 换不掉
+        $inpaintFill = 0                                       # 填充模式：换新衣服/新背景用（实测 fill=2 潜空间噪声会在蒙版区留噪点）
+        # 蒙版重绘按参考图原生尺寸走，保证未蒙版区域像素级保留
+        $refSize = Get-ImageSizePx -Path $refPath
+        $size = @{ W = [int]([Math]::Floor($refSize.W / 8) * 8); H = [int]([Math]::Floor($refSize.H / 8) * 8) }
+        Write-Host "[决策 C-1b] 蒙版重绘：蒙版=$finalMask（denoising=$finalDenoise，填充=噪声，尺寸=$($size.W)x$($size.H)）" -ForegroundColor Cyan
+        Write-Host "            未蒙版区域按原图保留 → 画风不会跟着换衣服一起变" -ForegroundColor DarkGray
+    } else {
+        $branchTag = 'C-1a 图生图·一致'
+        $finalDenoise = [double]$P.Denoise
+        if ($finalDenoise -le 0) { $finalDenoise = 0.45 }
+        Write-Host "[决策 C-1a] 图生图：底图=$finalInit，denoising=$finalDenoise（0.4-0.5 贴底图保画风）" -ForegroundColor Cyan
+    }
 }
-$finalWin = Invoke-FinalIterate -InitImage $finalInit -Denoising $finalDenoise -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint
+Write-Host "最终出图：$branchTag" -ForegroundColor Cyan
+$finalWin = Invoke-FinalIterate -InitImage $finalInit -Denoising $finalDenoise -Rounds $P.Rounds -W $size.W -H $size.H -Checkpoint $formCheckpoint -Mask $finalMask -InpaintFill $inpaintFill
+
 
 if ($finalWin) {
     if ($finalWin.VlmDown) {

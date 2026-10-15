@@ -532,6 +532,30 @@ assert.ok(/function Get-SdCurrentModel/.test(injectPs1), '必须能读到真实�
 assert.ok(/function Add-StyleWords/.test(injectPs1) && /function Remove-StyleWords/.test(injectPs1), '画风词注入/剥离必须走净化函数（防止反复切换堆出 ",,"）')
 
 // ---------------------------------------------------------------------------
+// 决策树 C-0 / C-1a / C-1b（2026-10-15「换衣服结果画风也变了」）：
+// 表单要有 模式（文生图/图生图）+ 蒙版（区域）两个开关；画风/模型要有「一致」档；
+// 脚本要有参考图解析链（PNG 元数据 → VLM → A1111 反推）、区域蒙版生成、替换目标识别、一致性合并；
+// 最终出图必须能把蒙版传给 sd-direct（-Mask / -InpaintFill）。
+// ---------------------------------------------------------------------------
+assert.ok(/foreach \(\$m in @\('文生图', '图生图'\)\) \{ \$null = \$cboMode\.Items\.Add\(\$m\) \}/.test(injectPs1), '表单必须有「模式」下拉（文生图 / 图生图）')
+assert.ok(/\$cboMode\.Add_SelectedIndexChanged/.test(injectPs1), '模式切换必须联动（图生图 → 画风一致 + denoising 0.45）')
+assert.ok(/'无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）'/.test(injectPs1), '蒙版下拉必须有区域选项（脸/衣服/主体/背景）')
+assert.ok(/'一致（自动检测参考图）'/.test(injectPs1), '画风下拉必须有「一致（自动检测参考图）」档')
+assert.ok(/cboModel\.Items\.Add\('一致（照参考图）'\)/.test(injectPs1), '模型下拉必须有「一致（照参考图）」档')
+assert.ok(/function Get-PngGenParams/.test(injectPs1), '必须能读参考图的 A1111 PNG 元数据（模型一致/画风一致的依据）')
+assert.ok(/-shl 24/.test(injectPs1), 'PNG chunk 长度必须按大端解析（小端会读出垃圾长度）')
+assert.ok(/function Get-ImageTags/.test(injectPs1), '必须有 A1111 反推（deepdanbooru/clip）')
+assert.ok(/function Get-ImageStyleByVlm/.test(injectPs1), '必须有本地视觉模型判画风（可选增强）')
+assert.ok(/function New-RegionMask/.test(injectPs1), '必须有区域蒙版生成')
+assert.ok(/function Get-ReplaceTarget/.test(injectPs1), '必须能识别替换目标（衣服/脸/背景）')
+assert.ok(/function Merge-ConsistencyPrompt/.test(injectPs1), '必须能把参考图词并入提示词并剥掉冲突标签')
+assert.ok(/Invoke-FinalIterate -InitImage \$finalInit -Denoising \$finalDenoise -Rounds \$P\.Rounds -W \$size\.W -H \$size\.H -Checkpoint \$formCheckpoint -Mask \$finalMask -InpaintFill \$inpaintFill/.test(injectPs1), '最终出图必须把蒙版与填充模式传给迭代函数')
+assert.ok(/\[string\]\$Mask = ""/.test(injectPs1) && /"-Mask", "`"\$Mask`"", "-InpaintFill"/.test(injectPs1), 'Invoke-FinalIterate 必须把 -Mask/-InpaintFill 传给 sd-direct')
+assert.ok(/\$inpaintFill = 0\s+# 填充模式/.test(injectPs1), '蒙版重绘默认必须用 fill=0 填充（实测 fill=2 潜空间噪声会在蒙版区留噪点）')
+assert.ok(injectPs1.includes('决策 C-0') && injectPs1.includes('C-1a') && injectPs1.includes('C-1b'), '脚本必须打印决策分支（C-0 / C-1a / C-1b）')
+assert.ok(c.includes('C-1b') && c.includes('蒙版重绘'), '技能正文必须写明决策树与蒙版重绘分支')
+
+// ---------------------------------------------------------------------------
 // 文档必须写清的两件事（用户明确要求）：本地模型评估链 + 触发话术（0.9.7）
 // ---------------------------------------------------------------------------
 const readme = fs.readFileSync(new URL('./README.md', import.meta.url), 'utf8')
