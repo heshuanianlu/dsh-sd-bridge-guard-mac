@@ -1128,7 +1128,7 @@ function syncScriptFile(file, target) {
 function syncDirectScripts(wsRoot) {
   const root = path.resolve(wsRoot || process.cwd())
   let allOk = true
-  for (const file of ['sd-direct.ps1', 'sd-inject.ps1']) {
+  for (const file of ['sd-direct.ps1', 'sd-inject.ps1', 'sd-auto-mask.py']) {
     if (!syncScriptFile(file, path.join(root, file))) allOk = false
   }
   // SD 目录只放 sd-direct.ps1（用户想从 SD 目录手跑脚本时用得到；放 sd-inject.ps1 没意义）

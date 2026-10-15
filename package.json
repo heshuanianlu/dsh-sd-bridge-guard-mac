@@ -19,6 +19,7 @@
                   "sd-bridge.js",
                   "sd-direct.ps1",
                   "sd-inject.ps1",
+                  "sd-auto-mask.py",
                   "install-sd.ps1",
                   "cordis.patch.yml",
                   "README.md",

@@ -1,6 +1,6 @@
 // 技能注册冒烟：验证 sd-paint（双分支违规分流协议）与 7 个工具注册 + 跨机器可移植性
-import assert from 'node:assert/strict'
-import fs from 'node:fs'
+
+// ---------------------------------------------------------------------------
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -609,3 +609,24 @@ console.log('sd_script(i2i):', out.command)
 console.log('sd_script_b(t2i):', al.command)
 console.log('quickOptions head:', quickText.split('\n')[0])
 console.log('SKILL SMOKE OK')
+
+// 按图内容自动抠图（2026-10-15 用户要求「蒙版不要预设」）：换衣服抠衣服、换背景抠背景。
+// 交付物 = sd-auto-mask.py（YOLO-World 文字提示 → SAM 精细蒙版）+ 脚本里的调用与表单默认值。
+// ---------------------------------------------------------------------------
+const autoMaskPy = fs.readFileSync(new URL('./sd-auto-mask.py', import.meta.url), 'utf8')
+assert.ok(/YOLO-World|world/.test(autoMaskPy) && /segment_anything/.test(autoMaskPy), '抠图脚本必须走 YOLO-World(文字提示) + SAM 分割')
+assert.ok(/TARGET_LABELS/.test(autoMaskPy) && /衣服/.test(autoMaskPy) && /背景/.test(autoMaskPy) && /脸/.test(autoMaskPy), '抠图脚本必须支持 衣服/脸/背景/主体 四类目标')
+assert.ok(/set_classes\(\[word\]\)/.test(autoMaskPy), '必须单词逐个试（多词混喂会互相稀释，实测命中率骤降）')
+assert.ok(/SILHOUETTE_FALLBACK/.test(autoMaskPy), '找不到服饰词时必须按人物剪影兜底（而不是固定矩形）')
+assert.ok(/INVERT_TARGETS/.test(autoMaskPy), '背景目标必须取反（人以外的区域）')
+const bridgeSrc2 = fs.readFileSync(new URL('./sd-bridge.js', import.meta.url), 'utf8')
+assert.ok(bridgeSrc2.includes('sd-auto-mask.py'), '插件必须把 sd-auto-mask.py 同步进工作区')
+assert.ok(/function New-AutoMaskFromImage/.test(injectPs1), 'sd-inject.ps1 必须有自动抠图调用函数')
+assert.ok(/function Find-SdPython/.test(injectPs1), '必须能定位 SD 自带的 python')
+assert.ok(/自动（按图内容抠图）/.test(injectPs1), '蒙版下拉首项必须是「自动（按图内容抠图）」')
+assert.ok(/\$autoMask = \(\$maskSpec -match '\^自动'/.test(injectPs1), '决策段必须识别「自动」蒙版并当场抠图')
+assert.ok(/自动蒙版：按参考图内容抠/.test(injectPs1), '自动抠图必须打印目标与引擎')
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+
+console.log('AUTO-MASK SMOKE OK')

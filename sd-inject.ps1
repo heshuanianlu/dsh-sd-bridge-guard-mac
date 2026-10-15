@@ -609,6 +609,60 @@ function Merge-ConsistencyPrompt {
 }
 
 # LoRA 片段：<lora:名称:权重>；名称带 .safetensors 后缀时保留原样（SD 两种都认）
+# ---- 按「这一张图的内容」自动抠图（不再用预设矩形区域）----
+# 调用同目录的 sd-auto-mask.py：YOLO-World（文字提示找目标）→ SAM（精细轮廓）→ 蒙版 PNG。
+# 换衣服 = 抠衣服/身体剪影；换背景 = 人以外取反；换脸 = 人脸区。全部**跟着这张图的实际内容走**。
+
+# 找 SD 自带的 python（能 import cv2/torch/ultralytics 的那个）
+function Find-SdPython {
+    $cands = @()
+    if ($SdDir) {
+        $cands += (Join-Path $SdDir 'python\python.exe')
+        $cands += (Join-Path $SdDir 'venv\Scripts\python.exe')
+        $cands += (Join-Path $SdDir '.venv\Scripts\python.exe')
+    }
+    foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cmd = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return ''
+}
+
+# 生成自动蒙版：成功返回蒙版路径，失败返回 '' 并把原因写进 $script:AutoMaskNote
+function New-AutoMaskFromImage {
+    param(
+        [string]$ImagePath,
+        [string]$Target,           # 衣服 / 脸 / 背景 / 主体
+        [string]$OutPath,
+        [int]$Dilate = 8,
+        [int]$Feather = 4,
+        [string]$HelperPath = ""   # 留空 = 脚本同目录下的 sd-auto-mask.py
+    )
+    $script:AutoMaskNote = ''
+    if (-not $ImagePath -or -not (Test-Path -LiteralPath $ImagePath)) { $script:AutoMaskNote = '参考图不存在'; return '' }
+    $scriptDir = $PSScriptRoot
+    if (-not $scriptDir) { try { $scriptDir = Split-Path -Parent $PSCommandPath } catch { } }
+    if (-not $scriptDir) { try { $scriptDir = (Get-Location).Path } catch { } }
+    $helper = if ($HelperPath) { $HelperPath } else { Join-Path $scriptDir 'sd-auto-mask.py' }
+    if (-not (Test-Path -LiteralPath $helper)) { $script:AutoMaskNote = "缺少抠图脚本：$helper"; return '' }
+    $py = Find-SdPython
+    if (-not $py) { $script:AutoMaskNote = '找不到可用的 python（SD 目录下 python\python.exe）'; return '' }
+    $args = @($helper, '--image', $ImagePath, '--target', $Target, '--out', $OutPath, '--dilate', "$Dilate", '--feather', "$Feather")
+    if ($SdDir) { $args += @('--sd-dir', $SdDir) }
+    $out = ''
+    try { $out = & $py @args 2>$null | Select-Object -Last 1 } catch { $script:AutoMaskNote = "抠图脚本调用失败：$($_.Exception.Message)"; return '' }
+    if (-not $out) { $script:AutoMaskNote = '抠图脚本没有输出'; return '' }
+    $json = $null
+    try { $json = $out | ConvertFrom-Json } catch { $script:AutoMaskNote = "抠图输出解析失败：$out"; return '' }
+    if ($json.ok -and $json.mask -and (Test-Path -LiteralPath $json.mask)) {
+        $script:AutoMaskNote = "$($json.engine)｜覆盖 $([math]::Round(100 * [double]$json.coverage, 1))%｜$($json.notes)"
+        return $json.mask
+    }
+    $script:AutoMaskNote = "$($json.notes)"
+    return ''
+}
+
 function Format-LoraFragment {
     param([string]$LoraName, [double]$Weight)
     if (-not $LoraName) { return "" }
@@ -793,13 +847,14 @@ function Show-ParamForm {
     # 2) 蒙版（决策 C-1b：替换衣服/脸/背景时只重绘这一块，其余像素原样保留 → 画风天然一致）
     $cboMask = New-Object System.Windows.Forms.ComboBox
     $cboMask.DropDownStyle = 'DropDown'
-    foreach ($v in @('无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）', '上半（脸）反选', '四周（背景）反选')) { $null = $cboMask.Items.Add($v) }
-    $cboMask.Text = '无（整图重绘）'
+    # 首项就是「自动」：蒙版按**这张图的内容**现抠（换衣服抠衣服、换背景抠背景），不再靠预设矩形。
+    foreach ($v in @('自动（按图内容抠图）', '无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）', '上半（脸）反选', '四周（背景）反选')) { $null = $cboMask.Items.Add($v) }
+    $cboMask.Text = '自动（按图内容抠图）'
     if ($MaskDefault) { $cboMask.Text = $MaskDefault }   # 蒙版区域由对话提交（C-1 替换时）
     $cboMask.SetBounds(120, (240 + 2 * 40), 190, 24)
     $form.Controls.Add($cboMask)
     $lbMaskHint = New-Object System.Windows.Forms.Label
-    $lbMaskHint.Text = '（白色=重绘区；也可填蒙版图路径）'
+    $lbMaskHint.Text = '（自动=按图抠；也可填区域名/box:x,y,w,h/蒙版图路径）'
     $lbMaskLockHint = $lbMaskHint   # 文生图时改写成锁定提示（下面 applyModeLock 里用）
     $lbMaskHint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 7)
     $lbMaskHint.ForeColor = [System.Drawing.Color]::Gray
@@ -1788,8 +1843,23 @@ if ($mode -eq '文生图') {
 
     # 蒙版（C-1b）：显式填了就用；填「无」但检测到替换动作 → 按目标自动选区域
     $maskSpec = $maskSpecRaw
+    $autoMask = ($maskSpec -match '^自动' -or $maskSpec -eq 'auto' -or $maskSpec -eq '')
     if ($maskSpec -match '^无' -or $maskSpec -eq '') { $maskSpec = '' }
-    if (-not $maskSpec -and $replaceTarget) {
+    # 自动抠图：按这张参考图的内容现生成（换衣服→衣服/身体；换背景→人以外；换脸→人脸区）
+    if ($autoMask -and -not $maskSpec) {
+        $autoTarget = if ($replaceTarget) { $replaceTarget } else { '衣服' }
+        if ($replaceTarget -eq '未指定') { $autoTarget = '主体' }
+        $autoOut = Join-Path $script:IterTempDir 'auto-mask.png'
+        Write-Host "自动蒙版：按参考图内容抠「$autoTarget」…（YOLO-World + SAM，首次会稍慢）" -ForegroundColor DarkGray
+        $autoPath = New-AutoMaskFromImage -ImagePath $refPath -Target $autoTarget -OutPath $autoOut -Dilate 8 -Feather 4
+        if ($autoPath) {
+            $finalMask = $autoPath
+            Write-Host "自动蒙版就绪：$($script:AutoMaskNote)" -ForegroundColor Cyan
+        } else {
+            Write-Host "自动蒙版没成功（$($script:AutoMaskNote)）→ 退回按区域重绘" -ForegroundColor Yellow
+        }
+    }
+    if (-not $finalMask -and -not $maskSpec -and $replaceTarget) {
         switch ($replaceTarget) {
             '衣服' { $maskSpec = '下半（衣服）' }
             '脸'   { $maskSpec = '上半（脸）' }
