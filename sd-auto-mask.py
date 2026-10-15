@@ -82,6 +82,8 @@ def main():
     ap.add_argument("--feather", type=int, default=4, help="羽化半径像素")
     ap.add_argument("--no-invert", action="store_true")
     ap.add_argument("--allow-silhouette", action="store_true", help="允许人物剪影兜底（默认关：会把身体一起重画）")
+    ap.add_argument("--fill-sheer", action="store_true", help="衣服：大核闭运算补全薄纱/透视布料（有上限保护）")
+    ap.add_argument("--sheer-scale", type=float, default=0.05, help="薄纱补全的闭运算半径系数（相对最长边）")
     ap.add_argument("--points", default="", help="SAM 点提示（图像像素坐标）：x,y;x,y …；给了就跳过检测直接点选")
     ap.add_argument("--max-words", type=int, default=5, help="逐词检测最多试几个词（命中即停）")
     args = ap.parse_args()
@@ -352,6 +354,24 @@ def main():
     if args.dilate > 0:
         k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.dilate * 2 + 1, args.dilate * 2 + 1))
         mask_full = cv2.dilate(mask_full, k2)
+    # 衣服可选：补全薄纱/透视布料（SAM 对半透明布料常判成非衣服）。用**大核闭运算**桥接细缝——
+    # 不要用凸包：裙子是斜跨人体的轮廓，凸包会把 90% 画面都罩进去（实测直接废掉）。
+    # 带双重上限保护：变大超过 2.2 倍、或超过画面 22%，就保持原蒙版不动。
+    if args.fill_sheer and args.target == "衣服":
+        try:
+            r = max(10, int(args.sheer_scale * max(H, W)))
+            kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r * 2 + 1, r * 2 + 1))
+            before = float((mask_full > 127).mean())
+            closed = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, kk)
+            after = float((closed > 127).mean())
+            if after <= max(0.22, before * 2.2):
+                mask_full = closed
+                notes.append(f"已补全薄纱区（{before:.1%} → {after:.1%}）")
+            else:
+                notes.append(f"薄纱补全会过大（{before:.1%} → {after:.1%}）→ 保持原蒙版")
+        except Exception:
+            pass
+
     if args.target in INVERT_TARGETS and not args.no_invert:
         mask_full = cv2.bitwise_not(mask_full)
         notes.append("背景目标：已取反（人以外的区域）")

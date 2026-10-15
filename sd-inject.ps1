@@ -649,6 +649,7 @@ function New-AutoMaskFromImage {
     $py = Find-SdPython
     if (-not $py) { $script:AutoMaskNote = '找不到可用的 python（SD 目录下 python\python.exe）'; return '' }
     $args = @($helper, '--image', $ImagePath, '--target', $Target, '--out', $OutPath, '--dilate', "$Dilate", '--feather', "$Feather")
+    if ($Target -eq '衣服') { $args += '--fill-sheer' }   # 补薄纱/透视布料（有 2.2 倍与 22% 双上限保护）
     if ($SdDir) { $args += @('--sd-dir', $SdDir) }
     $out = ''
     try { $out = & $py @args 2>$null | Select-Object -Last 1 } catch { $script:AutoMaskNote = "抠图脚本调用失败：$($_.Exception.Message)"; return '' }
