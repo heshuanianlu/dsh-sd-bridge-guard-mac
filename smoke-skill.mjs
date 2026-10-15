@@ -561,7 +561,7 @@ assert.ok(/parts\.push\('-Mode'/.test(bridgeSrc) && /parts\.push\('-MaskSpec'/.t
 assert.ok(/paramPairs\.push\('-Mode'/.test(bridgeSrc) && /paramPairs\.push\('-MaskSpec'/.test(bridgeSrc), '启动器必须带上 -Mode / -MaskSpec')
 assert.ok(c.includes('对话要自己判断任务类型') && c.includes('refImage'), '技能正文必须要求对话自己判断任务类型并提交 refImage/mask')
 assert.ok(/\[string\]\$Mode = ""/.test(injectPs1) && /\[string\]\$MaskSpec = ""/.test(injectPs1), 'sd-inject.ps1 必须接受 -Mode / -MaskSpec（对话提交的任务类型与蒙版区域）')
-assert.ok(/ModeDefault \$Mode -MaskDefault \$MaskSpec/.test(injectPs1), '表单必须用对话提交的 Mode/MaskSpec 预置')
+assert.ok(/ModeDefault \$Mode -MaskDefault \$\(if \(\$preMaskText\) \{ \$preMaskText \} else \{ \$MaskSpec \}\)/.test(injectPs1), '表单必须用对话提交的 Mode/MaskSpec（或对话画好的蒙版）预置')
 assert.ok(/\$applyModeLock = \{/.test(injectPs1) && /\$txtInit\.Enabled = -not \$isTxt/.test(injectPs1) && /\$cboMask\.Enabled = -not \$isTxt/.test(injectPs1), '文生图必须锁定「底图」与「蒙版」两个控件')
 assert.ok(/文生图：不需要蒙版，已锁定/.test(injectPs1) && /文生图：不需要底图，已锁定/.test(injectPs1), '锁定状态必须有明确提示文案')
 
@@ -630,3 +630,21 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 
 console.log('AUTO-MASK SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 对话侧预生成 + 表单锁定（2026-10-15 用户要求）：
+// C 档触发蒙版条件时，脚本在**弹表单之前**就解析底图、画好蒙版，两项直接填好并锁定；
+// 对话只提交 -InitImage（+可选 -MaskSpec），最省 token，用户只点「确定」。
+// ---------------------------------------------------------------------------
+assert.ok(/\[switch\]\$LockBase = \$false/.test(injectPs1) && /\[switch\]\$LockMask = \$false/.test(injectPs1), 'Show-ParamForm 必须支持 LockBase/LockMask')
+assert.ok(/对话侧：底图已解析并锁定/.test(injectPs1), '底图必须在弹表单前解析好并打印')
+assert.ok(/对话侧：按参考图内容抠/.test(injectPs1), '蒙版必须在弹表单前画好（对话侧完成绘制）')
+assert.ok(/对话侧：蒙版已生成并锁定/.test(injectPs1), '画好的蒙版必须打印出路径')
+assert.ok(/premask-/.test(injectPs1), '预生成蒙版要落到可见目录（premask-<参考图>-<目标>.png）')
+assert.ok(/\$applyExternalLock = \{/.test(injectPs1) && /对话已按图抠好蒙版并锁定/.test(injectPs1), '锁定状态必须有明确文案')
+assert.ok(/对话已解析底图并锁定/.test(injectPs1), '底图锁定文案必须存在')
+assert.ok(/if \(\$Mode -eq '图生图' -and \$preInitPath\)/.test(injectPs1), '只在图生图且底图解析成功时才预画蒙版')
+assert.ok(/elseif \(\$mspec -match '\^box'\)/.test(injectPs1), '精确框 box: 必须原样锁定（不再画）')
+assert.ok(/MaskDefault \$\(if \(\$preMaskText\)/.test(injectPs1), '表单蒙版默认值必须优先用对话画好的蒙版')
+console.log('PREDRAW+LOCK SMOKE OK')

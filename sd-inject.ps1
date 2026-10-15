@@ -763,7 +763,9 @@ function Show-ParamForm {
         [string]$InitImageDefault = "",
         [string]$CurrentModel = "",
         [string]$ModeDefault = "",
-        [string]$MaskDefault = ""
+        [string]$MaskDefault = "",
+        [switch]$LockBase = $false,      # 底图由对话解析好 → 表单直接填好并锁定
+        [switch]$LockMask = $false       # 蒙版由对话画好（或给定精确框）→ 表单直接填好并锁定
     )
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "sd-inject 出图参数"
@@ -1019,6 +1021,28 @@ function Show-ParamForm {
 
     # 构造完成先套一次锁定（初始模式可能是对话提交的）
     try { & $applyModeLock } catch { }
+
+    # 对话侧锁定（底图 / 蒙版由对话解析或画好）：初始套一次，切模式后再套一次，
+    # 保证 $applyModeLock 不会把它们重新解开（用户只点「确定」，不用碰这两个框）。
+    if ($LockBase -or $LockMask) {
+        $script:extLockBase = [bool]$LockBase
+        $script:extLockMask = [bool]$LockMask
+        $applyExternalLock = {
+            if ($script:extLockBase) {
+                $txtInit.Enabled = $false
+                $btnInitBrowse.Enabled = $false
+                $txtInit.BackColor = [System.Drawing.Color]::FromArgb(235, 245, 255)
+                $lbInitHint.Text = '（对话已解析底图并锁定）'
+            }
+            if ($script:extLockMask) {
+                $cboMask.Enabled = $false
+                $cboMask.BackColor = [System.Drawing.Color]::FromArgb(235, 245, 255)
+                $lbMaskLockHint.Text = '（对话已按图抠好蒙版并锁定）'
+            }
+        }
+        try { & $applyExternalLock } catch { }
+        $cboMode.Add_SelectedIndexChanged({ try { & $applyExternalLock } catch { } })
+    }
 
     # 初始档位也要注入一次（SelectedIndex 是在挂事件之前设的，不补这一下默认档就没有词）
     try {
@@ -1542,7 +1566,55 @@ $formPositive = $BasePrompt
 $formNegative = $BaseNegative
 if ($formPositive -and ($formPositive -notmatch ',\s*$')) { $formPositive = $formPositive.TrimEnd() + ", " }
 if ($formNegative -and ($formNegative -notmatch ',\s*$')) { $formNegative = $formNegative.TrimEnd() + ", " }
-$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $InitImage -CurrentModel $sdCurrentModel -ModeDefault $Mode -MaskDefault $MaskSpec
+# ---- 对话侧先干活：底图先解析、蒙版先画好 → 表单里两项已经填好并锁定（用户只点「确定」）----
+# 这样最省 token：对话只提交 -InitImage（+ 可选 -MaskSpec），画蒙版由本机脚本完成，不再来回问。
+$preInitPath = ""
+$preMaskText = ""
+$lockBase = $false
+$lockMask = $false
+if ($InitImage) {
+    $preInitPath = Resolve-InitImagePath -Raw $InitImage -OutDirPath $OutDir
+    if ($preInitPath) {
+        $lockBase = $true
+        Write-Host "对话侧：底图已解析并锁定 → $preInitPath" -ForegroundColor Cyan
+    } else {
+        Write-Host "对话侧：底图没解析成文件（$script:LastInitFail）→ 表单里保留可编辑" -ForegroundColor Yellow
+    }
+}
+if ($Mode -eq '图生图' -and $preInitPath) {
+    $mspec = "$MaskSpec"
+    if ($mspec -and $mspec -match '\.(png|jpg|jpeg|webp|bmp)$') {
+        # 对话直接给了蒙版图 → 直接用并锁定
+        $mp0 = $mspec
+        if (-not [System.IO.Path]::IsPathRooted($mp0)) { $mp0 = Join-Path $OutDir $mp0 }
+        if (Test-Path -LiteralPath $mp0) { $preMaskText = $mp0; $lockMask = $true }
+    } elseif ($mspec -match '^box') {
+        # 精确坐标框：脚本照框走，值本身就是最终蒙版定义 → 锁定
+        $preMaskText = $mspec; $lockMask = $true
+    } elseif ($mspec -notmatch '^无') {
+        # 空 / 自动 / 区域名 → 现在就按图抠一张蒙版出来（对话侧完成绘制）
+        $tgt = '衣服'
+        switch -Regex ($mspec) {
+            '脸|上半'   { $tgt = '脸';   break }
+            '背景|四周' { $tgt = '背景'; break }
+            '主体|中间' { $tgt = '主体'; break }
+            default     { $tgt = '衣服' }
+        }
+        $maskOut = Join-Path $OutDir ("premask-" + [IO.Path]::GetFileNameWithoutExtension($preInitPath) + "-$tgt.png")
+        Write-Host "对话侧：按参考图内容抠「$tgt」蒙版…（YOLO-World + SAM）" -ForegroundColor DarkGray
+        $made = New-AutoMaskFromImage -ImagePath $preInitPath -Target $tgt -OutPath $maskOut -Dilate 8 -Feather 4
+        if ($made) {
+            $preMaskText = $made
+            $lockMask = $true
+            Write-Host "对话侧：蒙版已生成并锁定 → $made" -ForegroundColor Cyan
+            Write-Host "         $($script:AutoMaskNote)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "对话侧：蒙版没画出来（$($script:AutoMaskNote)）→ 表单蒙版栏保持可编辑，请你填 box:/路径/区域名" -ForegroundColor Yellow
+        }
+    }
+}
+
+$P = Show-ParamForm -DefaultRounds $paramFormRounds -HasBaseImage $hasBaseImg -Positive $formPositive -Negative $formNegative -LoraList $sdLoras -CheckpointList $sdCheckpoints -InitImageDefault $(if ($preInitPath) { $preInitPath } else { $InitImage }) -CurrentModel $sdCurrentModel -ModeDefault $Mode -MaskDefault $(if ($preMaskText) { $preMaskText } else { $MaskSpec }) -LockBase:$lockBase -LockMask:$lockMask
 # 表单里的提示词是最终值（基底 + 用户在表单里的修改/追加）
 $positive = $P.Pos
 $negative = $P.Neg
