@@ -736,6 +736,10 @@ function New-AutoMaskFromImage {
     $errFile = "$outFile.err"
     $proc = $null
     try {
+        # 子进程 python 的 stdout 默认跟系统 ANSI 代码页（中文机是 GBK）走 → 中文变乱码、JSON 解析失败。
+        # 强制 UTF-8（进程级，跑完还原）。
+        $env:PYTHONIOENCODING = 'utf-8'
+        $env:PYTHONUTF8 = '1'
         $proc = Start-Process -FilePath $py -ArgumentList $args -NoNewWindow -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $deadline = (Get-Date).AddSeconds(240)
@@ -764,11 +768,20 @@ function New-AutoMaskFromImage {
         Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
         return ''
     } finally {
+        $env:PYTHONIOENCODING = $null
+        $env:PYTHONUTF8 = $null
         Remove-Item -LiteralPath $outFile, $errFile -ErrorAction SilentlyContinue
     }
     if (-not $out) { $script:AutoMaskNote = '抠图脚本没有输出'; return '' }
     $json = $null
-    try { $json = $out | ConvertFrom-Json } catch { $script:AutoMaskNote = "抠图输出解析失败：$out"; return '' }
+    try { $json = $out | ConvertFrom-Json } catch {
+        # 双保险：万一是「UTF-8 被按 GBK 读」造成的乱码，用已有的修复函数救一次
+        try {
+            $fixed = Repair-Utf8Mojibake -Text $out
+            if ($fixed -and $fixed -ne $out) { $json = $fixed | ConvertFrom-Json }
+        } catch { }
+        if (-not $json) { $script:AutoMaskNote = "抠图输出解析失败：$out"; return '' }
+    }
     if ($json.ok -and $json.mask -and (Test-Path -LiteralPath $json.mask)) {
         $script:AutoMaskNote = "$($json.engine)｜覆盖 $([math]::Round(100 * [double]$json.coverage, 1))%｜$($json.notes)"
         return $json.mask

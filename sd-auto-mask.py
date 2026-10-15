@@ -122,12 +122,12 @@ def main():
         import numpy as np
     except Exception as e:  # pragma: no cover
         result["notes"] = f"缺少 cv2/numpy：{e}"
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=True))
         return 0
 
     if not os.path.isfile(args.image):
         result["notes"] = f"参考图不存在：{args.image}"
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=True))
         return 0
 
     # Windows 中文/非 ASCII 路径：cv2.imread 直接失败（OpenCV 老限制）→ np.fromfile + imdecode
@@ -146,7 +146,7 @@ def main():
             pass
     if img_bgr is None:
         result["notes"] = "参考图读不出来（路径含中文？格式不支持？）"
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=True))
         return 0
     H, W = img_bgr.shape[:2]
 
@@ -493,7 +493,7 @@ def main():
 
     if mask_full.max() == 0:
         result["notes"] = "；".join(notes + ["没抠出任何区域（换词或用手工框/区域蒙版）"])
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=True))
         return 0
 
     # ---------- ③ 后处理：闭运算补洞 → 膨胀 → 羽化 ----------
@@ -648,7 +648,7 @@ def main():
     result["boxes"] = len(boxes)
     result["coverage"] = round(float((mask_full > 127).mean()), 4)
     result["notes"] = "；".join(notes)
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(result, ensure_ascii=True))
     return 0
 
 

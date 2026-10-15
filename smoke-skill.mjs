@@ -677,3 +677,19 @@ assert.ok(/\$sdRootForHelper = \$SdDir/.test(injectPs1) && /--sd-dir', \$sdRootF
 assert.ok(/Get-ChildItem -LiteralPath \$drv -Directory -ErrorAction SilentlyContinue/.test(injectPs1), '扫盘兜底不得限制目录数量（上次被「前 60 个」截掉了 SD.4.8）')
 assert.ok(/蒙版没画出来/.test(injectPs1) && /缺少抠图脚本|找不到可用的 python/.test(injectPs1), '抠图失败必须给出可读原因')
 console.log('SD-PY-DETECT SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 真机 bug（2026-10-15 第二张截图）：抠图**已经算出来了**（coverage 0.1058），PowerShell 侧却报
+// 「抠图输出解析失败」+ JSON 里中文全乱码。根因：子进程 python 的 stdout 走系统 GBK 代码页，
+// 中文被写成 GBK 字节 → 按 UTF-8 读回来乱码、把 JSON 的引号都吃坏 → ConvertFrom-Json 失败。
+// 修：① 调 python 前强制 PYTHONIOENCODING=utf-8 / PYTHONUTF8=1；
+//     ② JSON 改用 ensure_ascii=True（纯 ASCII 的 \uXXXX，任何代码页都破坏不了，PS 侧自动还原中文）；
+//     ③ 解析失败再用 Repair-Utf8Mojibake 兜一次。
+// ---------------------------------------------------------------------------
+assert.ok(/ensure_ascii=True/.test(autoMaskPy), '抠图 JSON 必须走 ensure_ascii=True（纯 ASCII，任何代码页都不会坏）')
+assert.ok(!/json\.dumps\(result, ensure_ascii=False\)/.test(autoMaskPy), '不允许再出现 ensure_ascii=False 的 JSON 输出')
+assert.ok(/PYTHONIOENCODING = 'utf-8'/.test(injectPs1) && /PYTHONUTF8 = '1'/.test(injectPs1), '调 python 前必须强制 UTF-8（子进程 stdout 默认跟系统 GBK）')
+assert.ok(/Repair-Utf8Mojibake -Text \$out/.test(injectPs1), '解析失败必须再用乱码修复兜一次')
+assert.ok(/-Encoding UTF8 -ErrorAction SilentlyContinue/.test(injectPs1), '读临时输出文件必须按 UTF-8')
+console.log('JSON-ENCODING SMOKE OK')
