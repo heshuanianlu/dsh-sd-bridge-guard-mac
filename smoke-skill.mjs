@@ -477,10 +477,10 @@ assert.ok(!/^[A-Za-z]:/.test(d.outputDir) && !/^[A-Za-z]:/.test(d.refDir), 'outp
 // ---------------------------------------------------------------------------
 const quickText = mod.buildQuickOptions ? mod.buildQuickOptions() : ''
 assert.ok(quickText.includes('C 档选项表'), 'quickOptions 文本必须自带「C 档选项表」标题')
-assert.ok(quickText.includes('写实二次元·东亚脸'), 'C 档选项表必须列出用户自调画风「写实二次元·东亚脸」')
-assert.ok(quickText.includes('彩色哥特'), 'C 档选项表必须列出用户自调画风「彩色哥特」')
-assert.ok(quickText.includes('釉彩调色盘'), 'C 档选项表必须列出用户自调 LoRA 画风「釉彩调色盘」')
-assert.ok(quickText.includes('★'), '用户自调画风必须带 ★ 标记')
+// 2026-10-16（用户要求）：画风不再列在选项表里 —— 它由 C 档表单档位直接写进正向提示词框。
+assert.ok(!/^\| 画风 \|/m.test(quickText), 'C 档选项表不得再有「画风」行（画风写在正向提示词里）')
+assert.ok(!quickText.includes('★'), '用户自调画风的 ★ 标记不再出现在选项表里')
+assert.ok(quickText.includes('画风不在本表里'), 'C 档选项表必须说明画风去哪了（正向提示词框）')
 assert.ok(quickText.includes('比例') && quickText.includes('画质') && quickText.includes('LoRA') && quickText.includes('模型'), 'C 档选项表必须覆盖 比例/画质/LoRA/模型')
 assert.ok(quickText.includes('Denoising') && quickText.includes('迭代'), 'C 档选项表必须覆盖 Denoising 与迭代次数')
 for (const name of ['sd_txt2img', 'sd_img2img', 'sd_inpaint']) {
@@ -490,7 +490,7 @@ for (const name of ['sd_txt2img', 'sd_img2img', 'sd_inpaint']) {
 // 技能正文：C 档选项表章节 + 触发话术
 assert.ok(c.includes('C 档选项表'), '技能正文必须有「C 档选项表」章节（A 档出图后必贴）')
 assert.ok(c.includes('quickOptions'), '技能正文必须点名 quickOptions 字段')
-assert.ok(/4 号画风/.test(c), '技能正文必须给出「按编号改参数重出图」的用法示例')
+assert.ok(/majicMIX \+ 3:4/.test(c) || /再来一张/.test(c), '技能正文必须给出「一句话改参数重出图」的用法示例（画风已移出选项表）')
 assert.ok(c.includes('打开SD插件'), '技能正文必须写明触发话术「打开SD插件」')
 assert.ok(c.includes('用SD插件绘制'), '技能正文必须写明触发话术「用SD插件绘制」')
 assert.ok(/★ 用户自调/.test(c) || /★用户自调/.test(c), '技能正文必须标出 ★ 用户自调画风')
