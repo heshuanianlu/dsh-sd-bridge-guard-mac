@@ -1,0 +1,274 @@
+{
+  "name": "dsh-sd-bridge-guard",
+  "version": "1.0.1",
+  "generatedAt": "2026-10-16T10:13:40.495Z",
+  "fileCount": 38,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sha256": "2babad98386c9dc5e4984056d4bcb922692c94138b934d9240c282c5cb3dbc30",
+      "bytes": 158,
+      "category": "doc",
+      "shipped": false
+    },
+    {
+      "path": ".github/workflows/publish-npm.yml",
+      "sha256": "5719c4d80466465f9c94e4220700fa3b9f5c4d2de7eff66ef89c29c07dce31e9",
+      "bytes": 3100,
+      "category": "ci",
+      "shipped": false
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "5ba69c6e32cd5fe22d02cfc71b54dd3ea7d11c24977f5fe474b9a2f59fbb7d74",
+      "bytes": 298,
+      "category": "doc",
+      "shipped": false
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "6475e92a5abd07b5aa2fd8579983a1a9a0fc24e161704baafe8b6755226dd0d0",
+      "bytes": 128550,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "bdb82112b106aeb758ce81a15934c2ee954c67c8e36d9329e32018ff1ec5ad35",
+      "bytes": 1089,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "README.md",
+      "sha256": "03125b31948a66647ce2f6a51a5c4306b30f44d93880e71b795869e58e8caf83",
+      "bytes": 79834,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "acceptance.mjs",
+      "sha256": "c5037bebc442b6de2d7956019f83ff9dc6505cecc0a6b4ff684514e40e1a4843",
+      "bytes": 17246,
+      "category": "dev",
+      "shipped": false
+    },
+    {
+      "path": "cordis.patch.yml",
+      "sha256": "8f8b1e2eaa048a343cbeb7d14a4fddf160ee376923ed9a2aa3aad4dcc4811c40",
+      "bytes": 383,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-c-paramform.jpg",
+      "sha256": "4c701f182850b3c3726ea0c02e2d0276e1b705a0342591db6b8166b7f7e8f5a3",
+      "bytes": 50795,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-img2img.jpg",
+      "sha256": "c88e41a47fada9c959a8bffa5196aad7c5e2a9d89b9eb816f4a2b37847369ba9",
+      "bytes": 42797,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-style-cyberpunk.jpg",
+      "sha256": "6f9918a848cf5ece1eea0cd089ade0d1a08e728a851dcedb1f38e29ad8a6143f",
+      "bytes": 110636,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-style-dongya-face.jpg",
+      "sha256": "5cc5601b7d4fc17c511591203ea9043a0afb56b39b7ba88b203008e74c5bcf3d",
+      "bytes": 58885,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-style-guofeng.jpg",
+      "sha256": "8d276bbb46697e9fc365e75a871faea2cb1ffc6a7d4959d8d2cb9b24bbd8e348",
+      "bytes": 85798,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-style-realistic.jpg",
+      "sha256": "816a223eba369395c6d034b17ec69bb722eb2d2ddeebc90b97a0bb8ce515af57",
+      "bytes": 60073,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-style-youcai.jpg",
+      "sha256": "cae3e3700bdd51f9df98c031324fea78720b73a1551e6a69b7898368c33062aa",
+      "bytes": 87235,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-txt2img-anime.jpg",
+      "sha256": "5461109a09ccffcb1996c4f20b8a2ec7c542720b603c3aabe61299d18805843c",
+      "bytes": 90929,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/assets/demo-txt2img.jpg",
+      "sha256": "4ee780aa994526fed49735d71e0d56622be77c62d812e456843127d5bf82459a",
+      "bytes": 43408,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "docs/models-loras.md",
+      "sha256": "2d06e79a32fa8b453f37cfa3acad5df496f76ea502c3627cfa9489aa1ff82195",
+      "bytes": 11101,
+      "category": "doc",
+      "shipped": true
+    },
+    {
+      "path": "gen-manifest.mjs",
+      "sha256": "02899a9e14723508e177f3d0b74029655c1e4dc8f70e0e5b5cc55bacd2ee1d6f",
+      "bytes": 5494,
+      "category": "dev",
+      "shipped": false
+    },
+    {
+      "path": "install-sd.ps1",
+      "sha256": "8741578959648b7a34d48815627aabaf41c2101df41846e6b9ac24b4cab0ccba",
+      "bytes": 47830,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "package.json",
+      "sha256": "227558e6d00845bf8f1be312cedc707081679c0ec4c0b532910bb4e4c83dac02",
+      "bytes": 2979,
+      "category": "runtime",
+      "shipped": false
+    },
+    {
+      "path": "publish-npm.ps1",
+      "sha256": "ca934412253d1122138c09c243851b41c7ec873201f4ffed5b7e896e7ced3cdd",
+      "bytes": 6860,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "sd-auto-mask.py",
+      "sha256": "c7e6442abbdf25fbb8810d9a58364bf8cd9fd6d5807b8ef1bcf429c09627d5ac",
+      "bytes": 46997,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "sd-bridge.js",
+      "sha256": "4e9854e7bbb44f46295e5bab468258566ecc78769fe61dd8650b001fed0aa4d9",
+      "bytes": 207986,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "sd-direct.ps1",
+      "sha256": "daffefc545071eecc977d8cb16490c7d106b45634d48f99cc0121da67400d841",
+      "bytes": 27755,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "sd-inject.ps1",
+      "sha256": "2eb074e26d7225d50f8dca0e46ed04d87df83772c45d29b02cbff1a32df0d26e",
+      "bytes": 172573,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "sd-mask-qa.py",
+      "sha256": "3eeccfea9ce87b386f477886a5605e8d48c225f1f6b755a6d07df2640afe2ffc",
+      "bytes": 6737,
+      "category": "runtime",
+      "shipped": true
+    },
+    {
+      "path": "smoke-skill.mjs",
+      "sha256": "916f00c0d01e539f5106272dfaef34120e04f521ecc0f201b2e234a7b57db079",
+      "bytes": 85093,
+      "category": "dev",
+      "shipped": false
+    },
+    {
+      "path": "test-automask-retry.ps1",
+      "sha256": "f01e5861898beb2062dd6f613a3c824350c977336473a3a83b59199aece7cbde",
+      "bytes": 4814,
+      "category": "tool",
+      "shipped": true
+    },
+    {
+      "path": "test-install-catalog.mjs",
+      "sha256": "0dd0378a98b87a0d573391c0b9a9147b35516069d9814a13b75b9a387a23b79f",
+      "bytes": 8389,
+      "category": "dev",
+      "shipped": false
+    },
+    {
+      "path": "test-install-record.mjs",
+      "sha256": "400a2e9bd9cfb749fc534386a6ec2687b362c42e0d9e4978fd30166cbb496564",
+      "bytes": 2832,
+      "category": "dev",
+      "shipped": false
+    },
+    {
+      "path": "test-mask-qa.ps1",
+      "sha256": "d1d7ab8ed301515ab5256145b23ef5b477df125520652414c1d1b0650188e959",
+      "bytes": 5186,
+      "category": "tool",
+      "shipped": true
+    },
+    {
+      "path": "test-region-mask.ps1",
+      "sha256": "e886386e28709d21d5a470d033c6946e5a055aac8f8694243b945c2563138dd3",
+      "bytes": 6599,
+      "category": "tool",
+      "shipped": true
+    },
+    {
+      "path": "test-settings.mjs",
+      "sha256": "ea8327b42ae464cbe03ae8c578f3a084e627ae42f08dd897586efea7390e7569",
+      "bytes": 2979,
+      "category": "dev",
+      "shipped": false
+    },
+    {
+      "path": "test-trailing-comma.ps1",
+      "sha256": "cd64633b10dffe031491593cdbc0b38fdd4ed7b9ff21b86c6ee5e5e4458924be",
+      "bytes": 3205,
+      "category": "tool",
+      "shipped": true
+    },
+    {
+      "path": "test-vlm-cleanup.ps1",
+      "sha256": "7133b93adb1df0c64a86a6623add67401360f6835a4334e4751f797c46160f46",
+      "bytes": 5699,
+      "category": "tool",
+      "shipped": true
+    },
+    {
+      "path": "test-vram-release.ps1",
+      "sha256": "1fd82e178c100c98afd0df4c2a891467ef6dc3a039346926d4287e0b0dbaf0fd",
+      "bytes": 3441,
+      "category": "tool",
+      "shipped": true
+    },
+    {
+      "path": "verify-integrity.mjs",
+      "sha256": "96f2674b9dda7be3ba6d351c6ede91c0573af2a36f13114d2ceb53a1406fe03b",
+      "bytes": 11906,
+      "category": "other",
+      "shipped": false
+    }
+  ]
+}

@@ -150,7 +150,7 @@ fs.rmSync(tmpRef2, { force: true })
 //    （C 档 · 完全拒绝不再走这两个工具，改由 sd_inject 生成 sd-inject.ps1 本地注入命令）
 assert.deepEqual(
   [...tools.keys()],
-  ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_script_b', 'sd_inject', 'sd_models', 'sd_server'],
+  ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_script_b', 'sd_inject', 'sd_models', 'sd_server', 'sd_integrity'],
 )
 const before = fs.readdirSync(outDir).length
 const s = await tools.get('sd_script').execute(
@@ -234,7 +234,14 @@ console.log('sd_script_b(mask):', sbMask.command)
 const injectTool = tools.get('sd_inject')
 assert.ok(injectTool, 'sd_inject missing')
 const injBase = fs.readdirSync(outDir).length
-const inj = await injectTool.execute({ basePrompt: '1girl, solo, upper body, simple background' }, exec)
+const inj = await injectTool.execute(
+  {
+    basePrompt: '1girl, solo, upper body, simple background',
+    violationPrompts: 'nude, naked',
+    suggestedPrompts: 'clothed, sfw',
+  },
+  exec,
+)
 assert.equal(inj.mode, '本地注入')
 assert.equal(inj.generatesImage, false, 'sd_inject 不得生图')
 assert.equal(inj.scriptPath, path.join(ws, 'sd-inject.ps1'))

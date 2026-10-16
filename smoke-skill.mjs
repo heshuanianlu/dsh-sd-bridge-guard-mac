@@ -206,7 +206,7 @@ assert.ok(inject, 'sd_inject missing（C 档命令生成器）')
 assert.equal(inject.output.schema.properties.generatesImage.type, 'boolean')
 assert.ok(inject.description.includes('不生成任何图片'), 'sd_inject 必须声明不出图')
 
-const inj = await inject.execute({ basePrompt: '1girl, solo, upper body, simple background' }, exec)
+const inj = await inject.execute({ basePrompt: '1girl, solo, upper body, simple background', violationPrompts: 'nude, naked', suggestedPrompts: 'clothed, sfw' }, exec)
 assert.equal(inj.mode, '本地注入')
 assert.equal(inj.generatesImage, false, 'sd_inject 不得生图')
 assert.ok(
@@ -233,7 +233,7 @@ assert.ok(!inj.command.includes('-NoVlmReview'), `默认（vlmReview=true）不�
 assert.ok(inj.command.includes('-Width 512') && inj.command.includes('-Height 768'), inj.command)
 assert.ok(inj.command.includes('-Name "inject"'), inj.command)
 // 不传 basePrompt 时用素体兜底（默认 "1girl, solo"，见 sd-bridge.js 与 sd-inject.ps1 的 $BasePrompt 默认值）
-const inj2 = await inject.execute({}, exec)
+const inj2 = await inject.execute({ violationPrompts: 'nude', suggestedPrompts: 'clothed' }, exec)
 assert.ok(
   inj2.command.includes('-BasePrompt "1girl, solo"'),
   `留空必须用素体基底兜底：${inj2.command}`,
@@ -254,10 +254,10 @@ assert.ok(
   'sd-inject.ps1 不得用 Get-Location 解析 OutDir（会随运行目录漂移）',
 )
 
-// 八个工具（含蒙版重绘 + 双版本对齐脚本 + C 档本地注入命令生成器）
+// 九个工具（含蒙版重绘 + 双版本对齐脚本 + C 档本地注入命令生成器 + 完整性检测）
 assert.deepEqual(
   [...tools.keys()],
-  ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_script_b', 'sd_inject', 'sd_models', 'sd_server'],
+  ['sd_txt2img', 'sd_img2img', 'sd_inpaint', 'sd_script', 'sd_script_b', 'sd_inject', 'sd_models', 'sd_server', 'sd_integrity'],
 )
 
 // sd_inpaint：蒙版来源二选一 + 蒙版参数 + 自检提醒
@@ -796,7 +796,7 @@ console.log('VLM-COLDSTART+CLEANUP SMOKE OK')
   }
   const ws2 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-off-'))
   await mod.apply(ctx2, { sdDir: process.env.DSH_SD_DIR || '', port: 7860, vlmAutoStart: false })
-  const inj2 = await tools2.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws2 } } } })
+  const inj2 = await tools2.get('sd_inject').execute({ basePrompt: '1girl, solo', violationPrompts: 'nude', suggestedPrompts: 'clothed' }, { agent: { session: { header: { cwd: ws2 } } } })
   assert.ok(inj2.command.includes('-NoVlmStart'), `vlmAutoStart=false 必须把 -NoVlmStart 写进命令：${inj2.command}`)
   assert.ok(/(^|\s)-NoVlmStart(\s|$)/.test(inj2.command), `-NoVlmStart 必须是独立开关：${inj2.command}`)
   assert.ok(inj2.command.startsWith('powershell -ExecutionPolicy Bypass -File '), '关掉冷启动不得破坏命令结构')
@@ -833,7 +833,7 @@ assert.ok(/\[switch\]\$ForceCpu/.test(injectPs1), '必须有 ForceCpu 内部开�
   }
   const ws3 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-maskoff-'))
   await mod.apply(ctx3, { sdDir: process.env.DSH_SD_DIR || '', port: 7860, maskAutoSegment: false })
-  const inj3 = await tools3.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws3 } } } })
+  const inj3 = await tools3.get('sd_inject').execute({ basePrompt: '1girl, solo', violationPrompts: 'nude', suggestedPrompts: 'clothed' }, { agent: { session: { header: { cwd: ws3 } } } })
   assert.ok(inj3.command.includes('-NoAutoMask'), `maskAutoSegment=false 必须把 -NoAutoMask 写进命令：${inj3.command}`)
   assert.ok(inj3.command.startsWith('powershell -ExecutionPolicy Bypass -File '), '关掉自动抠图不得破坏命令结构')
   console.log('MASK-AUTOSEGMENT-SWITCH SMOKE OK')
@@ -879,7 +879,7 @@ assert.ok(/if \(\$NoVlmReview\) \{ return '' \}/.test(injectPs1), '关掉审核�
   const tools4 = new Map()
   const ws4 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-noreview-'))
   await mod.apply(mk(tools4), { sdDir: process.env.DSH_SD_DIR || '', port: 7860, vlmReview: false })
-  const inj4 = await tools4.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws4 } } } })
+  const inj4 = await tools4.get('sd_inject').execute({ basePrompt: '1girl, solo', violationPrompts: 'nude', suggestedPrompts: 'clothed' }, { agent: { session: { header: { cwd: ws4 } } } })
   assert.ok(inj4.command.includes('-NoVlmReview'), `vlmReview=false 必须把 -NoVlmReview 写进命令：${inj4.command}`)
   assert.ok(inj4.command.includes('-VlmModel "qwen3-vl:8b"'), `默认模型必须写进命令（能识图的视觉模型）：${inj4.command}`)
   assert.ok(inj4.command.startsWith('powershell -ExecutionPolicy Bypass -File '), '关掉审核不得破坏命令结构')
@@ -887,7 +887,7 @@ assert.ok(/if \(\$NoVlmReview\) \{ return '' \}/.test(injectPs1), '关掉审核�
   const tools5 = new Map()
   const ws5 = fs.mkdtempSync(path.join(os.tmpdir(), 'sd-guard-vlmmodel-'))
   await mod.apply(mk(tools5), { sdDir: process.env.DSH_SD_DIR || '', port: 7860, vlmReview: true, vlmModel: 'my-vl:7b' })
-  const inj5 = await tools5.get('sd_inject').execute({ basePrompt: '1girl, solo' }, { agent: { session: { header: { cwd: ws5 } } } })
+  const inj5 = await tools5.get('sd_inject').execute({ basePrompt: '1girl, solo', violationPrompts: 'nude', suggestedPrompts: 'clothed' }, { agent: { session: { header: { cwd: ws5 } } } })
   assert.ok(inj5.command.includes('-VlmModel "my-vl:7b"'), `插件页自定义模型名必须写进命令：${inj5.command}`)
   assert.ok(!inj5.command.includes('-NoVlmReview'), '显式开启审核时不得带 -NoVlmReview: ' + inj5.command)
   console.log('VLM-REVIEW-SWITCH SMOKE OK')

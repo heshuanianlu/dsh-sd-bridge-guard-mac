@@ -3,13 +3,69 @@
 [![npm](https://img.shields.io/npm/v/dsh-sd-bridge-guard.svg)](https://www.npmjs.com/package/dsh-sd-bridge-guard)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/savinglighting/dsh-sd-bridge-guard/blob/main/LICENSE)
 
-**DeepSeek Harness 插件 · 本机 Stable Diffusion 生图八件套 + 违规分流协议（A 档 / C 档）· 跨机器零适配**
+**DeepSeek Harness 插件 · 本机 Stable Diffusion 生图九件套 + 违规分流协议（A 档 / C 档）· 跨机器零适配**
 
 让 DeepSeek Harness 直接调用你电脑里的 Stable Diffusion WebUI 生图：不用提前打开 SD（首次调用自动以纯 API 模式拉起）、不用改任何路径——装上插件就能用。
 
 ---
 
-## 🆕 版本更新内容（v1.0.0 · 2026-10-16）
+## 🆕 版本更新内容（v1.0.1 · 2026-10-16）
+
+**本轮三件事：下载后能自查缺什么、蒙版可以鼠标手绘、C 档违禁词能注入表单。**
+
+### ① 文件完整性检测（新功能）
+
+别人拿到插件后不再只能靠「跑一下看看报不报错」判断包是否完整——现在有**基线清单 + 反向比对**：
+
+```bash
+node verify-integrity.mjs              # 本机 vs 随包清单，终端彩色表格
+node verify-integrity.mjs --remote     # 再比对仓库最新版（列出新增/更新/移除）
+node verify-integrity.mjs --md         # Markdown 表格（贴 issue / 回复用）
+node verify-integrity.mjs --json       # 机器可读
+```
+
+或在 DSH 里直接说「**检查一下 SD 插件少了什么文件**」→ 模型调 `sd_integrity` 工具，回你一张排好版的表：
+
+| 状态 | 文件 | 分类 | 大小 | 影响 |
+|------|------|------|------|------|
+| ✗ 必需 | `sd-mask-qa.py` | runtime | 6737B | 插件无法运行 |
+| △ 辅助 | `test-vram-release.ps1` | tool | 3441B | 该功能不可用 |
+| · 可选 | `CHANGELOG.md` | doc | 123626B | 不影响运行 |
+
+分类决定严重度（`runtime` / `tool` / `doc`·`dev`·`ci`），不搞一刀切——npm 包装不上 dev/doc 是正常的，只有 `runtime` 缺失才是真告警。
+
+**自动触发点**：插件启动时跑一次（缺必需文件记醒目告警）；退出时再跑一次并落盘 `~/.dsh-sd-bridge/integrity-report.{json,md}`。
+
+**发布者侧**：`node gen-manifest.mjs` 生成基线，`--check` 校验是否过期（CI 用）；`prepublishOnly` 已挂自动生成 + 校验。
+
+### ② 手绘蒙版（新功能）
+
+C 档参数表「蒙版」下拉新增 **`手动绘制（鼠标涂抹）`**（紧跟「自动」之后）——选中即弹出参考图，鼠标涂出要重绘的区域：
+
+| 操作 | 效果 |
+|------|------|
+| 左键拖动 | 涂抹要重绘的区域（笔迹显示为半透明红） |
+| 右键拖动 | 擦除 |
+| 滚轮 | 调笔刷大小（6–200 px，标题栏实时显示） |
+| `C` 键 / 清空 | 清空全部笔迹 |
+| `Enter` / 确定 | 保存蒙版并出图 |
+| `Esc` / 取消 | 放弃，**回退自动蒙版**（不静默重画整张） |
+
+画布最长边压到 900 px 保证不卡，保存时按**参考图原始尺寸**还原（蒙版与 SD 目标尺寸对齐）。手绘优先级最高，不会被自动抠图/替换目标推断覆盖。
+
+### ③ C 档违禁词注入表单（技术测试链）
+
+`sd_inject` 新增 `violationPrompts` / `suggestedPrompts` 参数，脚本侧新增 `-ViolationPrompts` / `-SuggestedPrompts`，分别预填进参数表单第一个框（正向）与第二个框（负向）。五层防线防漏传：schema `required` → `execute()` 抛错 → hint 告警 → 命令拼参 → 启动器传参。
+
+### ④ 真机故障修复
+
+- **`sd-inject.ps1` 缺 UTF-8 BOM → PS 5.1 按 GBK 读中文语法错**。三份脚本统一补 BOM，`parse errors = 0`。
+- **SD 后端 500（`Expected all tensors to be on the same device, but found cpu and cuda:0`）**：8G 卡上 `qwen3-vl:8b` 常驻 5.05G，SD 再要 4-5G → CLIP 编码器部分层被挤到 CPU，张量设备不一致直接崩。卸载常驻模型后 275MiB → 6731MiB 空闲。
+- **SD 重启后 CLIP tokenizer 联网超时**：本地缓存本是完整的，但没设 `HF_HOME` 跑去拉 huggingface.co 超时。带上 `HF_HOME` + `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` → **9 秒就绪**（原来 57 秒）。
+
+---
+
+## 版本更新内容（v1.0.0 · 2026-10-16）
 
 **首个正式版。其中「C 档选项表」按用户要求做了调整：画风不再列在里面。**
 
@@ -480,6 +536,7 @@ powershell -ExecutionPolicy Bypass -File "插件目录\install-sd.ps1"
 | `sd_inject` | **C 档专用**：只生成 `sd-inject.ps1` 的本地调用命令并（`run: true` 时）在你本机拉起脚本窗口，**绝不生成图片**（`generatesImage` 恒为 false） |
 | `sd_models` | 列出 checkpoints / LoRA / 采样器 / VAE / 当前选项 |
 | `sd_server` | `status` / `start` / `stop`；找不到 SD 时 `status` 返回安装指引 |
+| `sd_integrity` | **完整性检测**：反向比对本机文件与随包 `manifest.json`，列出缺失（按必需/辅助/文档分级）、被修改、清单外新增；`checkRemote: true` 时再拉仓库最新清单，列出新版本新增/更新/移除的文件。返回排好版的中文 Markdown 表格，原样贴给用户即可 |
 
 ### 保存与命名
 

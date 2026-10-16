@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.0.1（完整性检测 + 手绘蒙版 + C 档参数注入 · 2026-10-16）
+
+本轮三件事：**别人下载后能自查缺什么**、**蒙版可以鼠标手绘**、**C 档违禁词能注入表单**。
+
+### ① 文件完整性检测（新功能）
+
+别人从 npm / GitHub 拿到插件后，不再只能靠「跑一下看看报不报错」判断包是否完整——
+现在有**基线清单 + 反向比对**：
+
+- **`manifest.json`**（新增）：38 个文件的基线清单，逐文件记 `sha256 / bytes / category / shipped`。
+  分类决定缺失的严重度：`runtime`（✗ 必需，缺了插件跑不起来）/ `tool`（△ 辅助，该功能不可用）/
+  `doc`·`dev`·`ci`（· 可选，不影响运行）——不搞一刀切，避免 dev/doc 本来就不全时报一堆假错误。
+- **`gen-manifest.mjs`**（新增）：`node gen-manifest.mjs` 生成基线；`--check` 只校验（CI 用，清单过期退出码非 0）。
+- **`verify-integrity.mjs`**（新增）：独立检测脚本，终端彩色表格 / `--json` / `--md` / `--remote`。
+  退出码 `0` 完好、`2` 缺必需文件、`3` 检测本身失败。
+- **`sd_integrity` 工具**（新增，插件内）：跑检测并把排好版的中文表格交给模型贴给用户。
+  按需联网拉 GitHub 上的最新 `manifest.json`（`main`/`master` 双分支兜底 + 12 秒超时，离线自动降级只做本机比对），
+  列出**新版本新增了什么、哪些文件更新了、哪些已被仓库移除**。
+- **启动自检**：插件 apply 时跑一次，缺 `runtime` 文件立即记醒目告警；
+  **退出自检**：卸载时再跑一次并落盘 `~/.dsh-sd-bridge/integrity-report.{json,md}`，用户事后也能看。
+- 全程异步 + 静默失败：检测绝不把插件主流程拖崩。
+
+### ② 手绘蒙版（新功能）
+
+C 档参数表「蒙版」下拉新增 **`手动绘制（鼠标涂抹）`**（紧跟「自动」之后）——选中即弹出手绘窗口：
+
+| 操作 | 效果 |
+| --- | --- |
+| 左键拖动 | 涂抹要重绘的区域（笔迹显示为半透明红） |
+| 右键拖动 | 擦除 |
+| 滚轮 | 调笔刷大小（6–200 px，标题栏实时显示） |
+| `C` 键 / 清空 | 清空全部笔迹 |
+| `Enter` / 确定 | 保存蒙版并出图 |
+| `Esc` / 取消 | 放弃，**回退自动蒙版**（不静默重画整张） |
+
+实现要点：画布最长边压到 900 px 保证不卡（保存时按**参考图原始尺寸**用 NearestNeighbor 还原，蒙版与 SD 目标尺寸对齐）；
+显示用 `ColorMatrix` 一次 `DrawImage` 完成（避免 900×900 逐像素 `GetPixel`）；
+常驻位图复用（不每次涂抹新建 Bitmap）；两点间线性插值补点（快速拖动不断线）。
+决策树里手绘**优先级最高**，不被「自动抠图 / 替换目标推断」覆盖。
+
+### ③ C 档违禁词注入表单（技术测试链）
+
+`sd_inject` 新增 `violationPrompts` / `suggestedPrompts` 参数，脚本侧新增 `-ViolationPrompts` / `-SuggestedPrompts`，
+分别预填进参数表单**第一个框（正向）**与**第二个框（负向）**。为防漏传导致静默失效，加了五层防线：
+
+| 层 | 机制 |
+| --- | --- |
+| L1 | schema `required: ['violationPrompts','suggestedPrompts']` |
+| L2 | `execute()` 开头 `throw`——两个都空直接中断，报错信息告诉模型怎么补 |
+| L3 | `hint` 里 `⚠️ 漏传参数：…` 告警（只传一个时同轮补调） |
+| L4 | 命令 `parts` 拼 `-ViolationPrompts` / `-SuggestedPrompts` |
+| L5 | 启动器 `paramPairs` 同步进 `$p` 数组 |
+
+### ④ 真机故障修复（本轮实测踩到）
+
+- **`sd-inject.ps1` 缺 UTF-8 BOM 导致 PS 5.1 按 GBK 读中文 → 语法错**（`Try 语句缺少 Catch`、
+  `表达式或语句中包含意外的标记`）。三份脚本统一补 BOM，`parse errors = 0`。
+- **SD 后端 500（`Expected all tensors to be on the same device, but found cpu and cuda:0`）**：
+  8G 卡上 `qwen3-vl:8b` 常驻占 5.05G，SD 再要 4-5G → CLIP 文本编码器部分层被挤到 CPU，
+  张量设备不一致直接崩。卸载常驻模型后显存 275MiB → 6731MiB 空闲，出图恢复。
+- **SD 重启后 CLIP tokenizer 联网超时**：本地缓存（`<SD>\.cache\huggingface`）本是完整的，
+  但没设 `HF_HOME` 就跑去 `huggingface.co` 拉 → 连接超时 ×5 重试 ×3 轮。
+  启动时带 `HF_HOME` + `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` → **9 秒就绪**（原来 57 秒）。
+
+### ⑤ 插件管理页开关（前序 PR 延续）
+
+插件内注册 HTTP 端点 `/api/sd-bridge-setting`（GET 读 / POST 写 `finalVisualReview`），
+配合前端注入脚本在插件详情页渲染「最后视觉审验」开关。
+
+**回归**：`node gen-manifest.mjs --check` 通过；`node verify-integrity.mjs` 本机比对 38/38 完好；
+三份拷贝（主目录 / release / profile 加载副本）`sd-bridge.js` SHA256 一致；PS 5.1 `parse errors = 0`。
+
 ## 1.0.0（首个正式版 · 2026-10-16）
 
 把 0.9.14 之后这一整轮真机修复收拢成正式版。**C 档（`sd_inject` → `sd-inject.ps1`）从「能出图」变成「可复现、可自查、失败有话说」**：

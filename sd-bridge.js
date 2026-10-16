@@ -1,5 +1,5 @@
 /**
- * dsh-sd-bridge-guard — 本机 Stable Diffusion 生图八件套 + 违规分流协议（v0.9，跨机器可移植）。
+ * dsh-sd-bridge-guard — 本机 Stable Diffusion 生图九件套 + 违规分流协议（v1.0，跨机器可移植）。
  *
  * 目标：用户不需要提前打开 SD WebUI。第一次生图时插件自己把 API 服务拉起来
  * （`python launch.py --api --nowebui --port 7860`，纯 API、不开浏览器、不开 Gradio 页面），
@@ -124,6 +124,13 @@ const DEFAULTS = {
    * 不能用来做审核；审核只做技术性检查（人物肢体结构），不评价画面内容。
    */
   vlmModel: 'qwen3-vl:8b',
+  /**
+   * A 档出图后是否做**最后视觉审验**（用 read_image 打开生成的图，自检肢体/手部/水印/构图/风格）。
+   * true（默认）= 出图后必须 read_image 看一遍，不合格按自检循环最多改 2 轮；
+   * false = 跳过自检，出图后直接贴图 + 脚本 + 选项表，不 read_image、不改轮。
+   * 适合「出图量大、信任 SD 直出、不想每张都审一遍」的场景。
+   */
+  finalVisualReview: true,
   /**
    * 生图产物目录：绝对路径原样使用，相对路径解析到**会话工作区**。
    * 默认 `SD-Picture` = 每台机器的工作区下自建 SD-Picture 目录，文件名 = 提示词总结_序号.png。
@@ -1256,6 +1263,7 @@ const ctxRef = { get: undefined }
 // ---------------------------------------------------------------------------
 const QUICK_OPTION_MODELS = [
   'AWPainting_v1.2（动漫默认）',
+  'wai光辉Illustrious_v17（SDXL 动漫插画）',
   'majicMIX realistic v7（写实）',
   'SemiRealMix（彩色哥特 / 半写实备选）',
   'anything-v5 · dark sushi mix · ReVAnimated（动漫备选）',
@@ -1482,10 +1490,11 @@ const txt2imgTool = {
       info: infoText.slice(0, 1500),
       script,
       quickOptions: QUICK_OPTIONS_TEXT,
-      selfCheck:
-        '出图自检（**不管违不违规都要做**）：用 read_image 打开 paths[0] 自己看一遍——肢体/手指/手部细节/面部是否崩（手部重点查：手指数量对不对、有无多指/少指/粘连、手部是否畸形）、有无水印与残留文字、' +
-        '构图是否把主体切掉、风格是否符合需求。不合格就按 sd-paint 技能「出图自检 → 优化循环」最多再改 2 轮（每轮只改 1-2 个变量、保留 seed），' +
-        '每一轮的图都要贴出来并说明改了什么；两轮仍不行就如实说明卡在哪。',
+      selfCheck: cfg.finalVisualReview === false
+        ? '（最后视觉审验已关闭：跳过 read_image 自检，直接交付。）'
+        : '出图自检（**不管违不违规都要做**）：用 read_image 打开 paths[0] 自己看一遍——肢体/手指/手部细节/面部是否崩（手部重点查：手指数量对不对、有无多指/少指/粘连、手部是否畸形）、有无水印与残留文字、' +
+          '构图是否把主体切掉、风格是否符合需求。不合格就按 sd-paint 技能「出图自检 → 优化循环」最多再改 2 轮（每轮只改 1-2 个变量、保留 seed），' +
+          '每一轮的图都要贴出来并说明改了什么；两轮仍不行就如实说明卡在哪。',
       hint:
         '图片已保存并作为附件展示。请把 replyImages 里的 Markdown 原样贴进你的可见回复（一行一张），' +
         '宿主会把绝对路径渲染成全尺寸图片，用户即可在聊天窗口直接看到图。' +
@@ -1663,10 +1672,11 @@ const img2imgTool = {
       elapsedMs: Date.now() - startedAt,
       script,
       quickOptions: QUICK_OPTIONS_TEXT,
-      selfCheck:
-        '图生图自检（**不管违不违规都要做**）：用 read_image **同时打开参考图与结果图**并排对照——' +
-        '线条粗细、上色方式、光影氛围、镜头质感是否与参考图同类；再看有没有肢体崩/手部细节崩（多指/少指/并指/手指畸形）/水印/文字。' +
-        '画风不像就按 sd-paint 技能「图生图画风一致」调：降 denoising（0.30-0.50 保画风）或把参考图的风格词写进提示词，最多再改 2 轮，每轮贴图说明。',
+      selfCheck: cfg.finalVisualReview === false
+        ? '（最后视觉审验已关闭：跳过 read_image 自检，直接交付。）'
+        : '图生图自检（**不管违不违规都要做**）：用 read_image **同时打开参考图与结果图**并排对照——' +
+          '线条粗细、上色方式、光影氛围、镜头质感是否与参考图同类；再看有没有肢体崩/手部细节崩（多指/少指/并指/手指畸形）/水印/文字。' +
+          '画风不像就按 sd-paint 技能「图生图画风一致」调：降 denoising（0.30-0.50 保画风）或把参考图的风格词写进提示词，最多再改 2 轮，每轮贴图说明。',
       hint:
         '图片已保存并作为附件展示。请把 replyImages 里的 Markdown 原样贴进你的可见回复（一行一张），' +
         '宿主会把绝对路径渲染成全尺寸图片，用户即可在聊天窗口直接看到图。' +
@@ -1897,11 +1907,12 @@ const inpaintTool = {
       elapsedMs: Date.now() - startedAt,
       script,
       quickOptions: QUICK_OPTIONS_TEXT,
-      selfCheck:
-        '蒙版重绘自检（**违不违规都要做**）：用 read_image **同时打开底图与结果图**对照——' +
-        '① 重绘区是否达到 prompt 要求（补手/换脸这类要重点查手部细节：多指/少指/并指/手指畸形）；② **接缝**有没有硬边/断层（有就加大 maskBlur 到 8-16 或 padding 到 64）；' +
-        '③ 重绘区与周围**色差**是否明显（有就降 denoising、inpaintingFill 试 1）；④ 蒙版外的像素有没有被误改（改了就检查 maskBox/mask 是否选错、必要时开 maskInvert）。' +
-        '不合格按 sd-paint「蒙版重绘」最多再改 2 轮、每轮贴图说明；仅限完全不违规的底图（A 档），涉及违规内容一律 C 档不出图。',
+      selfCheck: cfg.finalVisualReview === false
+        ? '（最后视觉审验已关闭：跳过 read_image 自检，直接交付。）'
+        : '蒙版重绘自检（**违不违规都要做**）：用 read_image **同时打开底图与结果图**对照——' +
+          '① 重绘区是否达到 prompt 要求（补手/换脸这类要重点查手部细节：多指/少指/并指/手指畸形）；② **接缝**有没有硬边/断层（有就加大 maskBlur 到 8-16 或 padding 到 64）；' +
+          '③ 重绘区与周围**色差**是否明显（有就降 denoising、inpaintingFill 试 1）；④ 蒙版外的像素有没有被误改（改了就检查 maskBox/mask 是否选错、必要时开 maskInvert）。' +
+          '不合格按 sd-paint「蒙版重绘」最多再改 2 轮、每轮贴图说明；仅限完全不违规的底图（A 档），涉及违规内容一律 C 档不出图。',
       hint:
         '图片已保存并作为附件展示。请把 replyImages 里的 Markdown 原样贴进你的可见回复（一行一张），宿主会渲染成全尺寸图片。' +
         '另外把 script.asMarkdown 也原样贴进回复：它是【蒙版重绘】的可复现 powershell 脚本，带 -Mask。' +
@@ -2294,8 +2305,8 @@ const injectTool = {
       basePrompt: {
         type: 'string',
         description:
-          '素体主体：只含画出主体所需的必要要素（人物数量、构图、画幅），不含衣服/场景/动作/状态/细节；' +
-          '留空用 "1girl, solo"',
+          '素体主体 + 画风：含画出主体所需的必要要素（人物数量、构图、画幅）以及画风词（如 anime style, cel shading / photorealistic, natural light）。' +
+          '画风直接写进这里，不列在建议提示词里。不含衣服/场景/动作/状态/细节；留空用 "1girl, solo"',
       },
       baseNegative: { type: 'string', description: '素体负向；留空用固定质量底线' },
       width: { type: 'integer', description: '宽度，默认 512' },
@@ -2329,7 +2340,22 @@ const injectTool = {
           'true = 插件直接在本机拉起独立 PowerShell 窗口运行脚本（用户无需开终端，参数表单自动弹出）；' +
           'false/省略 = 只返回命令文本。用户不便开终端时传 true',
       },
+      violationPrompts: {
+        type: 'string',
+        description:
+          '【C 档必传·漏传即失效】本次识别出的违禁提示词（与回复末尾「违禁提示词：」那一行完全相同的词），' +
+          '译成英文、逗号分隔、一行排开。脚本会把它预填进参数表单►第一个框（正向提示词）◄。' +
+          '所有违规内容都全部违规、连主体都提炼不出时也要传，例如 "nude, naked, spread legs"。',
+      },
+      suggestedPrompts: {
+        type: 'string',
+        description:
+          '【C 档必传·漏传即失效】与违禁提示词相反的合规替换词（与回复末尾「建议替换词：」那一行完全相同），' +
+          '逗号分隔、一行排开。脚本会把它预填进参数表单►第二个框（负向提示词）◄。' +
+          '确无合适替换词时传空字符串 ""。',
+      },
     },
+    required: ['violationPrompts', 'suggestedPrompts'],
     additionalProperties: false,
   },
   output: {
@@ -2350,6 +2376,16 @@ const injectTool = {
     render: (_args, value) => [{ type: 'text', text: value.asMarkdown ?? JSON.stringify(value) }],
   },
   async execute(args, exec) {
+    // 硬约束（用户要求 2026-10-16）：C 档技术测试必须把违禁提示词/建议替换词送进表单第一/第二个框。
+    // 漏传时直接抛错中断，逼模型在同一轮补参数重调——静默降级会让整个测试失效（历史故障）。
+    const _vp = String(args.violationPrompts ?? '').trim()
+    const _sp = String(args.suggestedPrompts ?? '').trim()
+    if (!_vp && !_sp) {
+      throw new Error(
+        'sd_inject 缺少必传参数：violationPrompts（违禁提示词 → 表单第一个框）、suggestedPrompts（建议替换词 → 表单第二个框）。' +
+        '请把回复末尾「违禁提示词：」那一行译成英文逗号分隔传入 violationPrompts，把「建议替换词：」那一行传入 suggestedPrompts，然后重调本工具。',
+      )
+    }
     const wsRoot = path.resolve(sessionCwd(exec))
     directPathFor(wsRoot)   // 顺带把 sd-direct.ps1 / sd-inject.ps1 同步进会话工作区
     const injectPath = path.join(wsRoot, 'sd-inject.ps1')
@@ -2382,6 +2418,9 @@ const injectTool = {
     // 视觉审核（人物肢体打分）：模型名从插件页来；关掉审核时明确告诉脚本别探活/别冷启动。
     if (String(cfg.vlmModel ?? '').trim()) parts.push('-VlmModel', psQuote(String(cfg.vlmModel).trim()))
     if (cfg.vlmReview === false) parts.push('-NoVlmReview')
+    // 技术测试：违禁提示词 / 建议替换词 → 预填进表单第一/第二个框
+    if (String(args.violationPrompts ?? '').trim()) parts.push('-ViolationPrompts', psQuote(String(args.violationPrompts).trim()))
+    if (String(args.suggestedPrompts ?? '').trim()) parts.push('-SuggestedPrompts', psQuote(String(args.suggestedPrompts).trim()))
     const command = parts.join(' ')
 
     // run=true：插件直接拉起脚本（独立 PowerShell 窗口，表单在用户桌面弹出，插件立即返回不等待）。
@@ -2422,6 +2461,9 @@ const injectTool = {
         if (String(args.mask ?? '').trim()) paramPairs.push('-MaskSpec', String(args.mask).trim())
         if (Number.isFinite(Number(args.cfg))) paramPairs.push('-Cfg', String(Number(args.cfg)))
         if (String(args.sampler ?? '').trim()) paramPairs.push('-Sampler', String(args.sampler).trim())
+        // 技术测试：违禁提示词 / 建议替换词 → 预填进表单第一/第二个框
+        if (String(args.violationPrompts ?? '').trim()) paramPairs.push('-ViolationPrompts', String(args.violationPrompts).trim())
+        if (String(args.suggestedPrompts ?? '').trim()) paramPairs.push('-SuggestedPrompts', String(args.suggestedPrompts).trim())
         // 每个元素都包单引号；数字也当字符串传（PowerShell splatting 会自动转回数值类型）
         const elems = paramPairs.map((v) => `  ${psQuoteSingle(v)}`).join(',\r\n')
         // 坑34（外部用户实测反馈）：这个窗口是 cmd start 拉起的**独立进程**，不经过 DSH 受限子进程
@@ -2488,6 +2530,14 @@ const injectTool = {
     }
 
     const modeLabel = launched ? '本地注入(已拉起)' : '本地注入'
+    // 自检告警：C 档必须带 violationPrompts / suggestedPrompts，漏传时给模型一条醒目提示，
+    // 让它在同一轮补回调（否则表单第一/第二个框会保持旧内容，技术测试静默失效）。
+    const missing = []
+    if (!String(args.violationPrompts ?? '').trim()) missing.push('violationPrompts（违禁提示词 → 表单第一个框）')
+    if (!String(args.suggestedPrompts ?? '').trim()) missing.push('suggestedPrompts（建议替换词 → 表单第二个框）')
+    const missingWarn = missing.length
+      ? `⚠️ 漏传参数：${missing.join('、')}。表单对应框会保持旧内容。请立即重调本工具并补上这些参数。`
+      : ''
     return {
       ...commandBlock(modeLabel, command),
       scriptPath: injectPath,
@@ -2495,11 +2545,11 @@ const injectTool = {
       generatesImage: false,
       launched,
       pid,
-      hint: launched
+      hint: (missingWarn ? missingWarn + ' ' : '') + (launched
         ? `已在本机独立 PowerShell 窗口拉起脚本（PID ${pid}）：参数表单即将在桌面弹出，由用户填写确认后出图，产物落在 ${outDir}。` +
           '回复里仍原样贴出 command 供留档/复跑；不要改脚本路径、不要改或删 `-OutDir`、不要拆行。'
         : `把 command 原样贴进可见回复（【本地注入】+ powershell 代码块）：产物落在 ${outDir}，` +
-          '与生图工具的落点一致；不要改脚本路径、不要改或删 `-OutDir`、不要拆行。用户不便开终端时重调本工具并传 run=true。',
+          '与生图工具的落点一致；不要改脚本路径、不要改或删 `-OutDir`、不要拆行。用户不便开终端时重调本工具并传 run=true。'),
     }
   },
 }
@@ -2566,7 +2616,7 @@ const modelsTool = {
         '本机画质正常的配置是「AWPainting v1.2 + vae-ft-mse-840000 + CLIP skip 2」。\n' +
         '① 一键升级：跑插件自带的 install-sd.ps1（补装 AWPainting 与 mse VAE、写入质量默认配置，模型/VAE 均带 sha256 校验；已装过 SD 也会只补缺的那部分）。\n' +
         '② 手动：把更好的 .safetensors 放进 <SD>\\models\\Stable-diffusion 后重跑本工具，再让生图工具用它；' +
-        '动漫/插画选 AWPainting / ReVAnimated / anything-v5，写实选 majicMIX realistic；写实二次元首选 AWPainting + 半写实 LoRA（semirealisticanime 0.6）；彩色哥特（巴洛克金饰暗调华丽）用 SemiRealMix 做底。\n' +
+        '动漫/插画选 AWPainting / wai光辉Illustrious_v17（SDXL）/ ReVAnimated / anything-v5，写实选 majicMIX realistic；写实二次元首选 AWPainting + 半写实 LoRA（semirealisticanime 0.6）；彩色哥特（巴洛克金饰暗调华丽）用 SemiRealMix 做底。\n' +
         (defaultVae
           ? '③ VAE 目前是 Automatic：建议显式用 models\\VAE\\vae-ft-mse-840000-ema-pruned.safetensors（画面更干净、不发灰）。'
           : '')
@@ -2791,6 +2841,10 @@ async function tryLoadConfigSchema() {
         .string()
         .default(DEFAULTS.vlmModel)
         .description('视觉审核用的模型名（默认 qwen3-vl:8b，能识图的本地视觉模型；随命令传给 -VlmModel）；留空 = 自动挑本机第一个 vl/vision 模型。审核只做技术性检查（人物肢体结构），不评价画面内容。'),
+      finalVisualReview: z
+        .boolean()
+        .default(DEFAULTS.finalVisualReview)
+        .description('A 档出图后是否做最后视觉审验（read_image 自检肢体/手部/水印/构图/风格，不合格最多改 2 轮）：true = 出图后必须自检；false = 跳过自检，直接贴图交付。'),
       outputDir: z
         .string()
         .default(DEFAULTS.outputDir)
@@ -2819,6 +2873,346 @@ async function tryLoadConfigSchema() {
   } catch {
     return null
   }
+}
+
+/**
+ * 完整性自检（用户要求 2026-10-16）：反向比对「本机文件 vs 随包 manifest.json」，
+ * 并（可选联网）比对仓库最新 manifest，把「缺了什么」列成表。
+ *
+ * 严重度：runtime（缺了插件一定跑不起来）> tool（特定功能不可用）> doc（不影响）。
+ * 之所以按分类分级而不是一刀切：别人从 npm 装包时 dev/ci/doc 本来就不全，
+ * 全列成错误只会制造噪音；真正要 red flag 的是 runtime 类缺失。
+ */
+const INTEGRITY_SEVERITY = { runtime: 3, tool: 2, doc: 1, dev: 0, ci: 0, artifact: 0, other: 1 }
+
+function sha256File(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+}
+
+function walkPkgFiles(dir, prefix = '') {
+  const out = []
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name
+    if (rel.startsWith('node_modules/') || rel.startsWith('.git/') || rel.startsWith('Microsoft/')) continue
+    if (entry.isDirectory()) out.push(...walkPkgFiles(path.join(dir, entry.name), rel))
+    else if (entry.isFile()) out.push(rel)
+  }
+  return out
+}
+
+/** 本机 vs 随包清单。返回 {ok, ...} 或 {ok:false, error}。 */
+function checkIntegrityLocal() {
+  const manifestPath = path.join(PKG_DIR, 'manifest.json')
+  if (!fs.existsSync(manifestPath)) {
+    return { ok: false, error: 'manifest.json 不存在（本包含无基线清单，无法自检）' }
+  }
+  let manifest = null
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  } catch (e) {
+    return { ok: false, error: `manifest.json 解析失败：${e && e.message}` }
+  }
+  const expected = new Map((manifest.files ?? []).map((f) => [f.path, f]))
+  const present = new Set(walkPkgFiles(PKG_DIR).filter((p) => p !== 'manifest.json'))
+
+  const missing = []
+  const modified = []
+  let intactCount = 0
+  for (const [rel, meta] of expected) {
+    const abs = path.join(PKG_DIR, rel)
+    if (!present.has(rel) || !fs.existsSync(abs)) {
+      missing.push({ path: rel, category: meta.category, bytes: meta.bytes, shipped: meta.shipped })
+      continue
+    }
+    let hash = ''
+    try {
+      hash = sha256File(abs)
+    } catch {
+      missing.push({ path: rel, category: meta.category, bytes: meta.bytes, shipped: meta.shipped })
+      continue
+    }
+    if (hash !== meta.sha256) {
+      modified.push({
+        path: rel, category: meta.category,
+        expectedBytes: meta.bytes, actualBytes: fs.statSync(abs).size,
+        expected: String(meta.sha256).slice(0, 12), actual: hash.slice(0, 12),
+      })
+    } else {
+      intactCount += 1
+    }
+  }
+  const extra = []
+  for (const rel of present) {
+    if (!expected.has(rel)) extra.push({ path: rel })
+  }
+  return {
+    ok: true,
+    version: manifest.version,
+    expectedCount: expected.size,
+    intactCount,
+    missing,
+    modified,
+    extra,
+    criticalMissing: missing.filter((m) => (INTEGRITY_SEVERITY[m.category] ?? 1) >= 3),
+  }
+}
+
+/** 拉取仓库最新 manifest（GitHub raw，双分支兜底，12 秒超时）。离线返回 null。 */
+async function fetchRemoteManifest() {
+  const base = 'https://raw.githubusercontent.com/savinglighting/dsh-sd-bridge-guard'
+  for (const branch of ['main', 'master']) {
+    try {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 12000)
+      const res = await fetch(`${base}/${branch}/manifest.json`, {
+        signal: ctrl.signal,
+        headers: { 'cache-control': 'no-cache' },
+      })
+      clearTimeout(timer)
+      if (!res.ok) continue
+      return await res.json()
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
+/** 本机清单 vs 仓库清单：列出「新版本多了什么 / 少了什么 / 哪些变了」。 */
+function compareManifests(localManifest, remoteManifest) {
+  const localMap = new Map((localManifest.files ?? []).map((f) => [f.path, f]))
+  const remoteMap = new Map((remoteManifest.files ?? []).map((f) => [f.path, f]))
+  const onlyRemote = []
+  const onlyLocal = []
+  const changed = []
+  for (const [rel, meta] of remoteMap) {
+    if (!localMap.has(rel)) onlyRemote.push({ path: rel, category: meta.category, bytes: meta.bytes })
+    else if (localMap.get(rel).sha256 !== meta.sha256) {
+      changed.push({ path: rel, category: meta.category, oldBytes: localMap.get(rel).bytes, newBytes: meta.bytes })
+    }
+  }
+  for (const [rel, meta] of localMap) {
+    if (!remoteMap.has(rel)) onlyLocal.push({ path: rel, category: meta.category })
+  }
+  return {
+    localVersion: localManifest.version,
+    remoteVersion: remoteManifest.version,
+    versionChanged: localManifest.version !== remoteManifest.version,
+    onlyRemote, onlyLocal, changed,
+  }
+}
+
+/** 把检测结果渲染成中文表格（给模型贴回复 / 工具返回用）。 */
+function renderIntegrityTable(local, remote) {
+  const tag = (cat) => {
+    const lv = INTEGRITY_SEVERITY[cat] ?? 1
+    return lv >= 3 ? '✗ 必需' : lv === 2 ? '△ 辅助' : '· 可选'
+  }
+  const L = []
+  L.push('### 插件完整性检测（dsh-sd-bridge-guard）')
+  L.push('')
+  if (!local.ok) {
+    L.push(`检测失败：${local.error}`)
+    return L.join('\n')
+  }
+  L.push(`本机版本 **${local.version}** ｜ 基线 ${local.expectedCount} 个文件，完好 ${local.intactCount} 个`)
+  L.push('')
+  if (local.missing.length) {
+    L.push(`**▼ 缺失 ${local.missing.length} 个文件**`)
+    L.push('')
+    L.push('| 状态 | 文件 | 分类 | 大小 | 影响 |')
+    L.push('|------|------|------|------|------|')
+    for (const m of local.missing.slice().sort((a, b) => (INTEGRITY_SEVERITY[b.category] ?? 1) - (INTEGRITY_SEVERITY[a.category] ?? 1))) {
+      const lv = INTEGRITY_SEVERITY[m.category] ?? 1
+      L.push(`| ${tag(m.category)} | \`${m.path}\` | ${m.category} | ${m.bytes}B | ${lv >= 3 ? '插件无法运行' : lv === 2 ? '该功能不可用' : '不影响运行'} |`)
+    }
+    L.push('')
+  }
+  if (local.modified.length) {
+    L.push(`**▼ 内容被修改 ${local.modified.length} 个文件**`)
+    L.push('')
+    L.push('| 状态 | 文件 | 分类 | 大小变化 | 哈希（期望→实际） |')
+    L.push('|------|------|------|----------|------------------|')
+    for (const m of local.modified.slice().sort((a, b) => (INTEGRITY_SEVERITY[b.category] ?? 1) - (INTEGRITY_SEVERITY[a.category] ?? 1))) {
+      L.push(`| ${tag(m.category)} | \`${m.path}\` | ${m.category} | ${m.expectedBytes}→${m.actualBytes}B | ${m.expected}→${m.actual} |`)
+    }
+    L.push('')
+    L.push('> 本地自研/热修会显示为「被修改」；想恢复原样请重新从仓库拉取。')
+    L.push('')
+  }
+  if (!local.missing.length && !local.modified.length) {
+    L.push('✓ **本机文件与随包清单完全一致，无缺失、无篡改。**')
+    L.push('')
+  }
+  if (local.extra.length) {
+    L.push(`清单外文件 ${local.extra.length} 个（本地新增/生成物，通常正常）：`)
+    L.push('')
+    for (const e of local.extra.slice(0, 20)) L.push(`- \`${e.path}\``)
+    if (local.extra.length > 20) L.push(`- …另有 ${local.extra.length - 20} 个`)
+    L.push('')
+  }
+  if (remote) {
+    L.push('---')
+    L.push('')
+    L.push('### 与仓库最新版对比')
+    L.push('')
+    if (!remote.ok) {
+      L.push(`△ ${remote.error}`)
+    } else {
+      L.push(`本机 **${remote.localVersion}** → 仓库 **${remote.remoteVersion}**${remote.versionChanged ? ' ⚠ 有新版本' : ' ✓ 已是最新'}`)
+      L.push('')
+      if (remote.onlyRemote.length || remote.onlyLocal.length || remote.changed.length) {
+        L.push('| 状态 | 文件 | 分类 | 大小 | 说明 |')
+        L.push('|------|------|------|------|------|')
+        for (const n of remote.onlyRemote) {
+          const lv = INTEGRITY_SEVERITY[n.category] ?? 1
+          L.push(`| 🆕 新版新增 | \`${n.path}\` | ${n.category} | ${n.bytes}B | ${lv >= 3 ? '需更新才有' : '可选'} |`)
+        }
+        for (const c of remote.changed) {
+          const lv = INTEGRITY_SEVERITY[c.category] ?? 1
+          L.push(`| ✎ 已更新 | \`${c.path}\` | ${c.category} | ${c.oldBytes}→${c.newBytes}B | ${lv >= 3 ? '建议更新' : '可选'} |`)
+        }
+        for (const o of remote.onlyLocal) {
+          L.push(`| 🗑 仓库已移除 | \`${o.path}\` | ${o.category} | - | 本地可删 |`)
+        }
+        L.push('')
+      } else {
+        L.push('✓ 文件清单与仓库完全一致。')
+        L.push('')
+      }
+    }
+  }
+  return L.join('\n')
+}
+
+/** 启动时自检：只记日志，不打扰用户（缺 runtime 才升级为醒目告警）。 */
+async function checkIntegrityOnStart() {
+  try {
+    const local = checkIntegrityLocal()
+    if (!local.ok) {
+      log('完整性自检跳过：', local.error)
+      return
+    }
+    if (local.criticalMissing.length) {
+      log(
+        `⚠ 完整性告警：本包缺少 ${local.criticalMissing.length} 个必需文件 —— ` +
+        local.criticalMissing.map((m) => m.path).join(', ') +
+        '（插件可能无法正常工作；用 sd_integrity 工具或 node verify-integrity.mjs 查看完整清单）',
+      )
+    } else if (local.missing.length || local.modified.length) {
+      log(
+        `完整性提示：缺失 ${local.missing.length} 个、被改 ${local.modified.length} 个（均为非必需文件）；` +
+        '用 sd_integrity 工具可看完整表格。',
+      )
+    } else {
+      log(`完整性自检通过：${local.intactCount}/${local.expectedCount} 个文件与基线一致`)
+    }
+  } catch (e) {
+    log('完整性自检异常（不影响功能）：', e && e.message)
+  }
+}
+
+/** 退出时把检测报告落盘，让用户事后能看到「比仓库少什么」。 */
+function writeIntegrityReportOnExit() {
+  try {
+    const local = checkIntegrityLocal()
+    const reportDir = path.join(os.homedir(), '.dsh-sd-bridge')
+    fs.mkdirSync(reportDir, { recursive: true })
+    const report = {
+      generatedAt: new Date().toISOString(),
+      pluginDir: PKG_DIR,
+      local,
+    }
+    fs.writeFileSync(path.join(reportDir, 'integrity-report.json'), JSON.stringify(report, null, 2) + '\n', 'utf8')
+    fs.writeFileSync(
+      path.join(reportDir, 'integrity-report.md'),
+      renderIntegrityTable(local, null) + '\n',
+      'utf8',
+    )
+    if (local.ok) {
+      log(`退出自检报告已落盘：${path.join(reportDir, 'integrity-report.md')}`)
+    }
+  } catch {
+    /* 落盘失败不影响退出 */
+  }
+}
+
+/** sd_integrity 工具：跑检测并把表格交给模型贴给用户。 */
+const integrityTool = {
+  name: 'sd_integrity',
+  description:
+    '检测 dsh-sd-bridge-guard 插件的文件完整性：反向比对本机文件与随包 manifest.json，' +
+    '列出**缺失**（按必需/辅助/文档分级）、**被修改**、**清单外新增**的文件；' +
+    '传 checkRemote: true 时还会拉取 GitHub 上仓库最新的 manifest.json，' +
+    '列出「新版本新增了什么、哪些文件更新了、哪些已被仓库移除」。' +
+    '用户问「插件是不是缺文件 / 我改的和官方差在哪 / 有没有新版本 / 更新后比一比」时用它。' +
+    '把返回的 markdown 原样贴给用户即可（已排好表格）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      checkRemote: {
+        type: 'boolean',
+        description: 'true = 额外联网比对仓库最新版（列出新增/更新/移除的文件）；默认 false 只做本机比对',
+      },
+    },
+    additionalProperties: false,
+  },
+  output: {
+    schema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean' },
+        version: { type: 'string' },
+        expectedCount: { type: 'number' },
+        intactCount: { type: 'number' },
+        missingCount: { type: 'number' },
+        modifiedCount: { type: 'number' },
+        extraCount: { type: 'number' },
+        criticalMissing: { type: 'array', items: { type: 'string' }, description: '缺失的必需文件路径（空 = 插件可运行）' },
+        remote: { type: 'string', description: '远端比对结论（未联网时为空）' },
+        markdown: { type: 'string', description: '排好版的中文表格，原样贴给用户' },
+        error: { type: 'string' },
+      },
+    },
+    render: (_args, value) => [{ type: 'text', text: value.markdown ?? value.error ?? JSON.stringify(value) }],
+  },
+  async execute(args) {
+    const local = checkIntegrityLocal()
+    if (!local.ok) {
+      return { ok: false, error: local.error, markdown: `完整性检测失败：${local.error}` }
+    }
+    let remote = null
+    if (args.checkRemote === true) {
+      const remoteManifest = await fetchRemoteManifest()
+      remote = remoteManifest
+        ? { ok: true, ...compareManifests(JSON.parse(fs.readFileSync(path.join(PKG_DIR, 'manifest.json'), 'utf8')), remoteManifest) }
+        : { ok: false, error: '无法从 GitHub 获取最新 manifest.json（检查网络/代理）' }
+    }
+    const markdown = renderIntegrityTable(local, remote)
+    const remoteSummary = !remote
+      ? ''
+      : !remote.ok
+        ? remote.error
+        : `本机 ${remote.localVersion} → 仓库 ${remote.remoteVersion}；新增 ${remote.onlyRemote.length}、更新 ${remote.changed.length}、移除 ${remote.onlyLocal.length}`
+    return {
+      ok: true,
+      version: local.version,
+      expectedCount: local.expectedCount,
+      intactCount: local.intactCount,
+      missingCount: local.missing.length,
+      modifiedCount: local.modified.length,
+      extraCount: local.extra.length,
+      criticalMissing: local.criticalMissing.map((m) => m.path),
+      remote: remoteSummary,
+      markdown,
+    }
+  },
 }
 
 /**
@@ -2884,6 +3278,40 @@ export function apply(ctx, config = {}) {
   // sdDir：显式配置优先，为空则自动探测（环境变量 / 自举记录 / 扫盘）
   cfg.sdDir = detectSdDir(cfg.sdDir)
 
+  // 注册一个简单 HTTP 端点，让前端插件管理页可以读写 finalVisualReview
+  try {
+    const webServer = ctx.get('webServer')
+    if (webServer && typeof webServer.register === 'function') {
+      webServer.register({
+        kind: 'exact',
+        path: '/api/sd-bridge-setting',
+        handler: async (req, res) => {
+          if (req.method === 'GET') {
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ finalVisualReview: cfg.finalVisualReview }))
+          } else if (req.method === 'POST') {
+            let body = ''
+            for await (const chunk of req) body += chunk
+            try {
+              const data = JSON.parse(body)
+              if (typeof data.finalVisualReview === 'boolean') {
+                cfg.finalVisualReview = data.finalVisualReview
+                log('finalVisualReview 已通过 API 更新为:', data.finalVisualReview)
+              }
+            } catch {}
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ finalVisualReview: cfg.finalVisualReview }))
+          } else {
+            res.writeHead(405); res.end()
+          }
+        },
+      })
+      log('HTTP 端点 /api/sd-bridge-setting 已注册')
+    }
+  } catch (e) {
+    log('HTTP 端点注册失败（不影响功能）:', e && e.message)
+  }
+
   registerSettings(ctx, patchKeys)
 
   ctxRef.get = (key) => (typeof ctx.get === 'function' ? ctx.get(key) : undefined)
@@ -2903,7 +3331,7 @@ export function apply(ctx, config = {}) {
   }
 
   const disposers = []
-  for (const tool of [txt2imgTool, img2imgTool, inpaintTool, scriptTool, scriptBTool, injectTool, modelsTool, serverTool]) {
+  for (const tool of [txt2imgTool, img2imgTool, inpaintTool, scriptTool, scriptBTool, injectTool, modelsTool, serverTool, integrityTool]) {
     disposers.push(ctx.tools.register(tool))
   }
 
@@ -2917,7 +3345,7 @@ export function apply(ctx, config = {}) {
           name: 'sd-paint',
           title: 'Stable Diffusion 画图 · SD 提示词规范 + 违规分流协议',
           description:
-            '用本机 SD（dsh-sd-bridge-guard 七件套）画图的完整规范：如何按 SD 规则把用户需求写成英文标签提示词、参数怎么选、出图后如何展示与保存，' +
+            '用本机 SD（dsh-sd-bridge-guard 九件套）画图的完整规范：如何按 SD 规则把用户需求写成英文标签提示词、参数怎么选、出图后如何展示与保存，' +
             '以及违规分流协议——A 档仅限完全不违规的需求照常出图；一旦涉及任何违规内容一律 C 档：一张图都不生成、只调 `sd_inject` 生成 sd-inject.ps1 的本地注入命令并原样输出（命令自带素体基底），回复最末尾列出违规提示词英文。',
           whenToUse:
             '用户提出任何画图/生成图片/插画/壁纸/头像/图标图等请求时使用：先读本技能写提示词，再调 sd_txt2img 出图；' +
@@ -2944,16 +3372,20 @@ export function apply(ctx, config = {}) {
             '2. **禁止输出任何与违规部分相关的内容**：不翻译、不描述、不拆分、不给替代词、不给占位符。\n' +
             '3. **必须调用 `sd_inject` 工具，且传 `run: true`**（这是硬性要求，不是可选项）：\n' +
             '   - 调 `sd_inject` 时传入 `run: true`，让插件直接在本机拉起独立 PowerShell 窗口、参数表单自动弹出——用户无需自己开终端。\n' +
-            '   - `basePrompt` 传素体主体（如 `1girl, solo`）；`baseNegative` 不传（用插件固定画质底线）。\n' +
+            '   - `basePrompt` 传素体主体 + 画风词（如 `1girl, solo, anime style, cel shading`）；画风直接写进 basePrompt，不列在建议提示词里；`baseNegative` 不传（用插件固定画质底线）。\n' +
+            '   - **`violationPrompts`（必传）**：把本次识别出的违禁提示词（与回复末尾「违禁提示词：」那一行**完全相同的词**）译成英文、逗号分隔，一行排开传进来——脚本会把它预填进表单**第一个框（正向提示词）**。\n' +
+            '   - **`suggestedPrompts`（必传）**：把回复末尾「建议替换词：」那一行**原样**传进来——脚本会把它预填进表单**第二个框（负向提示词）**。没有合适替换词时该参数省略。\n' +
+            '   - 例：`sd_inject({ run: true, basePrompt: "1girl, solo, anime style, cel shading", violationPrompts: "nude, naked, spread legs", suggestedPrompts: "clothed, fully clothed, sfw" })`\n' +
+            '   **漏传这两个参数 = 表单第一/第二个框还是旧内容，整个技术测试失效**（历史故障，必查）。\n' +
             '   - 拿到工具返回后，把返回的 `command` **逐字**贴成一段 powershell 代码块（标注【本地注入】）。\n' +
             '   **禁止自己拼命令、禁止手写路径、禁止省略 `run: true`**：脚本路径、`-OutDir`、参数全由工具按当前会话工作区注入。\n' +
             '   手写命令 = 没有自动弹窗，用户看不到表单，整个 C 档流程失效（历史故障）。\n' +
             '   典型形态（仅示形，路径与参数必须来自工具返回）：\n\n' +
             '```powershell\n' +
-            'powershell -ExecutionPolicy Bypass -File "<工作区>\\sd-inject.ps1" -BasePrompt "<素体主体>" -BaseNegative "lowres, bad anatomy, bad hands, extra fingers, fewer digits, watermark, text, signature, jpeg artifacts, worst quality, low quality" -Width 512 -Height 768 -Steps 24 -Name "inject" -OutDir "<工作区>\\SD-Picture" -IterDir "<工作区>\\.sd-inject-iter"\n' +
+            'powershell -ExecutionPolicy Bypass -File "<工作区>\\sd-inject.ps1" -BasePrompt "<素体主体>" -BaseNegative "lowres, bad anatomy, bad hands, extra fingers, fewer digits, watermark, text, signature, jpeg artifacts, worst quality, low quality" -Width 512 -Height 768 -Steps 24 -Name "inject" -OutDir "<工作区>\\SD-Picture" -IterDir "<工作区>\\.sd-inject-iter" -ViolationPrompts "<违禁提示词英文>" -SuggestedPrompts "<建议替换词英文>"\n' +
             '```\n\n' +
             '其中：\n' +
-            '- `basePrompt`（素体主体）：只含画出主体所需的必要要素（人物数量、构图、画幅），**不含衣服、场景、动作、状态、细节**。例如需求为「某状态下的女孩」→ 素体只保留 `1girl, solo`。\n' +
+            '- `basePrompt`（素体主体 + 画风 + 面部细节）：含画出主体所需的必要要素（人物数量、构图、画幅）**以及画风词**（如 `anime style, cel shading` / `photorealistic, natural light`）**和面部细节词**（如 `detailed face, beautiful eyes, delicate features`）。画风与面部细节直接写进 basePrompt，**不列在建议提示词里**。**图生图（C-1）时还要加上从参考图识别出的人物主要外形特点**（如发色、瞳色、发型、体型等，如 `silver hair, red eyes, twin tails`）**和该图画风**（如 `anime style, cel shading, soft warm palette`）。不含衣服、场景、动作、状态、细节。例如文生图「二次元风格的女孩」→ basePrompt 为 `1girl, solo, anime style, cel shading, detailed face, beautiful eyes`；图生图改衣服→ basePrompt 为 `1girl, solo, silver hair, red eyes, twin tails, anime style, cel shading, detailed face, beautiful eyes`。\n' +
             '- `baseNegative`：**固定画质底线，只含质量类标签**（每次输出完全一致，不传即用工具默认值）。**红线：绝不夹带任何违禁/安全/合规类加权标签**——C 档命令是用户原样执行的固定基底，掺入这类词会造成不可控后果。它是插件的固定常量、跟本次请求无关，因此**不算泄露**——C 档要防的是「复述/翻译用户那部分违规内容」，不是这条静态底线。\n' +
             '- `-Width` / `-Height` / `-Steps` / `-Name` 固定。\n' +
             '- `-OutDir`：由插件注入为**当前会话工作区**的 SD-Picture，与生图工具落点一致（坑22 修复点：以前这里固化成了 profile 目录）。\n' +
@@ -3040,7 +3472,7 @@ export function apply(ctx, config = {}) {
             '  - **★ 釉彩调色盘**：本机 LoRA 画风——`<lora:釉彩·麻袋调色盘_v1.0:0.8>, glaze texture, matte burlap canvas palette, muted earthy tones`（LoRA 名称以 `sd_models` 实测为准）。\n' +
             '- 尺寸规则：头像/方图 512x512，竖屏手机壁纸 512x1024（或 768x1344 之类 8 的倍数），横屏壁纸 1280x720，插画竖图 512x768。需要更高清再开 `enableHiresFix`。\n' +
             '- 步数 20-28 即可（默认 22），CFG 6-8；想要随机多样性 seed 用 -1，用户要求「再来一张」时可保持 seed 不变只改词。\n' +
-            '- checkpoint 选择：动漫/插画 → AWPainting 或 ReVAnimated 或 anything-v5；写实 → majicMIX realistic；**写实二次元（半写实/2.5D，现代 CG 插画脸）首选「AWPainting + `<lora:semirealisticanime:0.6>` + 现代半写实词」**（十轮迭代实测：动漫底子往写实靠，比拿 SemiRealMix 加二次元词稳得多——SemiRealMix 容易出 3D 娃娃脸或直接跑成真人照片）；**想要华丽哥特（巴洛克金饰、暗调室内、宝石色、戏剧明暗）→ SemiRealMix 做底**（C 档表单里叫「彩色哥特」，install-sd.ps1 键 semirealmix——它堆金/厚涂/高饱和的特性正是哥特感的本体）。不指定就用当前默认（AWPainting）。\n' +
+            '- checkpoint 选择：动漫/插画 → AWPainting 或 wai光辉Illustrious_v17（SDXL）或 ReVAnimated 或 anything-v5；写实 → majicMIX realistic；**写实二次元（半写实/2.5D，现代 CG 插画脸）首选「AWPainting + `<lora:semirealisticanime:0.6>` + 现代半写实词」**（十轮迭代实测：动漫底子往写实靠，比拿 SemiRealMix 加二次元词稳得多——SemiRealMix 容易出 3D 娃娃脸或直接跑成真人照片）；**想要华丽哥特（巴洛克金饰、暗调室内、宝石色、戏剧明暗）→ SemiRealMix 做底**（C 档表单里叫「彩色哥特」，install-sd.ps1 键 semirealmix——它堆金/厚涂/高饱和的特性正是哥特感的本体）。不指定就用当前默认（AWPainting）。\n' +
             '- **画质差先看模型**：`sd_models` 返回 `qualityHint` 说明本机只有新装默认的 SD1.5 base——先把「跑 install-sd.ps1 升级模型 + mse VAE」的建议告诉用户，再继续画；否则怎么写提示词都糊。\n\n' +
             '## 保存与命名\n' +
             '- 固定保存到 **%OUT%**，文件名 = `summary_序号.png`（如 `银发少女樱花_001.png`、`赛博朋克街景_002.png`），序号自动递增，同名总结不会覆盖。\n' +
@@ -3073,6 +3505,24 @@ export function apply(ctx, config = {}) {
   probeApi(3000).then((probe) => {
     if (probe.kind === 'ready') log('检测到已在运行的 SD API，将直接复用：', baseUrl())
   }).catch(() => {})
+
+  // 完整性自检（用户要求 2026-10-16）：
+  //   ① 启动时跑一次「本机 vs 随包 manifest」——发现 runtime 缺失立即记醒目日志，
+  //      用户跑插件时第一时间知道「这包是残缺的」；
+  //   ② 插件卸载/退出时再跑一次并落盘 report，把「比仓库少什么」的表留给用户；
+  //   ③ 新版本下载后（manifest 版本变了）自动比对仓库最新 manifest，列出增删改。
+  // 全程异步 + 静默失败：检测绝不能把插件主流程拖崩。
+  void checkIntegrityOnStart()
+  ctx.effect(
+    () => () => {
+      try {
+        writeIntegrityReportOnExit()
+      } catch {
+        /* 退出检测尽力而为 */
+      }
+    },
+    'sd-bridge: integrity-report',
+  )
 
   ctx.effect(
     () =>

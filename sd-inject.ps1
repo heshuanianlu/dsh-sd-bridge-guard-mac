@@ -56,7 +56,9 @@ param(
     [int]$VlmStartTimeout = 60,                       # 冷启动等待 Ollama 就绪的秒数（就绪后再等首次推理加载模型）
     [switch]$KeepWorkFiles,                            # 加 -KeepWorkFiles 则保留本次产生的中间图（预蒙版/命中率总览图），默认跑完自动清掉
     [switch]$NoAutoMask,                               # 加 -NoAutoMask 则不跑自动抠图（跳过 YOLO-World/SAM），只用几何区域蒙版（上半/下半/中间/四周）或你手填的框
-    [switch]$NoOpen                                   # 加 -NoOpen 则跑完不自动打开这张图
+    [switch]$NoOpen,                                  # 加 -NoOpen 则跑完不自动打开这张图
+    [string]$ViolationPrompts = "",                    # 技术测试用：C 档会话末尾的违禁提示词，预填进表单第一个框（正向提示词）
+    [string]$SuggestedPrompts = ""                     # 技术测试用：C 档会话末尾的建议替换词，预填进表单第二个框（负向提示词）
 )
 
 # 启动诊断日志已关闭（用户要求 2026-10-14）：不再写 sd-inject-start.log
@@ -358,7 +360,7 @@ function Get-AnimeCheckpoint {
     $cps = @($Checkpoints | Where-Object { $_ })
     $first = @($cps | Where-Object { $_ -match 'AWPainting|awpainting' } | Select-Object -First 1)
     if ($first.Count -gt 0) { return [string]$first[0] }
-    $second = @($cps | Where-Object { $_ -match 'anything|ReVAnimated|revanimated|dark\s*sushi|二次元|动漫|anime' } | Select-Object -First 1)
+    $second = @($cps | Where-Object { $_ -match 'anything|ReVAnimated|revanimated|dark\s*sushi|二次元|动漫|anime|光辉|Illustrious|illustrious' } | Select-Object -First 1)
     if ($second.Count -gt 0) { return [string]$second[0] }
     return ''
 }
@@ -610,6 +612,193 @@ function New-RegionMask {
         $bmp.Dispose()
         return $OutPath
     } catch { $bmp.Dispose(); return '' }
+}
+
+# ---- 手绘蒙版编辑器（用户要求 2026-10-16）：弹出参考图，鼠标涂抹要重绘的区域 ----
+# 交互：左键涂抹（白=重绘区）、右键擦除、滚轮调笔刷大小、C 清空、Enter/S 确定、Esc 取消。
+# 返回：保存好的蒙版 PNG 路径（白=重绘区）；用户取消或没有参考图时返回 ''。
+function Show-MaskPainter {
+    param([string]$ImagePath, [string]$OutPath)
+    if (-not $ImagePath -or -not (Test-Path -LiteralPath $ImagePath)) { return '' }
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Windows.Forms
+    try {
+        $src = [System.Drawing.Image]::FromFile($ImagePath)
+    } catch { return '' }
+
+    # 画布按参考图等比缩到最长边 900，避免大图卡顿（蒙版后续会被 SD 缩放到目标尺寸）
+    $maxSide = 900.0
+    $k = 1.0
+    if ($src.Width -gt $maxSide -or $src.Height -gt $maxSide) {
+        $k = [Math]::Min($maxSide / $src.Width, $maxSide / $src.Height)
+    }
+    $cw = [int][Math]::Max(64, [Math]::Round($src.Width * $k))
+    $ch = [int][Math]::Max(64, [Math]::Round($src.Height * $k))
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "手绘蒙版 — 左键涂抹要重绘的区域 / 右键擦除 / 滚轮调笔刷 / C 清空 / Enter 确定 / Esc 取消"
+    $form.ClientSize = New-Object System.Drawing.Size($cw, ($ch + 34))
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.StartPosition = 'CenterScreen'
+    $form.MaximizeBox = $false
+    $form.TopMost = $true
+
+    $canvas = New-Object System.Windows.Forms.PictureBox
+    $canvas.SetBounds(0, 0, $cw, $ch)
+    $canvas.SizeMode = 'Normal'
+    $canvas.BackColor = [System.Drawing.Color]::Black
+    $form.Controls.Add($canvas)
+
+    # 底图（缩放后）+ 蒙版图层（白笔迹）
+    $baseBmp = New-Object System.Drawing.Bitmap($cw, $ch)
+    $baseG = [System.Drawing.Graphics]::FromImage($baseBmp)
+    $baseG.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $baseG.DrawImage($src, 0, 0, $cw, $ch)
+    $baseG.Dispose()
+
+    $maskBmp = New-Object System.Drawing.Bitmap($cw, $ch)
+    $maskG = [System.Drawing.Graphics]::FromImage($maskBmp)
+    $maskG.Clear([System.Drawing.Color]::Black)
+    # 显示层：底图 + 半透明红（红 = 要重绘的区域）。复用同一张，避免每次涂抹新建 Bitmap 泄漏。
+    $dispBmp = New-Object System.Drawing.Bitmap($cw, $ch)
+    # ColorMatrix：mask 的黑 → 全透明（保留原图），mask 的白 → 半透明红（标出重绘区）
+    $redMatrix = New-Object System.Drawing.Imaging.ColorMatrix
+    $redMatrix.Matrix00 = 0; $redMatrix.Matrix01 = 0; $redMatrix.Matrix02 = 0; $redMatrix.Matrix03 = 0; $redMatrix.Matrix04 = 0
+    $redMatrix.Matrix10 = 0; $redMatrix.Matrix11 = 0; $redMatrix.Matrix12 = 0; $redMatrix.Matrix13 = 0; $redMatrix.Matrix14 = 0
+    $redMatrix.Matrix20 = 0; $redMatrix.Matrix21 = 0; $redMatrix.Matrix22 = 0; $redMatrix.Matrix23 = 0; $redMatrix.Matrix24 = 0
+    $redMatrix.Matrix30 = 0.62; $redMatrix.Matrix31 = 0.20; $redMatrix.Matrix32 = 0.20; $redMatrix.Matrix33 = 0; $redMatrix.Matrix34 = 0
+    $redMatrix.Matrix40 = 0; $redMatrix.Matrix41 = 0; $redMatrix.Matrix42 = 0; $redMatrix.Matrix43 = 0; $redMatrix.Matrix44 = 1
+    $redAttr = New-Object System.Drawing.Imaging.ImageAttributes
+    $redAttr.SetColorMatrix($redMatrix)
+
+    $script:brushSize = 30
+    $script:painting = $false
+    $script:erasing = $false
+    $script:lastPt = $null
+    $script:painted = $false
+
+    # 重绘显示层：底图 → 按 ColorMatrix 叠上 mask（白笔迹显示成半透明红）
+    $recompose = {
+        $g = [System.Drawing.Graphics]::FromImage($dispBmp)
+        $g.Clear([System.Drawing.Color]::Black)
+        $g.DrawImage($baseBmp, 0, 0, $cw, $ch)
+        $rect = New-Object System.Drawing.Rectangle(0, 0, $cw, $ch)
+        $g.DrawImage($maskBmp, $rect, 0, 0, $cw, $ch, [System.Drawing.GraphicsUnit]::Pixel, $redAttr)
+        $g.Dispose()
+        $canvas.Image = $dispBmp
+        $canvas.Invalidate()
+    }
+
+    $paintAt = {
+        param($x, $y, [bool]$erase)
+        $half = [int]($script:brushSize / 2)
+        $col = if ($erase) { [System.Drawing.Color]::Black } else { [System.Drawing.Color]::White }
+        $br = New-Object System.Drawing.SolidBrush($col)
+        $maskG.FillEllipse($br, ($x - $half), ($y - $half), $script:brushSize, $script:brushSize)
+        $br.Dispose()
+        if (-not $erase) { $script:painted = $true }
+        # 两点之间补插值，快速拖动不断线
+        if ($script:lastPt) {
+            $dx = $x - $script:lastPt.X; $dy = $y - $script:lastPt.Y
+            $dist = [Math]::Sqrt($dx * $dx + $dy * $dy)
+            $steps = [int]($dist / [Math]::Max(1, ($script:brushSize / 4)))
+            for ($i = 1; $i -lt $steps; $i++) {
+                $ix = [int]($script:lastPt.X + $dx * $i / $steps)
+                $iy = [int]($script:lastPt.Y + $dy * $i / $steps)
+                $b2 = New-Object System.Drawing.SolidBrush($col)
+                $maskG.FillEllipse($b2, ($ix - $half), ($iy - $half), $script:brushSize, $script:brushSize)
+                $b2.Dispose()
+            }
+        }
+        $script:lastPt = New-Object System.Drawing.Point($x, $y)
+        & $recompose
+    }
+
+    $canvas.Add_MouseDown({
+        param($s, $e)
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            $script:painting = $true; $script:erasing = $false; $script:lastPt = $null
+            & $paintAt $e.X $e.Y $false
+        } elseif ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
+            $script:painting = $true; $script:erasing = $true; $script:lastPt = $null
+            & $paintAt $e.X $e.Y $true
+        }
+    })
+    $canvas.Add_MouseMove({
+        param($s, $e)
+        if ($script:painting) { & $paintAt $e.X $e.Y $script:erasing }
+    })
+    $canvas.Add_MouseUp({
+        param($s, $e)
+        $script:painting = $false; $script:lastPt = $null
+    })
+    $canvas.Add_MouseWheel({
+        param($s, $e)
+        $delta = if ($e.Delta -gt 0) { 6 } else { -6 }
+        $script:brushSize = [Math]::Max(6, [Math]::Min(200, $script:brushSize + $delta))
+        $form.Text = "手绘蒙版 — 笔刷 $($script:brushSize)px / 左键涂抹 / 右键擦除 / 滚轮调笔刷 / C 清空 / Enter 确定 / Esc 取消"
+    })
+
+    $form.KeyPreview = $true
+    $form.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+            $script:painterResult = ''
+            $form.DialogResult = 'Cancel'; $form.Close()
+        } elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+            $form.DialogResult = 'OK'; $form.Close()
+        } elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::C) {
+            $maskG.Clear([System.Drawing.Color]::Black)
+            $script:painted = $false
+            & $recompose
+        }
+    })
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = '确定（用这块蒙版出图）'
+    $btnOk.SetBounds(0, ($ch + 4), 260, 28)
+    $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
+    $form.Controls.Add($btnOk)
+    $btnClear = New-Object System.Windows.Forms.Button
+    $btnClear.Text = '清空'
+    $btnClear.SetBounds(266, ($ch + 4), 70, 28)
+    $btnClear.Add_Click({
+        $maskG.Clear([System.Drawing.Color]::Black)
+        $script:painted = $false
+        & $recompose
+    })
+    $form.Controls.Add($btnClear)
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消'
+    $btnCancel.SetBounds(342, ($ch + 4), 70, 28)
+    $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
+    $form.Controls.Add($btnCancel)
+
+    & $recompose
+    $dlg = $form.ShowDialog()
+    if ($dlg -ne [System.Windows.Forms.DialogResult]::OK) {
+        $maskG.Dispose(); $maskBmp.Dispose(); $dispBmp.Dispose(); $redAttr.Dispose(); $baseBmp.Dispose(); $src.Dispose(); $form.Dispose()
+        return ''
+    }
+    if (-not $script:painted) {
+        $maskG.Dispose(); $maskBmp.Dispose(); $dispBmp.Dispose(); $redAttr.Dispose(); $baseBmp.Dispose(); $src.Dispose(); $form.Dispose()
+        Write-Host "手绘蒙版：没有涂抹任何区域，取消本次手绘。" -ForegroundColor Yellow
+        return ''
+    }
+    # 存盘：按**参考图原始尺寸**输出纯黑白蒙版（SD 需要白=重绘区）
+    $outBmp = New-Object System.Drawing.Bitmap($src.Width, $src.Height)
+    $outG = [System.Drawing.Graphics]::FromImage($outBmp)
+    $outG.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::NearestNeighbor
+    $outG.DrawImage($maskBmp, 0, 0, $src.Width, $src.Height)
+    $outG.Dispose()
+    $ok = ''
+    try {
+        $outBmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $ok = $OutPath
+    } catch { $ok = '' }
+    $outBmp.Dispose()
+    $maskG.Dispose(); $maskBmp.Dispose(); $dispBmp.Dispose(); $redAttr.Dispose(); $baseBmp.Dispose(); $src.Dispose(); $form.Dispose()
+    return $ok
 }
 
 # 蒙版命中率体检：C-1b 出图后自动跑一次，客观回答「蒙版准不准」。
@@ -1130,7 +1319,8 @@ function Show-ParamForm {
     $cboMask = New-Object System.Windows.Forms.ComboBox
     $cboMask.DropDownStyle = 'DropDown'
     # 首项就是「自动」：蒙版按**这张图的内容**现抠（换衣服抠衣服、换背景抠背景），不再靠预设矩形。
-    foreach ($v in @('自动（按图内容抠图）', '无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）', '上半（脸）反选', '四周（背景）反选')) { $null = $cboMask.Items.Add($v) }
+    # 「手动绘制」= 弹出手绘窗口，用户拿鼠标涂出要重绘的区域（用户要求 2026-10-16）。
+    foreach ($v in @('自动（按图内容抠图）', '手动绘制（鼠标涂抹）', '无（整图重绘）', '上半（脸）', '下半（衣服）', '中间（主体）', '四周（背景）', '上半（脸）反选', '四周（背景）反选')) { $null = $cboMask.Items.Add($v) }
     $cboMask.Text = '自动（按图内容抠图）'
     if ($MaskDefault) { $cboMask.Text = $MaskDefault }   # 蒙版区域由对话提交（C-1 替换时）
     $cboMask.SetBounds(120, (240 + 2 * 40), 190, 24)
@@ -2078,6 +2268,9 @@ $sdCurrentModel = Get-SdCurrentModel   # 真实当前底子：画风切模型是
 # 表单预填前先补末尾英文逗号：让两个输入框里显示的基底提示词末尾就带逗号（用户要求）
 $formPositive = $BasePrompt
 $formNegative = $BaseNegative
+# 技术测试：如果传了违禁提示词/建议替换词，覆盖表单预填值
+if ($ViolationPrompts -and $ViolationPrompts.Trim()) { $formPositive = $ViolationPrompts.Trim() }
+if ($SuggestedPrompts -and $SuggestedPrompts.Trim()) { $formNegative = $SuggestedPrompts.Trim() }
 if ($formPositive -and ($formPositive -notmatch ',\s*$')) { $formPositive = $formPositive.TrimEnd() + ", " }
 if ($formNegative -and ($formNegative -notmatch ',\s*$')) { $formNegative = $formNegative.TrimEnd() + ", " }
 # ---- 对话侧先干活：底图先解析、蒙版先画好 → 表单里两项已经填好并锁定（用户只点「确定」）----
@@ -2454,13 +2647,28 @@ if ($mode -eq '文生图') {
     # 蒙版（C-1b）：显式填了就用；填「无」但检测到替换动作 → 按目标自动选区域
     $maskSpec = $maskSpecRaw
     $autoPathUsedForClothes = $false
+    # 「手动绘制」= 弹出蒙版编辑器，让用户拿鼠标涂要重绘的区域（用户要求 2026-10-16）。
+    # 优先级最高：用户既然选了手绘，就不该再被「自动抠图/替换目标推断」覆盖。
+    if ($maskSpec -match '^手动|手动绘制|manual|手绘') {
+        $paintOut = Join-Path $script:IterTempDir 'manual-mask.png'
+        Write-Host "手动蒙版：正在打开绘制窗口（左键涂抹要重绘的区域，右键擦除，滚轮调笔刷，C 清空，Enter 确定）…" -ForegroundColor Cyan
+        $painted = Show-MaskPainter -ImagePath $refPath -OutPath $paintOut
+        if ($painted) {
+            $finalMask = $painted
+            Write-Host "手动蒙版就绪：$painted" -ForegroundColor Green
+        } else {
+            # 用户取消/没涂 → 不静默重画整张；退回「自动」逻辑（或几何区域），并明确告知
+            Write-Host "手绘蒙版未完成（取消或没涂抹）→ 回退到自动蒙版逻辑。" -ForegroundColor Yellow
+            $maskSpec = '自动（按图内容抠图）'
+        }
+    }
     # 「自动」是**关键字**，不是区域名：必须先把它从区域名里摘出去，否则后面会当成「认不出的区域」→
     # 退回整图重绘（2026-10-15 实测事故：用户选自动 → 日志「蒙版区域认不出 → 退回整图重绘」→ 整张图重画）。
     $autoMask = ($maskSpec -match '^自动' -or $maskSpec -eq 'auto' -or $maskSpec -eq '')
     if ($autoMask) { $maskSpec = '' }
     if ($maskSpec -match '^无') { $maskSpec = '' }
     # 自动抠图：按这张参考图的内容现生成（换衣服→衣服/身体；换背景→人以外；换脸→人脸区）
-    if ($autoMask) {
+    if ($autoMask -and -not $finalMask) {
         $autoTarget = if ($replaceTarget) { $replaceTarget } else { '衣服' }
         if ($replaceTarget -eq '未指定') { $autoTarget = '主体' }
         $autoOut = Join-Path $script:IterTempDir 'auto-mask.png'
