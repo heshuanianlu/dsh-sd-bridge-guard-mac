@@ -125,6 +125,30 @@ const DEFAULTS = {
    */
   vlmModel: 'qwen3-vl:8b',
   /**
+   * C 档**开跑前是否释放显存**（Issue 3 顺带补，2026-10-16 真机报告）。
+   * true（默认）= 每个「要显存」的步骤开跑前，按需让对面那一侧（SD / 本地模型服务）交还显存；
+   * false = 生成命令追加 `-NoVramRelease`，整套动作完全关掉（SD 与本地模型谁都不动）。
+   *
+   * **6G 以下小显存卡建议设 false**：这类机器上 SD 常驻后剩余恒低于默认阈值，
+   * 触发「卸 SD checkpoint → A1111 在请求内重载」这条路径时，部分权重会被留在 CPU，
+   * 同一次请求内张量设备不一致 → txt2img 500（CPU/CUDA 设备分裂，实测）。
+   */
+  vramRelease: true,
+  /**
+   * 触发释放显存的剩余显存阈值（GB，默认 4.0）。
+   * 只有「当前剩余 < 此值」时才动手释放；够用就直接走，避免无谓的重载开销。
+   * 6G 卡建议设 **1.5-2.0**（SD 常驻 3.6G 剩余时不再触发释放）。
+   */
+  vramMinFreeGb: 4.0,
+  /**
+   * SD 启动前的**显存自愈三级降级**（用户要求 2026-10-16）。
+   * true（默认）= 启动前自动：① 最多 3 轮清理显存（同时清 SD 与本地模型两侧）；
+   *   ② 仍不够 → 用 `--use-cpu all --no-half --precision full` 走 CPU 推理；
+   *   ③ CPU 起不来 → 换核显（Intel/AMD iGPU）。
+   * false = 关掉自愈，走老路径（启动失败就把错误抛给用户；便于对照排查）。
+   */
+  vramAutoFallback: true,
+  /**
    * A 档出图后是否做**最后视觉审验**（用 read_image 打开生成的图，自检肢体/手部/水印/构图/风格）。
    * true（默认）= 出图后必须 read_image 看一遍，不合格按自检循环最多改 2 轮；
    * false = 跳过自检，出图后直接贴图 + 脚本 + 选项表，不 read_image、不改轮。
@@ -337,6 +361,10 @@ const state = {
   lastUsedAt: 0,
   /** GPU 探测结果缓存：undefined = 未探测（true = Blackwell） */
   blackwell: undefined,
+  /** 当前 SD 运行模式：'gpu' | 'cpu' | 'igpu' | 'failed'（显存自愈降级后会被改写） */
+  serverMode: 'gpu',
+  /** SD 子进程输出尾巴（供启动失败的诊断信息引用） */
+  serverLog: '',
 }
 
 const cfg = { ...DEFAULTS }
@@ -359,6 +387,8 @@ function pushLog(chunk) {
   if (lines.length === 0) return
   state.logTail.push(...lines)
   if (state.logTail.length > 120) state.logTail.splice(0, state.logTail.length - 120)
+  // 显存自愈的失败诊断要引用「最近日志」；单独留一份纯文本（末尾 2000 字符足够定位）
+  state.serverLog = (state.serverLog + String(chunk)).slice(-2000)
 }
 
 function logTailText() {
@@ -417,9 +447,91 @@ async function apiPost(route, payload, timeoutMs) {
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
-    throw new Error(`SD API POST ${route} 失败：HTTP ${res.status} ${body.slice(0, 800)}`)
+    const err = new Error(`SD API POST ${route} 失败：HTTP ${res.status} ${body.slice(0, 800)}`)
+    err.sdStatus = res.status
+    err.sdBody = body
+    throw err
   }
   return res.json()
+}
+
+/**
+ * 判定一个 SD 错误是否为「显存不足 / 设备分裂」类可自愈错误（用户要求 2026-10-16）。
+ * 两类现场都要认：
+ *   · `Not enough memory, use lower resolution ... Need: 0.4GB free, Have:0.2GB free`
+ *   · `Expected all tensors to be on the same device ... cpu and cuda:0`（CLIP/LoRA 权重留在 CPU）
+ */
+function isVramError(error) {
+  const t = `${error?.message ?? ''} ${error?.sdBody ?? ''}`
+  return /Not enough memory|not enough memory|CUDA out of memory|OutOfMemoryError|Expected all tensors to be on the same device|cuda:0/i.test(t)
+}
+
+/**
+ * 带显存自愈的 POST（用户要求 2026-10-16「重试三次清理显存，失败走 CPU/核显出图」）。
+ *
+ * 出图时撞上显存类 500 的处理链：
+ *   ① 清显存（同时清 SD 与本地模型两侧）→ 原样重试，最多 3 轮；
+ *   ② 3 轮后仍失败 → 重启 SD 为 CPU 模式，再重试一次；
+ *   ③ CPU 起不来 → 核显模式再试一次；
+ *   ④ 全都不行 → 抛出带诊断的错误（明确告诉用户「谁在占显存」）。
+ *
+ * @returns {Promise<any>} 与原 apiPost 相同的返回值
+ */
+async function apiPostWithVramHeal(route, payload, timeoutMs) {
+  try {
+    return await apiPost(route, payload, timeoutMs)
+  } catch (error) {
+    if (!isVramError(error) || cfg.vramAutoFallback === false) throw error
+    log(`显存自愈：${route} 撞上显存类错误 → 开始最多 3 轮清理重试`)
+    // ① 三轮清显存 + 重试
+    for (let i = 1; i <= 3; i++) {
+      await releaseVramSide('any')
+      await new Promise((r) => setTimeout(r, 1500 * i))
+      const free = queryFreeVramGb()
+      log(`显存自愈：第 ${i}/3 轮清理后剩余 ${free < 0 ? '未知' : free.toFixed(2) + 'G'} → 重试 ${route}`)
+      try {
+        return await apiPost(route, payload, timeoutMs)
+      } catch (e2) {
+        if (!isVramError(e2)) throw e2 // 换成了别的错（例如提示词问题）→ 立即抛
+        error = e2
+      }
+    }
+    // ② CPU 模式重启
+    const modes = detectIgpu() ? ['cpu', 'igpu'] : ['cpu']
+    for (const mode of modes) {
+      log(`显存自愈：3 轮清理无效 → 重启 SD 为 ${mode} 模式后重试`)
+      stopServer()
+      await new Promise((r) => setTimeout(r, 3000))
+      try {
+        spawnServer(mode)
+      } catch {
+        continue
+      }
+      const ready = await waitForReady(mode === 'cpu' ? 300000 : 180000)
+      if (!ready.ok) {
+        log(`显存自愈：${mode} 模式等不到就绪，跳过`)
+        continue
+      }
+      state.serverMode = mode
+      try {
+        const out = await apiPost(route, payload, timeoutMs)
+        log(`显存自愈：已在 ${mode} 模式下完成出图`)
+        return out
+      } catch (e3) {
+        if (!isVramError(e3)) throw e3
+        error = e3
+      }
+    }
+    // ④ 全面失败：给出可执行的诊断
+    const free = queryFreeVramGb()
+    throw new Error(
+      `显存自愈失败（已尝试 3 轮清理 + ${modes.join('/')} 模式重启）。\n` +
+      `当前剩余显存：${free < 0 ? '未知（无 nvidia-smi）' : free.toFixed(2) + 'G'}\n` +
+      `最常见原因：别的程序（游戏 / 浏览器 / 视频播放器 / 另一个 SD 实例）占着显存。\n` +
+      `处理建议：关掉占显存的程序后重试；或把 vramMinFreeGb 调低（如 2.0）；或设 vramRelease=true 让它每次出图前主动清。\n` +
+      `原始错误：${error?.message ?? error}`,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,17 +697,261 @@ function buildFreshEnv() {
   return env
 }
 
-/** 组装 spawn 环境：基础项 + HF 缓存（坑11）+ 全新安装预置（坑6/7/8/9） */
+/**
+ * Issue 5 修复（2026-10-16 真机报告）：插件 spawn 的 SD 继承宿主旧 PATH。
+ *
+ * install-sd.ps1 会把 MinGit 装到 `%LOCALAPPDATA%\dsh-sd-bridge\MinGit\cmd` 并写进**用户 PATH**，
+ * 但正在运行的 DSH 宿主（以及它 spawn 的子进程）仍持有旧 PATH —— 全新机器首次启动时
+ * `prepare_environment()` 里的 `git clone` 就找不到 git：
+ *   `RuntimeError: Couldn't clone assets. Command: "git" clone ... Error code: 1`
+ * 只有在 `repositories/` 还没克隆完的首次启动才命中（已克隆的机器跳过 clone 所以看不出来）。
+ *
+ * 这里把插件自己装的 MinGit 目录（以及几个常见 git 落地位置）并入子进程 PATH。
+ * 只**前置**已存在的目录，找不到就静默跳过（不改变已有环境，也不阻断启动）。
+ */
+function withGitOnPath(env) {
+  const candidates = []
+  const localAppData = process.env.LOCALAPPDATA
+  if (localAppData) candidates.push(path.join(localAppData, 'dsh-sd-bridge', 'MinGit', 'cmd'))
+  candidates.push(
+    'C:\\Program Files\\Git\\cmd',
+    'C:\\Program Files (x86)\\Git\\cmd',
+  )
+  const sep = process.platform === 'win32' ? ';' : ':'
+  const existing = candidates.filter((p) => {
+    try {
+      return fs.existsSync(p)
+    } catch {
+      return false
+    }
+  })
+  if (existing.length === 0) return env
+  const current = String(env.PATH ?? process.env.PATH ?? '')
+  const missing = existing.filter((p) => !current.split(sep).includes(p))
+  if (missing.length === 0) return env
+  return { ...env, PATH: [...missing, current].join(sep) }
+}
+
+/** 组装 spawn 环境：基础项 + HF 缓存（坑11）+ 全新安装预置（坑6/7/8/9）+ git 可用性（Issue 5） */
 function buildLaunchEnv(prepared) {
-  return {
+  const base = {
     ...process.env,
     GRADIO_ANALYTICS_ENABLED: 'False',
     ...buildHfEnv(prepared),
     ...(prepared ? {} : buildFreshEnv()),
   }
+  // Issue 5（2026-10-16 真机报告）：**不能**用 `prepared` 做守卫——报告里的场景恰恰是
+  // SD 已装（venv 存在 → prepared=true）但 `repositories/` 还没克隆完，`prepare_environment()`
+  // 里的 `git clone` 照样执行、照样找不到 git。所以这里无条件并入插件自带的 MinGit 目录；
+  // 只**前置已存在**的目录、找不到就原样返回，对已跑通的机器零影响。
+  const patched = withGitOnPath(base)
+  if (patched.PATH !== base.PATH) {
+    log('已把插件自带的 git 目录前置进子进程 PATH（Issue 5：宿主旧 PATH 里没有 MinGit）')
+  }
+  return patched
 }
 
-function spawnServer() {
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 显存自愈（2026-10-16 用户要求）：
+ *   「重试三次清理显存，如果失败走 CPU / 核显出图」
+ *
+ * 现场：8G 卡上只要别的程序（游戏 / 浏览器 / 视频）吃掉大半显存，SD 起来后
+ * 剩余不足 → txt2img 直接 500：
+ *   Not enough memory, use lower resolution (max approx. 768x768). Need: 0.4GB free, Have:0.2GB free
+ *   或 CLIP 张量设备分裂：Expected all tensors to be on the same device ... cpu and cuda:0
+ * 以前这里只会「把错误抛给用户」，没有任何自愈动作。
+ *
+ * 现在的策略（三级递进，全部自动）：
+ *   ① 清显存：连续最多 3 轮「让对方一侧交还显存 → 等 → 复测」；
+ *   ② 仍不够 → 换 CPU 推理（--use-cpu all --no-half --disable-nan-check --precision full）；
+ *   ③ CPU 起不来（罕见）→ 换核显（Intel/AMD iGPU，--use-cpu 之外的设备选择）。
+ *
+ * 为什么 CPU 兜底有意义：SD1.5 级模型在 CPU 上出一张 512x768 约 1-3 分钟，
+ * 比「直接失败、一张都拿不到」好得多；用户明确要求过这个降级。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 用 nvidia-smi 查剩余显存（GB）；没 nvidia-smi / 查询失败返回 -1（表示「拿不到信息」）。 */
+function queryFreeVramGb() {
+  try {
+    const r = spawnSync('nvidia-smi', ['--query-gpu=memory.free', '--format=csv,noheader,nounits'], {
+      encoding: 'utf8',
+      timeout: 8000,
+      windowsHide: true,
+    })
+    if (r.status !== 0 || !r.stdout) return -1
+    const first = String(r.stdout).trim().split(/\r?\n/)[0].trim()
+    const mb = Number(first)
+    if (!Number.isFinite(mb)) return -1
+    return mb / 1024
+  } catch {
+    return -1
+  }
+}
+
+/** 查 CPU 逻辑核数（CPU 模式的分片数参考）。 */
+function cpuThreadCount() {
+  try {
+    const n = os.cpus?.()?.length ?? 0
+    return n > 0 ? n : 4
+  } catch {
+    return 4
+  }
+}
+
+/**
+ * 释放一侧显存（供清显存循环复用）：
+ *   which='ollama' → 让本地模型服务卸掉常驻模型（keep_alive:0）
+ *   which='sd'     → 让 A1111 卸载 checkpoint（下次出图自动重载）
+ * 全部 async，失败静默（自愈动作不该反过来报错）。
+ */
+async function releaseVramSide(which) {
+  const acts = []
+  if (which === 'ollama' || which === 'any') {
+    const base = String(cfg.vlmBase ?? 'http://127.0.0.1:11434/v1').replace(/\/v1\/?$/, '').replace(/\/$/, '')
+    acts.push(
+      (async () => {
+        try {
+          const res = await fetch(`${base}/api/ps`, { signal: AbortSignal.timeout(8000) })
+          if (!res.ok) return false
+          const j = await res.json()
+          const models = Array.isArray(j?.models) ? j.models.map((m) => String(m.name)) : []
+          let freed = 0
+          for (const m of models) {
+            try {
+              const r2 = await fetch(`${base}/api/generate`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ model: m, keep_alive: 0 }),
+                signal: AbortSignal.timeout(20000),
+              })
+              if (r2.ok) freed += 1
+            } catch {
+              /* 单个模型卸载失败不阻断其余 */
+            }
+          }
+          if (freed > 0) log(`显存自愈：已让本地模型服务卸载 ${freed} 个常驻模型`)
+          return freed > 0
+        } catch {
+          return false
+        }
+      })(),
+    )
+  }
+  if (which === 'sd' || which === 'any') {
+    acts.push(
+      (async () => {
+        let done = 0
+        for (const ep of ['sdapi/v1/unload-checkpoint', 'sdapi/v1/free']) {
+          try {
+            const r = await fetch(`${baseUrl()}/${ep}`, { method: 'POST', signal: AbortSignal.timeout(20000) })
+            if (r.ok) done += 1
+          } catch {
+            /* 端点不存在/服务没起都不算故障 */
+          }
+        }
+        if (done > 0) log('显存自愈：已让 SD 卸载 checkpoint（下次出图自动重载）')
+        return done > 0
+      })(),
+    )
+  }
+  const results = await Promise.all(acts)
+  return results.some(Boolean)
+}
+
+/**
+ * 三级显存自愈（用户要求 2026-10-16）：
+ *   ① 最多 3 轮「清显存 → 等待 → 复测」，每轮同时清 SD 与本地模型两侧；
+ *   ② 仍不足 → 标记 CPU 模式（调用方据此用 --use-cpu all 重启 SD）；
+ *   ③ CPU 也起不来 → 标记核显模式（iGPU）。
+ *
+ * @param {number} needGb 目标空闲显存（默认取 cfg.vramMinFreeGb）
+ * @returns {{ok: boolean, mode: 'gpu'|'cpu'|'igpu', freeGb: number, rounds: number, detail: string}}
+ */
+async function ensureVramWithRetry(needGb) {
+  const need = Number.isFinite(Number(needGb)) && Number(needGb) > 0 ? Number(needGb) : Number(cfg.vramMinFreeGb) || 4
+  const freeBefore = queryFreeVramGb()
+  if (freeBefore < 0) {
+    // 拿不到显存信息（无 nvidia-smi / 非 N 卡）：不做任何降级，交给 SD 自己判断
+    return { ok: true, mode: 'gpu', freeGb: -1, rounds: 0, detail: '无法读取显存信息（无 nvidia-smi），不做自愈' }
+  }
+  if (freeBefore >= need) {
+    return { ok: true, mode: 'gpu', freeGb: freeBefore, rounds: 0, detail: `显存充足（${freeBefore.toFixed(2)}G ≥ ${need}G）` }
+  }
+
+  log(`显存自愈：起始剩余 ${freeBefore.toFixed(2)}G < 需要 ${need}G → 开始最多 3 轮清理`)
+  let free = freeBefore
+  let rounds = 0
+  for (let i = 1; i <= 3; i++) {
+    rounds = i
+    await releaseVramSide('any')
+    // 给驱动一点回收时间（实测卸载后显存不是立刻回到 nvidia-smi）
+    await new Promise((r) => setTimeout(r, 1500 * i))
+    free = queryFreeVramGb()
+    log(`显存自愈：第 ${i}/3 轮清理后剩余 ${free < 0 ? '未知' : free.toFixed(2) + 'G'}`)
+    if (free >= need) {
+      return { ok: true, mode: 'gpu', freeGb: free, rounds: i, detail: `第 ${i} 轮清理后达标（${free.toFixed(2)}G）` }
+    }
+  }
+
+  // ② 三轮清不掉 → CPU 推理
+  log(`显存自愈：3 轮清理后仍只有 ${free < 0 ? '未知' : free.toFixed(2) + 'G'} → 自动降级 CPU 推理`)
+  return {
+    ok: false,
+    mode: 'cpu',
+    freeGb: free,
+    rounds,
+    detail: `3 轮清理后仍不足（${free < 0 ? '未知' : free.toFixed(2) + 'G'} < ${need}G）→ 降级 CPU 推理`,
+  }
+}
+
+/** CPU 模式的 launch.py 参数（A1111 官方 CPU 组合）。
+ *  注意（2026-10-16 实测）：`--threads` **不在** A1111 v1.10.1 的 cmd_args 里，
+ *  传了会直接 `error: unrecognized arguments` 启动失败——CPU 线程数由 torch 自己按核数决定，
+ *  插件不做干预（cpuThreadCount 仅用于日志/诊断）。
+ */
+function cpuModeArgs() {
+  return [
+    '--use-cpu', 'all',
+    '--no-half',
+    '--precision', 'full',
+    '--disable-nan-check',
+    '--skip-torch-cuda-test',
+    // CPU 上 OOM 不再是问题，split attention 能显著降内存占用
+    '--opt-split-attention',
+  ]
+}
+
+/** 核显模式的 launch.py 参数（Intel/AMD iGPU：走 XPU/DirectML 路径时不用 --use-cpu）。 */
+function igpuModeArgs() {
+  return [
+    '--skip-torch-cuda-test',
+    '--no-half',
+    '--precision', 'full',
+    '--disable-nan-check',
+    // Intel 核显加速（装了 intel-extension-for-pytorch 时生效；没装会被 A1111 忽略）
+    '--use-ipex',
+  ]
+}
+
+/** 探测本机是否存在核显（Intel/AMD 集成显卡）。 */
+function detectIgpu() {
+  try {
+    const r = spawnSync(
+      'powershell',
+      ['-NoProfile', '-Command', '(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join "|"'],
+      { encoding: 'utf8', timeout: 12000, windowsHide: true },
+    )
+    const names = String(r.stdout ?? '')
+    if (/Intel\(R\)|UHD Graphics|Iris|Radeon\(TM\) Graphics|AMD Radeon Graphics|Vega \d+ Graphics/i.test(names)) {
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+function spawnServer(mode = 'gpu') {
   const python = resolvePython()
   const launchPy = path.join(cfg.sdDir, 'launch.py')
   if (!fs.existsSync(launchPy)) {
@@ -603,6 +959,8 @@ function spawnServer() {
   }
   // 全新安装（venv 尚未创建）时不能跳过环境准备，也不能离线——首次启动要联网装 torch 等依赖
   const prepared = fs.existsSync(path.join(cfg.sdDir, 'venv')) || fs.existsSync(path.join(cfg.sdDir, 'python'))
+  // 显存自愈降级（2026-10-16 用户要求）：gpu=默认 / cpu=--use-cpu all / igpu=核显
+  const modeArgs = mode === 'cpu' ? cpuModeArgs() : mode === 'igpu' ? igpuModeArgs() : []
   const args = [
     launchPy,
     '--api',
@@ -610,9 +968,10 @@ function spawnServer() {
     '--port', String(cfg.port),
     ...(prepared ? ['--skip-prepare-environment'] : []),
     '--skip-version-check',
+    ...modeArgs,
     ...(Array.isArray(cfg.extraArgs) ? cfg.extraArgs : []),
   ]
-  log('启动 SD API：', python, args.join(' '))
+  log(`启动 SD API（${mode} 模式）：`, python, args.join(' '))
   const child = spawn(python, args, {
     cwd: cfg.sdDir,
     windowsHide: true,
@@ -633,7 +992,91 @@ function spawnServer() {
   })
   state.child = child
   state.startedByUs = true
+  state.serverMode = mode
   return child
+}
+
+/**
+ * 带显存自愈的 SD 启动（2026-10-16 用户要求「重试三次清理显存，失败走 CPU/核显」）。
+ *
+ * 流程：
+ *   1. 跑三级显存自愈（ensureVramWithRetry）——最多 3 轮清理，返回建议模式；
+ *   2. 建议 gpu → 照常启动；
+ *   3. 建议 cpu → 先尝试**停掉已跑的 SD**（GPU 占着显存的那份），再以 CPU 参数重启；
+ *   4. CPU 起不来（等不到就绪）→ 尝试核显；
+ *   5. 核显也不行 → 回报诊断信息（含当前占显存最狠的进程提示），并把 state.serverMode 记下来。
+ *
+ * @returns {Promise<{ok: boolean, mode: string, detail: string}>}
+ */
+async function startServerWithVramFallback() {
+  const vram = await ensureVramWithRetry(0)
+  const tried = []
+  const needStop = vram.mode !== 'gpu'
+
+  const attempt = async (mode) => {
+    tried.push(mode)
+    // 非 GPU 模式：先把占用显存的 SD 停掉，否则 CPU 参数起不来（端口冲突 / 显存仍被占）
+    if (mode !== 'gpu') {
+      log(`显存自愈：切换到 ${mode} 模式 → 先停止现有 SD 进程`)
+      stopServer()
+      await new Promise((r) => setTimeout(r, 3000))
+    }
+    try {
+      spawnServer(mode)
+    } catch (error) {
+      return { ok: false, mode, detail: `启动失败：${error?.message ?? error}` }
+    }
+    // 等就绪（CPU 模式更慢：给 5 分钟；GPU 模式 3 分钟）
+    const waitMs = mode === 'cpu' ? 300000 : 180000
+    const probe = await waitForReady(waitMs)
+    if (probe.ok) {
+      return { ok: true, mode, detail: `${mode} 模式已就绪（等待 ${Math.round(probe.elapsedMs / 1000)}s）` }
+    }
+    return { ok: false, mode, detail: `${mode} 模式等不到就绪（${Math.round(probe.elapsedMs / 1000)}s）：${probe.detail}` }
+  }
+
+  // ① 首选模式
+  const first = await attempt(vram.mode)
+  if (first.ok) {
+    state.serverMode = first.mode
+    return { ok: true, mode: first.mode, detail: `${vram.detail}；${first.detail}`, vram }
+  }
+
+  // ② GPU 失败 → 依次尝试 CPU、核显
+  const fallbacks = []
+  if (vram.mode === 'gpu') fallbacks.push('cpu')
+  if (detectIgpu()) fallbacks.push('igpu')
+  for (const fb of fallbacks) {
+    log(`显存自愈：${first.mode} 模式失败 → 尝试 ${fb} 模式`)
+    const r = await attempt(fb)
+    if (r.ok) {
+      state.serverMode = r.mode
+      return { ok: true, mode: r.mode, detail: `${vram.detail}；${first.detail} → 回退 ${r.detail}`, vram }
+    }
+  }
+
+  state.serverMode = 'failed'
+  return {
+    ok: false,
+    mode: 'failed',
+    detail: `所有模式都起不来（已尝试：${tried.join(' → ')}）。最近日志：${state.serverLog.slice(-400)}`,
+    vram,
+  }
+}
+
+/** 轮询 /sdapi/v1/options 直到就绪或超时。 */
+async function waitForReady(timeoutMs) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const r = await fetch(`${baseUrl()}/sdapi/v1/options`, { signal: AbortSignal.timeout(5000) })
+      if (r.ok) return { ok: true, elapsedMs: Date.now() - t0, detail: '' }
+    } catch {
+      /* 还没起来，继续等 */
+    }
+    await new Promise((r) => setTimeout(r, 3000))
+  }
+  return { ok: false, elapsedMs: Date.now() - t0, detail: '超时' }
 }
 
 function stopServer() {
@@ -682,6 +1125,20 @@ async function ensureServer({ allowStart = true } = {}) {
 
   state.starting = (async () => {
     if (state.child) stopServer()
+    // 显存自愈（2026-10-16 用户要求）：启动前先跑三级自愈——
+    // ① 最多 3 轮清理显存；② 清不掉 → CPU 推理；③ CPU 起不来 → 核显。
+    // 以前这里直接 spawnServer()，显存不够时只能把 500 抛给用户。
+    if (cfg.vramAutoFallback !== false) {
+      const auto = await startServerWithVramFallback()
+      if (auto.ok) {
+        log(`SD 已按 ${auto.mode} 模式启动：${auto.detail}`)
+        state.base = baseUrl()
+        touchIdleTimer()
+        return await probeApi(5000).then((p) => p.options ?? {})
+      }
+      throw new Error(`sd-bridge: ${auto.detail}`)
+    }
+    // 关掉自愈时走原路径（老行为，便于对照排查）
     spawnServer()
     const deadline = Date.now() + Number(cfg.startupTimeoutMs || DEFAULTS.startupTimeoutMs)
     let lastKind = ''
@@ -1436,7 +1893,7 @@ const txt2imgTool = {
     const lora = String(args.lora ?? '').trim().replace(/^<lora:|>$/g, '')
     if (lora) payload.prompt = `<lora:${lora}> ${payload.prompt}`
 
-    const data = await apiPost('/sdapi/v1/txt2img', payload, Number(cfg.requestTimeoutMs))
+    const data = await apiPostWithVramHeal('/sdapi/v1/txt2img', payload, Number(cfg.requestTimeoutMs))
     const images = Array.isArray(data.images) ? data.images : []
     if (images.length === 0) {
       throw new Error(`sd_txt2img: SD 没有返回图片。info=${String(data.info ?? '').slice(0, 400)}`)
@@ -1620,7 +2077,7 @@ const img2imgTool = {
         : {}),
     }
 
-    const data = await apiPost('/sdapi/v1/img2img', payload, Number(cfg.requestTimeoutMs))
+    const data = await apiPostWithVramHeal('/sdapi/v1/img2img', payload, Number(cfg.requestTimeoutMs))
     const images = Array.isArray(data.images) ? data.images : []
     if (images.length === 0) {
       throw new Error(`sd_img2img: SD 没有返回图片。info=${String(data.info ?? '').slice(0, 400)}`)
@@ -1850,7 +2307,7 @@ const inpaintTool = {
         : {}),
     }
 
-    const data = await apiPost('/sdapi/v1/img2img', payload, Number(cfg.requestTimeoutMs))
+    const data = await apiPostWithVramHeal('/sdapi/v1/img2img', payload, Number(cfg.requestTimeoutMs))
     const images = Array.isArray(data.images) ? data.images : []
     if (images.length === 0) {
       throw new Error(`sd_inpaint: SD 没有返回图片。info=${String(data.info ?? '').slice(0, 400)}`)
@@ -2293,6 +2750,45 @@ const scriptBTool = {
 const INJECT_BASE_NEGATIVE =
   'lowres, bad anatomy, bad hands, extra fingers, fewer digits, watermark, text, signature, jpeg artifacts, worst quality, low quality'
 
+/**
+ * 构造 sd-inject.ps1 的「cfg 驱动开关」参数对（Issue 2 修复，2026-10-16 真机报告）。
+ *
+ * 为什么抽成单独一个函数：这些开关原本在**两处各自维护**——返回给用户的命令字符串一套、
+ * `run: true` 实际执行的 launcher.ps1 另一套。launcher 那侧漏了 `-NoVlmStart` /
+ * `-NoAutoMask` / `-VlmModel` / `-NoVlmReview` 四行，于是「插件设置里关掉审核」后：
+ * 命令文本是对的，但真正跑起来的那次仍走默认开启审核的老路 → 触发 Issue 1 的 500。
+ * 两处共用同一份生成逻辑，从结构上杜绝这类漂移。
+ *
+ * @param {object} cfg 插件配置（DEFAULTS 合并后的）
+ * @param {object} args sd_inject 的调用参数
+ * @returns {{name: string, value: string}[]} 有序参数对（name 形如 '-NoVlmStart'，value 可为 ''）
+ */
+function buildInjectCfgSwitches(cfg, args) {
+  const pairs = []
+  // 插件设置 vlmAutoStart=false：明确告诉脚本「别自动拉起本地视觉模型」（服务没起就跳过质检，
+  // 不偷偷在你机器上起 ollama）。要用回冷启动把设置改回 true，或在命令里删掉这个开关。
+  if (cfg.vlmAutoStart === false) pairs.push({ name: '-NoVlmStart', value: '' })
+  // 插件设置 maskAutoSegment=false：不加载检测模型，改用几何区域蒙版（上半/下半/中间/四周）。
+  if (cfg.maskAutoSegment === false) pairs.push({ name: '-NoAutoMask', value: '' })
+  // 视觉审核（人物肢体打分）：模型名从插件页来；关掉审核时明确告诉脚本别探活/别冷启动。
+  if (String(cfg.vlmModel ?? '').trim()) pairs.push({ name: '-VlmModel', value: String(cfg.vlmModel).trim() })
+  if (cfg.vlmReview === false) pairs.push({ name: '-NoVlmReview', value: '' })
+  // Issue 3 顺带（2026-10-16）：把 -NoVramRelease / -VramMinFreeGb 也暴露到插件配置层——
+  // 6G 以下小显存卡没法从配置绕开「开跑前释放显存」，只能手工改命令。
+  if (cfg.vramRelease === false) pairs.push({ name: '-NoVramRelease', value: '' })
+  if (Number.isFinite(Number(cfg.vramMinFreeGb)) && Number(cfg.vramMinFreeGb) > 0) {
+    pairs.push({ name: '-VramMinFreeGb', value: String(Number(cfg.vramMinFreeGb)) })
+  }
+  // 技术测试：违禁提示词 / 建议替换词 → 预填进表单第一/第二个框
+  if (String(args.violationPrompts ?? '').trim()) {
+    pairs.push({ name: '-ViolationPrompts', value: String(args.violationPrompts).trim() })
+  }
+  if (String(args.suggestedPrompts ?? '').trim()) {
+    pairs.push({ name: '-SuggestedPrompts', value: String(args.suggestedPrompts).trim() })
+  }
+  return pairs
+}
+
 const injectTool = {
   name: 'sd_inject',
   description:
@@ -2390,6 +2886,8 @@ const injectTool = {
     directPathFor(wsRoot)   // 顺带把 sd-direct.ps1 / sd-inject.ps1 同步进会话工作区
     const injectPath = path.join(wsRoot, 'sd-inject.ps1')
     const outDir = resolveOutputDir(exec)
+    // cfg 驱动开关只算一次，命令字符串与 launcher 都从这里取（Issue 2：两处漂移的根治）
+    const injectCfgSwitches = buildInjectCfgSwitches(cfg, args)
     const parts = [
       'powershell', '-ExecutionPolicy', 'Bypass', '-File', psQuote(injectPath),
       '-BasePrompt',
@@ -2410,17 +2908,12 @@ const injectTool = {
     if (String(args.mask ?? '').trim()) parts.push('-MaskSpec', psQuote(String(args.mask).trim()))
     if (Number.isFinite(Number(args.cfg))) parts.push('-Cfg', String(Number(args.cfg)))
     if (String(args.sampler ?? '').trim()) parts.push('-Sampler', psQuote(String(args.sampler).trim()))
-    // 插件设置 vlmAutoStart=false：明确告诉脚本「别自动拉起本地视觉模型」（服务没起就跳过质检，
-    // 不偷偷在你机器上起 ollama）。要用回冷启动把设置改回 true，或在命令里删掉这个开关。
-    if (cfg.vlmAutoStart === false) parts.push('-NoVlmStart')
-    // 插件设置 maskAutoSegment=false：不加载检测模型，改用几何区域蒙版（上半/下半/中间/四周）。
-    if (cfg.maskAutoSegment === false) parts.push('-NoAutoMask')
-    // 视觉审核（人物肢体打分）：模型名从插件页来；关掉审核时明确告诉脚本别探活/别冷启动。
-    if (String(cfg.vlmModel ?? '').trim()) parts.push('-VlmModel', psQuote(String(cfg.vlmModel).trim()))
-    if (cfg.vlmReview === false) parts.push('-NoVlmReview')
-    // 技术测试：违禁提示词 / 建议替换词 → 预填进表单第一/第二个框
-    if (String(args.violationPrompts ?? '').trim()) parts.push('-ViolationPrompts', psQuote(String(args.violationPrompts).trim()))
-    if (String(args.suggestedPrompts ?? '').trim()) parts.push('-SuggestedPrompts', psQuote(String(args.suggestedPrompts).trim()))
+    // cfg 驱动开关（审核/抠图/显存/技术测试提示词）：与 launcher 共用 buildInjectCfgSwitches，
+    // 避免两处各自维护导致漂移（Issue 2 的根因）。
+    for (const sw of injectCfgSwitches) {
+      parts.push(sw.name)
+      if (sw.value) parts.push(psQuote(sw.value))
+    }
     const command = parts.join(' ')
 
     // run=true：插件直接拉起脚本（独立 PowerShell 窗口，表单在用户桌面弹出，插件立即返回不等待）。
@@ -2461,9 +2954,16 @@ const injectTool = {
         if (String(args.mask ?? '').trim()) paramPairs.push('-MaskSpec', String(args.mask).trim())
         if (Number.isFinite(Number(args.cfg))) paramPairs.push('-Cfg', String(Number(args.cfg)))
         if (String(args.sampler ?? '').trim()) paramPairs.push('-Sampler', String(args.sampler).trim())
-        // 技术测试：违禁提示词 / 建议替换词 → 预填进表单第一/第二个框
-        if (String(args.violationPrompts ?? '').trim()) paramPairs.push('-ViolationPrompts', String(args.violationPrompts).trim())
-        if (String(args.suggestedPrompts ?? '').trim()) paramPairs.push('-SuggestedPrompts', String(args.suggestedPrompts).trim())
+        // ── Issue 2 修复（2026-10-16 真机报告，阻塞级）──────────────────────────────
+        // 以前这里漏了 cfg 驱动的四个开关（-NoVlmStart / -NoAutoMask / -VlmModel / -NoVlmReview），
+        // 于是「插件设置里关掉审核」后：返回的命令字符串是对的，但 run:true 真正执行的
+        // launcher.ps1 里没有这些开关 → 实际那次运行仍走默认开启审核的老路 →
+        // 照旧触发 Ensure-Vram 白卸 SD → 复现 Issue 1 的 txt2img 500。
+        // 现在改成与命令字符串共用同一份 buildInjectCfgSwitches，结构上不可能再漂移。
+        for (const sw of injectCfgSwitches) {
+          paramPairs.push(sw.name)
+          if (sw.value) paramPairs.push(sw.value)
+        }
         // 每个元素都包单引号；数字也当字符串传（PowerShell splatting 会自动转回数值类型）
         const elems = paramPairs.map((v) => `  ${psQuoteSingle(v)}`).join(',\r\n')
         // 坑34（外部用户实测反馈）：这个窗口是 cmd start 拉起的**独立进程**，不经过 DSH 受限子进程
@@ -2630,7 +3130,8 @@ const serverTool = {
   name: 'sd_server',
   description:
     '管理本机 Stable Diffusion API 服务：status 查看状态，start 启动（纯 API 模式、不开浏览器），stop 停止由 sd-bridge 启动的进程。' +
-    '生图工具本身也会按需自动启动，通常不需要手动 start。',
+    '生图工具本身也会按需自动启动，通常不需要手动 start。' +
+    'status 还会回报**当前运行模式**（gpu / cpu / igpu）与剩余显存——显存不足时插件会自动三级降级（清理 → CPU → 核显）。',
   parameters: {
     type: 'object',
     properties: {
@@ -2647,6 +3148,8 @@ const serverTool = {
         {
           ok: true,
           state: 'ready',
+          mode: state.serverMode,
+          modeHint: state.serverMode === 'gpu' ? undefined : `已降级为 ${state.serverMode} 模式（显存自愈）`,
           baseUrl: baseUrl(),
           checkpoint: options?.sd_model_checkpoint,
           managedByPlugin: Boolean(state.child && state.startedByUs),
@@ -2660,10 +3163,21 @@ const serverTool = {
       return JSON.stringify({ ok: outcome.ok, state: 'stopped', reason: outcome.reason }, null, 2)
     }
     const probe = await probeApi()
+    const freeGb = queryFreeVramGb()
     return JSON.stringify(
       {
         ok: true,
         state: probe.kind === 'ready' ? 'ready' : 'offline',
+        mode: state.serverMode,
+        modeHint:
+          state.serverMode === 'cpu'
+            ? '当前是 CPU 推理模式（显存不足自动降级）：出图比 GPU 慢（512x768 约 1-3 分钟/张），但不会因显存失败'
+            : state.serverMode === 'igpu'
+              ? '当前是核显模式（CPU 兜底也起不来时的最后一档）'
+              : undefined,
+        freeVramGb: freeGb < 0 ? '无法读取（无 nvidia-smi）' : Number(freeGb.toFixed(2)),
+        vramMinFreeGb: Number(cfg.vramMinFreeGb),
+        vramAutoFallback: cfg.vramAutoFallback !== false,
         baseUrl: baseUrl(),
         sdDir: cfg.sdDir || undefined,
         checkpoint: probe.kind === 'ready' ? probe.options?.sd_model_checkpoint : undefined,
@@ -2841,6 +3355,18 @@ async function tryLoadConfigSchema() {
         .string()
         .default(DEFAULTS.vlmModel)
         .description('视觉审核用的模型名（默认 qwen3-vl:8b，能识图的本地视觉模型；随命令传给 -VlmModel）；留空 = 自动挑本机第一个 vl/vision 模型。审核只做技术性检查（人物肢体结构），不评价画面内容。'),
+      vramRelease: z
+        .boolean()
+        .default(DEFAULTS.vramRelease)
+        .description('C 档开跑前是否释放显存（每个要显存的步骤按需让对面一侧交还显存）：true = 启用；false = 生成命令追加 -NoVramRelease，整套关掉。6G 以下小显存卡建议设 false——SD 常驻后剩余恒低于阈值，触发「卸 checkpoint → 请求内重载」会让部分权重留在 CPU，txt2img 直接 500。'),
+      vramMinFreeGb: z
+        .number()
+        .default(DEFAULTS.vramMinFreeGb)
+        .description('触发释放显存的剩余显存阈值（GB，默认 4.0）：只有当前剩余低于此值才动手。6G 卡建议设 1.5-2.0（SD 常驻 3.6G 剩余时就不再触发释放）。随命令传给 -VramMinFreeGb。'),
+      vramAutoFallback: z
+        .boolean()
+        .default(DEFAULTS.vramAutoFallback)
+        .description('SD 启动前的显存自愈三级降级：① 最多 3 轮清理显存；② 仍不够 → CPU 推理（--use-cpu all）；③ CPU 起不来 → 核显。false = 关掉自愈、启动失败直接把错误抛出来（便于对照排查）。'),
       finalVisualReview: z
         .boolean()
         .default(DEFAULTS.finalVisualReview)
@@ -3491,7 +4017,19 @@ export function apply(ctx, config = {}) {
             '6. **违规不变**：A 档可只把违规区域蒙版重画（比整张重画更保画风），改完照常自检、残留就重画；C 档一张图都不出，只给上面的【本地注入】命令。\n\n' +
             '## 后台运行\n' +
             '- 生图在后台进程执行，你的回复不必等待解释：调用工具 → 贴 replyImages → 贴脚本 → 简短说明即可。\n' +
-            '- 想让它空闲自动关：配置 `idleStopMinutes`；手动控制用 `sd_server`（status/start/stop）。\n',
+            '- 想让它空闲自动关：配置 `idleStopMinutes`；手动控制用 `sd_server`（status/start/stop）。\n\n' +
+            '## 显存不足时插件会自己降级（不用你操心，但要会解释）\n' +
+            '- **三级自愈**（用户要求 2026-10-16）：① 出图前/撞到显存类 500 时，最多 **3 轮清理显存**\n' +
+            '  （同时清 SD checkpoint 与本地模型服务两侧）；② 仍不够 → 自动用 **CPU 推理**重启 SD\n' +
+            '  （`--use-cpu all --no-half --precision full`）；③ CPU 起不来 → 换 **核显**。\n' +
+            '- 触发条件：错误里出现 `Not enough memory`、`CUDA out of memory`、\n' +
+            '  `Expected all tensors to be on the same device ... cpu and cuda:0`。\n' +
+            '- **CPU 模式出图慢很多**（实测 512×512/12 步约 140s，512×640 蒙版重绘约 166s，16 线程）。\n' +
+            '  用户抱怨慢时：告诉他这是显存被别的程序占着触发的自动降级，\n' +
+            '  关掉占显存的程序（游戏/浏览器/另一个 SD）后 `sd_server stop` 再出图就会回到 GPU。\n' +
+            '- 想手工干预：`sd_server status` 看当前模式（`gpu`/`cpu`/`igpu`）与剩余显存；\n' +
+            '  配置 `vramRelease: false` 或调低 `vramMinFreeGb` 可减少清理动作；\n' +
+            '  `vramAutoFallback: false` 完全关掉自愈（启动失败直接把错误抛出来，便于排查）。\n',
           invocation: { modelInvocable: true, userInvocable: true },
           }),
         ),

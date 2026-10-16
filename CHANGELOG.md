@@ -1,5 +1,168 @@
 # Changelog
 
+## 1.0.2（手绘蒙版修复 + 蒙版不再锁定 + 显存自愈降级 + 1.0.1 真机报告五连修 · 2026-10-16）
+
+### ④ 显存自愈三级降级（用户要求：「重试三次清理显存，失败走 CPU / 核显出图」）
+
+**背景**：8G 卡上只要别的程序（游戏 / 浏览器 / 视频）吃掉大半显存，SD 起来后剩余不足 → txt2img 直接 500：
+```
+Not enough memory, use lower resolution (max approx. 768x768). Need: 0.4GB free, Have:0.2GB free
+RuntimeError: Expected all tensors to be on the same device, but found ... cpu and cuda:0!
+```
+以前这里只会把错误抛给用户，没有任何自愈动作。
+
+**三级递进（全自动）**：
+
+| 级别 | 动作 | 实测耗时 |
+| --- | --- | --- |
+| ① 清显存 | 最多 **3 轮**「同时清 SD checkpoint + 本地模型服务 → 等 1.5s×轮次 → 复测」 | 每轮 1.5-4.5s |
+| ② CPU 推理 | 仍不够 → `--use-cpu all --no-half --precision full --disable-nan-check --skip-torch-cuda-test --opt-split-attention` 重启 SD | 就绪 **25s**；出图 512×512/12 步 **144s** |
+| ③ 核显 | CPU 起不来 → 核显模式（`--use-ipex`，探测到 Intel/AMD iGPU 时才试） | 就绪上限 180s |
+| ④ 全败 | 抛带诊断的错误：当前剩余显存 + 「谁在占显存」的处理建议 | — |
+
+**两个触发点**：
+1. **启动前**（`ensureServer` → `startServerWithVramFallback`）：先跑三级决策，再按建议模式启动；
+2. **出图时**（`apiPostWithVramHeal` 包住 txt2img/img2img）：撞上显存类 500 → 3 轮清理重试 → 仍失败则切 CPU → 再不行切核显 → 全程失败才抛错。
+
+**新增配置**：`vramAutoFallback`（默认 true，关掉则走老路径、失败直接抛错便于排查）。
+
+**踩坑**：`--threads N` **不在** A1111 v1.10.1 的 `cmd_args` 里（实测 `error: unrecognized arguments: --threads 16`
+直接启动失败），CPU 线程数交给 torch 自己按核数决定，插件不干预。
+
+**真机验证**（本机 RTX 5060 8G，显存被 WarThunder 吃到只剩 328 MiB）：
+```
+① 显存读取：nvidia-smi "1863" → 1.82G ✅
+② 错误判定：Not enough memory / CUDA out of memory / 设备分裂 全部命中；正常错误不误判 ✅
+③ CPU 参数：--use-cpu all --no-half --precision full ...（无 --threads）✅
+④ 核显探测：识别出 Intel(R) UHD Graphics ✅
+⑤ CPU 模式实测：25s 就绪 → 出图 512×512/12 步 144s 成功（画面结构正常，GPU 使用率 0%）✅
+```
+
+### ⑤ 蒙版手绘修复验收（客观数据）
+
+用插件自带的 `sd-mask-qa.py` 对「手绘蒙版 → 蒙版重绘」做量化体检：
+
+```
+蒙版覆盖 2.69% ｜ 蒙版内命中 79.9% ｜ 蒙版外保留 99.92% ｜ 外溢 0.08% ｜ suspect 0
+```
+
+- **蒙版内命中 79.9%**：涂抹区域确实被重绘（剩下 20% 是边界抗锯齿与原本就接近的区域）；
+- **蒙版外保留 99.92%**：未涂区域几乎像素级原样保留 —— 这正是蒙版重绘的核心价值
+  （画风/背景/人物不跟着变）；
+- 手绘窗口实测：底图正常显示、**两笔涂抹痕迹清晰可见**（红色高亮带 + 波浪线）、
+  笔刷光标圈 + 十字准心跟手；存盘蒙版 1216×1536（= 参考图原始尺寸）、纯黑白。
+  对照图见 `tmp/mask-comparison.png`（原图 / 手绘蒙版 / 出图结果 三联）。
+
+
+### ③ 1.0.1 真机报告（第三方机器 · 6GB 卡 · 未装 Ollama）五连修
+
+> 来源：`sd-bridge-guard-issues-2026-10-16.md`（RTX 3060 Laptop 6GB / A1111 v1.10.1 /
+> torch 2.1.2+cu121 / **未安装 Ollama**）。两条阻塞、三条健壮性。
+
+**Issue 1（阻塞）无本地视觉模型时 `Ensure-Vram -For 'sd'` 白卸 SD → 后续每轮 txt2img 必 500**
+- 根因：`Test-FaceQuality` 内部无条件调 `Ensure-Vram -For 'sd' -Note '视觉审核'`，理由是
+  「给常驻 5278MB 的 8B 视觉模型腾显存」——但本机根本没这个模型，卸载纯属白卸。
+  而 A1111 v1.10.1 在「卸载 → 请求内重载」这条路径上会把部分权重留在 CPU
+  （CLIP token embedding、LoRA Linear 都遇到过）→ 同一次请求内张量设备不一致 → 500。
+  6GB 卡上 SD 常驻后剩余恒为 3.6G < 默认阈值 4G，**每一轮都会触发**。
+- 修法（两层）：
+  1. `Test-FaceQuality` 开头早退——`if ($NoVlmReview) { return -1 }` +
+     `if (-not (Test-VlmApi)) { return -1 }`（服务不可达就不进质检，也不去白卸 SD）；
+  2. 那行改 `if (Test-VlmApi) { Ensure-Vram -For 'sd' -Note '视觉审核' }`（只在模型真可达时才腾）。
+
+**Issue 2（阻塞）`sd_inject({ run: true })` 的启动器漏传 cfg 驱动的四个开关**
+- 根因：命令字符串与 `sd-inject-launcher.ps1` 的 `paramPairs` **两处各自维护**，
+  launcher 那侧漏了 `-NoVlmStart` / `-NoAutoMask` / `-VlmModel` / `-NoVlmReview`。
+  于是「插件设置里关掉审核」后：返回的命令文本是对的，但 `run:true` 真正执行的那次
+  仍走默认开启审核的老路 → 触发 Issue 1 的 500。
+- 修法（结构级根治，采纳报告建议）：抽出单一来源 `buildInjectCfgSwitches(cfg, args)`，
+  命令字符串与 launcher **共用同一份**，从结构上不可能再漂移。
+
+**Issue 3（一致性）`-NoVlmReview` 没「整条不跑」+ 未暴露显存开关**
+- 根因：`-NoVlmReview` 只在 `Invoke-BaseIterate` 内置 `$vlmOk = $false`，
+  但两个 `Test-FaceQuality` 调用点没用它做门禁（打印了「审核已关闭」却照跑质检 → 照旧白卸 SD）。
+- 修法：`Invoke-FinalIterate` 的 `$vlmDown` 初值改为 `[bool]$NoVlmReview`（整条不跑）；
+  `Invoke-BaseIterate` 的调用点加 `if ($vlmOk)` 门禁。
+- **顺带新增两个插件配置项**（报告建议）：`vramRelease`（默认 true，false 时传 `-NoVramRelease`）
+  与 `vramMinFreeGb`（默认 4.0，传 `-VramMinFreeGb`）——6GB 这类小显存卡终于能从配置层
+  绕开「开跑前释放显存」，不必手工改命令。6G 卡建议：`vramRelease: false` 或 `vramMinFreeGb: 2.0`。
+
+**Issue 4（安装）8 段并行下载必失败且原因被吞；hf-mirror 429 直接放弃**
+- 根因：`SegmentWorker` 的 `catch {}` 完全吞掉异常，失败只回裸 `$false` ——
+  用户只能看到「分段下载全部失败」，无法判断是服务端不支持 Range 还是本地网络问题。
+- 修法：
+  1. worker 改为回报 `@{ Ok; Errs }`，把每次尝试的异常（或「长度不符：期望 vs 实收」）收集起来；
+  2. 失败时打印前 3 条分段失败原因；
+  3. 单流降级对 **429 走 30s×次数 的退避重试**（原为固定 3s×次数，实测 hf-mirror 连打
+     4 次全 429 就放弃了 SemiRealMix / VAE / EasyNegative / badhandv4 四个小文件）。
+
+**Issue 5（健壮性）插件 spawn 的 SD 继承宿主旧 PATH，首次启动 `git clone` 失败**
+- 根因：`install-sd.ps1` 把 MinGit 装到 `%LOCALAPPDATA%\dsh-sd-bridge\MinGit\cmd` 并写进
+  **用户 PATH**，但运行中的 DSH 宿主（及其 spawn 的子进程）仍持有旧 PATH →
+  `prepare_environment()` 报 `Couldn't clone assets. Command: "git" clone ... Error code: 1`。
+- 修法：新增 `withGitOnPath(env)`，把插件自装的 MinGit 目录（及常见 git 落地位置）
+  前置进子进程 PATH；只并入**已存在**的目录，找不到就原样返回（对已跑通的机器零影响）。
+  注意**不能**用 `prepared` 做守卫——报告场景恰是 SD 已装（venv 存在）但 `repositories/`
+  还没克隆完，照样需要 git。
+
+**验证**：`npm test` 21 段全绿（新增 `REAL-ISSUES SMOKE OK`，14 条防回归断言覆盖 Issue 1-5）；
+PS 5.1 `parse errors = 0`；`verify-integrity.mjs` 32/32 完好。
+
+## 1.0.2 前序内容（手绘蒙版修复 + 蒙版不再锁定）
+
+用户实测反馈两条，都是真机复现后修的。
+
+### ① 手绘蒙版「看不到笔刷痕迹、也没有实际效果」——两个根因
+
+**坑35：PowerShell 的 WinForms 事件处理器不继承函数局部作用域。**
+`Show-MaskPainter` 里的 `$canvas` / `$maskG` / `$baseBmp` 等本是函数局部变量，
+但 `Add_MouseDown` / `Add_MouseMove` 的 scriptblock 在**自己的作用域**里执行——
+处理器里的这些变量全是 `$null`，`FillEllipse` 立即抛错，
+表现就是「拖了没反应、窗口里什么都没有」。
+**修法**：所有跨处理器共享的对象一律提到 `$script:` 作用域（`mp_` 前缀防撞），
+处理器只读写 `$script:mp_*`，不再依赖闭包捕获。
+
+**坑36：用 ColorMatrix 做「黑底白笔迹 → 半透明红」显示层，实测把底图整层盖成白色。**
+`ColorMatrix` 的行列语义在 PowerShell 里既难写也难验（`MatrixRC` 命名属性与索引器行为不一致，
+`$cm.M03` 这种写法直接报「属性不存在」；换成索引器又要手工清 25 项，稍有偏差就是全白/全黑）。
+**修法**：彻底不用矩阵——另开一张**独立红色叠加层**（透明底 ARGB 位图）：
+涂抹时同时往「蒙版层」写黑白（出图用）、往「红色层」写半透明红（显示用）；
+显示 = 底图 + 红色层。零矩阵、零魔法，所见即所得。
+擦除时红色层切 `CompositingMode::SourceCopy` 把该区域 alpha 直接置 0
+（普通 `SourceOver` 模式下「画透明色」擦不掉东西）。
+
+顺带增强：
+- **笔刷光标圈 + 十字准心**跟手显示，随时知道笔刷多大、落点在哪
+- 滚轮调笔刷（6–300 px），`[` / `]` 也能调
+- 鼠标移出画布自动收起光标圈
+- 画布 `AntiAlias`，边缘平滑
+- 存盘按**参考图原始尺寸**用 `NearestNeighbor` 还原（SD 需要白=重绘区）
+
+**实测**（自动化涂抹脚本：起窗口 → 定位 → 模拟鼠标按+拖 → 截图 → 回车 → 校验产物）：
+```
+窗口: 728x973       笔迹清晰可见（红色高亮带 + 光标圈）
+SAVED: test-mask2.png (12306 bytes)
+白色像素占比: 0.81%          蒙版尺寸 1216x1536（= 参考图原始尺寸）
+采样颜色: RGB(0,0,0) + RGB(255,255,255)（灰阶仅 3 个抗锯齿边缘点）
+```
+
+### ② 蒙版不再锁定（用户要求）
+
+**原行为**：对话侧一旦自动抠好蒙版（或给定精确框 / 蒙版图路径），表单里「蒙版」下拉就被**禁用**（灰蓝底 + 「对话已按图抠好蒙版并锁定」），用户想改也改不了。
+**新行为**：**任何情况下蒙版都保持可编辑**——自动抠图结果只**预填**、不锁死。
+想手绘就选「手动绘制（鼠标涂抹）」，想换区域选区域名，想整图重绘选「无」。
+
+改动点：
+- 三处 `$lockMask = $true` → `$false`（蒙版图路径 / 精确坐标框 / 自动抠图成功）
+- 移除表单里的蒙版锁定块（`$cboMask.Enabled = $false` + 灰底 + 锁定文案）
+- 提示文案更新为「（白色=重绘区；可填区域名/box:x,y,w,h/蒙版图路径，或选手动绘制）」
+
+**底图锁定保持不变**（`$lockBase`）——底图由对话解析、值本身必须精确，锁住是合理的。
+
+**实测**：图生图 + 对话给定坐标框，表单里蒙版下拉白底可编辑（显示「自动（按图内容抠图）」），底图框灰底禁用（「对话已解析底图并锁定」）——正是预期效果。
+
+**回归**：PS 5.1 `parse errors = 0`；三份 `sd-inject.ps1` SHA256 一致（`8262794B5C6DA507`）。
+
 ## 1.0.1（完整性检测 + 手绘蒙版 + C 档参数注入 · 2026-10-16）
 
 本轮三件事：**别人下载后能自查缺什么**、**蒙版可以鼠标手绘**、**C 档违禁词能注入表单**。

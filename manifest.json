@@ -1,8 +1,8 @@
 {
   "name": "dsh-sd-bridge-guard",
-  "version": "1.0.1",
-  "generatedAt": "2026-10-16T10:13:40.495Z",
-  "fileCount": 38,
+  "version": "1.0.2",
+  "generatedAt": "2026-10-16T13:56:52.129Z",
+  "fileCount": 40,
   "files": [
     {
       "path": ".gitattributes",
@@ -20,15 +20,15 @@
     },
     {
       "path": ".gitignore",
-      "sha256": "5ba69c6e32cd5fe22d02cfc71b54dd3ea7d11c24977f5fe474b9a2f59fbb7d74",
-      "bytes": 298,
+      "sha256": "6f62823af1c7e78947b976365d9d383f6cc6783918e58a904d5236bd6d392269",
+      "bytes": 379,
       "category": "doc",
       "shipped": false
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "6475e92a5abd07b5aa2fd8579983a1a9a0fc24e161704baafe8b6755226dd0d0",
-      "bytes": 128550,
+      "sha256": "c4249f1bf697f54d5b87730baaf5d0cb3eb7f8c69b874f929e5f1eb279e7481d",
+      "bytes": 139948,
       "category": "doc",
       "shipped": true
     },
@@ -41,8 +41,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "03125b31948a66647ce2f6a51a5c4306b30f44d93880e71b795869e58e8caf83",
-      "bytes": 79834,
+      "sha256": "24a1308fa6a4437ef6e36128a5c25b397629916f17c5062b9858678be8622806",
+      "bytes": 79287,
       "category": "doc",
       "shipped": true
     },
@@ -139,14 +139,14 @@
     },
     {
       "path": "install-sd.ps1",
-      "sha256": "8741578959648b7a34d48815627aabaf41c2101df41846e6b9ac24b4cab0ccba",
-      "bytes": 47830,
+      "sha256": "b163c9b5f869af7f77abcded226354bb1e392607de7c29895d9a8d2d2d00093c",
+      "bytes": 50845,
       "category": "runtime",
       "shipped": true
     },
     {
       "path": "package.json",
-      "sha256": "227558e6d00845bf8f1be312cedc707081679c0ec4c0b532910bb4e4c83dac02",
+      "sha256": "13f06dc3280feb851625ffa5af637116b237ab9d4dbd96fea8c2ff9a0cb943b9",
       "bytes": 2979,
       "category": "runtime",
       "shipped": false
@@ -167,8 +167,8 @@
     },
     {
       "path": "sd-bridge.js",
-      "sha256": "4e9854e7bbb44f46295e5bab468258566ecc78769fe61dd8650b001fed0aa4d9",
-      "bytes": 207986,
+      "sha256": "c3f7394146263102a2651bc3717cda35f2047aa38ce5ae5d89f3123455160fd4",
+      "bytes": 230672,
       "category": "runtime",
       "shipped": true
     },
@@ -181,8 +181,8 @@
     },
     {
       "path": "sd-inject.ps1",
-      "sha256": "2eb074e26d7225d50f8dca0e46ed04d87df83772c45d29b02cbff1a32df0d26e",
-      "bytes": 172573,
+      "sha256": "7c1380b089cfb864e7fd347f5bb3ae2f4fc533fd033da51f87649cd7be4d34cb",
+      "bytes": 178973,
       "category": "runtime",
       "shipped": true
     },
@@ -195,8 +195,8 @@
     },
     {
       "path": "smoke-skill.mjs",
-      "sha256": "916f00c0d01e539f5106272dfaef34120e04f521ecc0f201b2e234a7b57db079",
-      "bytes": 85093,
+      "sha256": "bb6afbf593911cd0cf75664bbd20418401f220253745c5d061fbad27bb5d5fe4",
+      "bytes": 91865,
       "category": "dev",
       "shipped": false
     },
@@ -267,6 +267,20 @@
       "path": "verify-integrity.mjs",
       "sha256": "96f2674b9dda7be3ba6d351c6ede91c0573af2a36f13114d2ceb53a1406fe03b",
       "bytes": 11906,
+      "category": "other",
+      "shipped": false
+    },
+    {
+      "path": "你们要学，我便教/~$要学，我便教.docx",
+      "sha256": "2148ec8ca4727c061f294f302f9039821ee17d8d882f67a0d753cb05aa8a4a50",
+      "bytes": 162,
+      "category": "other",
+      "shipped": false
+    },
+    {
+      "path": "你们要学，我便教/你们要学，我便教.docx",
+      "sha256": "02d11fcca6df0afaed68df59f5096050e55a7daf7ca125fbbfe404edac7e559c",
+      "bytes": 6749581,
       "category": "other",
       "shipped": false
     }

@@ -292,10 +292,14 @@ $script:SegmentWorker = {
     param([string]$Url, [long]$Start, [long]$End, [string]$Part, [int]$Tries)
     $need = $End - $Start + 1
     $tmp = "$Part.partnew"
+    # Issue 4 修复（2026-10-16 真机报告）：以前失败原因被 `catch {}` 完全吞掉，
+    # 用户只看到「分段下载全部失败」，无法判断是服务端不支持 Range、还是本地网络/代理问题。
+    # 现在把每次尝试的异常（或「长度不符」）收进 $errs，失败时一并回报。
+    $errs = @()
     for ($a = 1; $a -le $Tries; $a++) {
         $resp = $null; $src = $null; $dst = $null
         try {
-            if ((Test-Path -LiteralPath $Part) -and ((Get-Item -LiteralPath $Part).Length -eq $need)) { return $true }
+            if ((Test-Path -LiteralPath $Part) -and ((Get-Item -LiteralPath $Part).Length -eq $need)) { return @{ Ok = $true; Errs = @() } }
             # 308 手动跟一次：hf-mirror 对 resolve/main 下每个文件都回 308，PS5.1 不会自动跟随
             $eff = Resolve-HfRedirect -Url $Url
             $req = [System.Net.HttpWebRequest]::Create($eff)
@@ -313,12 +317,20 @@ $script:SegmentWorker = {
             $dst.Flush(); $dst.Close(); $dst = $null
             $src.Close(); $src = $null
             $resp.Close(); $resp = $null
-            if ((Get-Item -LiteralPath $tmp).Length -eq $need) {
+            $got = (Get-Item -LiteralPath $tmp).Length
+            if ($got -eq $need) {
                 Move-Item -LiteralPath $tmp -Destination $Part -Force
-                return $true
+                return @{ Ok = $true; Errs = $errs }
             }
+            # 长度不符：把「期望 vs 实收」记下来（服务端忽略 Range 时实收会是整文件长度）
+            $errs += "尝试 $a`: 长度不符（期望 $need，实收 $got）——服务端可能忽略了 Range 请求"
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         } catch {
+            $msg = $_.Exception.Message
+            if ($_.Exception.InnerException) { $msg = "$msg ← $($_.Exception.InnerException.Message)" }
+            $code = ''
+            try { if ($_.Exception.Response) { $code = " HTTP $([int]$_.Exception.Response.StatusCode)" } } catch { }
+            $errs += "尝试 $a`:$code $msg"
         } finally {
             if ($dst) { try { $dst.Dispose() } catch { } }
             if ($src) { try { $src.Dispose() } catch { } }
@@ -326,7 +338,7 @@ $script:SegmentWorker = {
         }
         Start-Sleep -Seconds ([Math]::Min(10, 2 * $a))
     }
-    return $false
+    return @{ Ok = $false; Errs = $errs }
 }
 
 function Get-SegmentedFile {
@@ -376,17 +388,42 @@ function Get-SegmentedFile {
         }
         Write-Host "分段并行下载（$Segs 段，共 $([math]::Round($total/1MB,1)) MB）：$effUrl"
         $failed = @()
+        $segErrs = @()
         foreach ($j in $jobs) {
             $ok = $false
-            try { $res = $j.Pipe.EndInvoke($j.Handle); $ok = [bool]($res[$res.Count - 1]) } catch { $ok = $false }
+            $detail = @()
+            try {
+                $res = $j.Pipe.EndInvoke($j.Handle)
+                # Issue 4（2026-10-16）：worker 现在回报 @{ Ok; Errs }，从这里取失败原因
+                if ($res -and $res.Count -gt 0) {
+                    $last = $res[$res.Count - 1]
+                    if ($last -is [hashtable] -and $last.ContainsKey("Ok")) {
+                        $ok = [bool]$last["Ok"]
+                        $detail = @($last["Errs"])
+                    } elseif ($last -is [psobject] -and $last.PSObject.Properties["Ok"]) {
+                        $ok = [bool]$last.Ok
+                        $detail = @($last.Errs)
+                    } else {
+                        $ok = [bool]$last
+                    }
+                }
+            } catch { $ok = $false; $detail = @("调用异常：$($_.Exception.Message)") }
             try { $j.Pipe.Dispose() } catch { }
-            if (-not $ok) { $failed += $j.Part }
+            if (-not $ok) {
+                $failed += $j.Part
+                if ($detail.Count -gt 0) { $segErrs += "[$([IO.Path]::GetFileName($j.Part))] $($detail[-1])" }
+            }
         }
         try { $pool.Close() } catch { }
         try { $pool.Dispose() } catch { }
 
         # 分段全挂（网络并发不稳 / 整段都失败）→ 自动降级单流重试一轮，而不是直接抛错
         if ($failed.Count -gt 0) {
+            # Issue 4（2026-10-16）：先把每个分段的失败原因摊开，别让用户只能猜「为什么不支持分段」
+            if ($segErrs.Count -gt 0) {
+                Write-Host "  分段失败原因（共 $($segErrs.Count) 段，展示前 3 条）：" -ForegroundColor DarkYellow
+                foreach ($e in ($segErrs | Select-Object -First 3)) { Write-Host "    $e" -ForegroundColor DarkGray }
+            }
             $left = @($parts | Where-Object { -not (Test-Path -LiteralPath $_) -or ((Get-Item -LiteralPath $_).Length -eq 0) })
             if ($failed.Count -eq $parts.Count -or $left.Count -eq $parts.Count) {
                 # 清理半成品分片（逐项 try/catch，别让残留句柄把脚本打断）
@@ -400,8 +437,15 @@ function Get-SegmentedFile {
                         Invoke-WebRequest -Uri $effUrl -OutFile $OutFile -UseBasicParsing -TimeoutSec 1800
                         $ok = (Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -eq $total)
                     } catch {
-                        Write-Host "单流第 $a 次失败：$($_.Exception.Message)" -ForegroundColor Yellow
-                        Start-Sleep -Seconds (3 * $a)
+                        # Issue 4（2026-10-16）：429 要退避重试——hf-mirror 对小文件限流，
+                        # 实测连打 4 次全 429 直接放弃（SemiRealMix / VAE / EasyNegative / badhandv4 都被挡）。
+                        $smsg = $_.Exception.Message
+                        $is429 = $smsg -match "429|Too Many Requests"
+                        $wait = if ($is429) { 30 * $a } else { 3 * $a }
+                        $tag = if ($is429) { "（429 限流，退避重试）" } else { "" }
+                        Write-Host "单流第 $a 次失败$tag：$smsg" -ForegroundColor Yellow
+                        Write-Host "  等待 ${wait}s 后重试…" -ForegroundColor DarkGray
+                        Start-Sleep -Seconds $wait
                     }
                 }
                 if (-not $ok) { throw "下载失败（分段与单流均失败）：$effUrl" }

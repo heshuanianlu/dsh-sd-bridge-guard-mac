@@ -622,8 +622,8 @@ assert.ok(/TARGET_LABELS/.test(autoMaskPy) && /衣服/.test(autoMaskPy) && /背�
 assert.ok(/set_classes\(\[word\]\)/.test(autoMaskPy), '必须单词逐个试（多词混喂会互相稀释，实测命中率骤降）')
 assert.ok(/SILHOUETTE_FALLBACK/.test(autoMaskPy), '找不到服饰词时必须按人物剪影兜底（而不是固定矩形）')
 assert.ok(/INVERT_TARGETS/.test(autoMaskPy), '背景目标必须取反（人以外的区域）')
-const bridgeSrc2 = fs.readFileSync(new URL('./sd-bridge.js', import.meta.url), 'utf8')
-assert.ok(bridgeSrc2.includes('sd-auto-mask.py'), '插件必须把 sd-auto-mask.py 同步进工作区')
+const bridgeSrcV101 = fs.readFileSync(new URL('./sd-bridge.js', import.meta.url), 'utf8')
+assert.ok(bridgeSrcV101.includes('sd-auto-mask.py'), '插件必须把 sd-auto-mask.py 同步进工作区')
 assert.ok(/function New-AutoMaskFromImage/.test(injectPs1), 'sd-inject.ps1 必须有自动抠图调用函数')
 assert.ok(/function Find-SdPython/.test(injectPs1), '必须能定位 SD 自带的 python')
 assert.ok(/自动（按图内容抠图）/.test(injectPs1), '蒙版下拉首项必须是「自动（按图内容抠图）」')
@@ -646,12 +646,81 @@ assert.ok(/对话侧：底图已解析并锁定/.test(injectPs1), '底图必须�
 assert.ok(/对话侧：按参考图内容抠/.test(injectPs1), '蒙版必须在弹表单前画好（对话侧完成绘制）')
 assert.ok(/对话侧：蒙版已生成并锁定/.test(injectPs1), '画好的蒙版必须打印出路径')
 assert.ok(/premask-/.test(injectPs1), '预生成蒙版要落到可见目录（premask-<参考图>-<目标>.png）')
-assert.ok(/\$applyExternalLock = \{/.test(injectPs1) && /对话已按图抠好蒙版并锁定/.test(injectPs1), '锁定状态必须有明确文案')
+// 2026-10-16 用户要求：蒙版**不再锁定**，任何情况下都保持可编辑（自动抠图只预填）。
+assert.ok(/\$applyExternalLock = \{/.test(injectPs1), '外部锁定逻辑必须存在（底图仍需锁定）')
 assert.ok(/对话已解析底图并锁定/.test(injectPs1), '底图锁定文案必须存在')
+assert.ok(!/对话已按图抠好蒙版并锁定/.test(injectPs1), '蒙版锁定文案必须已移除（用户要求不再锁定蒙版）')
+assert.ok(!/\$cboMask\.Enabled = \$false/.test(injectPs1), '蒙版下拉不得被禁用（用户要求始终可编辑）')
+assert.ok((injectPs1.match(/\$lockMask = \$false/g) || []).length >= 3, '三处蒙版来源（图片/box/自动抠图）都必须传 lockMask=false')
+assert.ok(!/\$lockMask = \$true/.test(injectPs1), '不得再出现 lockMask = $true（蒙版永不锁定）')
 assert.ok(/if \(\$Mode -eq '图生图' -and \$preInitPath\)/.test(injectPs1), '只在图生图且底图解析成功时才预画蒙版')
-assert.ok(/elseif \(\$mspec -match '\^box'\)/.test(injectPs1), '精确框 box: 必须原样锁定（不再画）')
+assert.ok(/elseif \(\$mspec -match '\^box'\)/.test(injectPs1), '精确框 box: 必须原样预填')
 assert.ok(/MaskDefault \$\(if \(\$preMaskText\)/.test(injectPs1), '表单蒙版默认值必须优先用对话画好的蒙版')
 console.log('PREDRAW+LOCK SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 手绘蒙版（2026-10-16，用户实测两轮修复）：
+// 坑35：WinForms 事件处理器不继承函数局部作用域 → 共享对象必须走 $script: 作用域；
+// 坑36：ColorMatrix 做显示层实测把底图盖白 → 改用独立红色叠加层。
+// ---------------------------------------------------------------------------
+assert.ok(/function Show-MaskPainter \{/.test(injectPs1), '必须存在 Show-MaskPainter 手绘函数')
+assert.ok(/手动绘制（鼠标涂抹）/.test(injectPs1), '蒙版下拉必须有「手动绘制（鼠标涂抹）」选项')
+assert.ok(/\$maskSpec -match '\^手动/.test(injectPs1), '决策段必须识别「手动绘制」并弹出绘制窗口')
+assert.ok(/\$script:mp_canvas/.test(injectPs1), '坑35：画布必须放 $script: 作用域（事件处理器不继承局部作用域）')
+assert.ok(/\$script:mp_maskG/.test(injectPs1), '坑35：蒙版 Graphics 必须放 $script: 作用域')
+assert.ok(/\$script:mp_recompose = \{/.test(injectPs1), '坑35：重绘闭包必须放 $script: 作用域')
+assert.ok(!/mp_redMatrix/.test(injectPs1), '坑36：不得再用 ColorMatrix 做显示层（实测盖白底图）')
+assert.ok(/\$script:mp_redBmp/.test(injectPs1), '坑36：必须有独立红色叠加层位图')
+assert.ok(/CompositingMode\]::SourceCopy/.test(injectPs1), '擦除必须用 SourceCopy 置 alpha=0（SourceOver 擦不掉）')
+assert.ok(/\$script:mp_brushSize/.test(injectPs1) && /MouseWheel/.test(injectPs1), '滚轮必须能调笔刷大小')
+assert.ok(/mp_cursor/.test(injectPs1) && /DrawEllipse/.test(injectPs1), '必须有跟随光标的笔刷圈')
+assert.ok(/NearestNeighbor/.test(injectPs1), '存盘必须按原图尺寸用 NearestNeighbor 还原')
+console.log('MASK-PAINTER SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 真机报告修复（2026-10-16，5 个 issue）防回归断言：Issue 1/2/3/4/5
+// ---------------------------------------------------------------------------
+assert.ok(injectPs1.includes('if ($NoVlmReview) { return -1 }'), 'Issue1: Test-FaceQuality 必须在 NoVlmReview 时早退')
+assert.ok(injectPs1.includes('if (-not (Test-VlmApi)) { return -1 }'), 'Issue1: Test-FaceQuality 必须在 VLM 不可达时早退')
+assert.ok(injectPs1.includes("if (Test-VlmApi) { Ensure-Vram -For 'sd' -Note '视觉审核' }"), 'Issue1: 视觉审核的 Ensure-Vram 必须被 Test-VlmApi 守卫')
+assert.ok(injectPs1.includes('$vlmDown = [bool]$NoVlmReview'), 'Issue3: -NoVlmReview 必须让最终轮质检整条不跑')
+assert.ok(injectPs1.includes('$score = if ($vlmOk) { Test-FaceQuality'), 'Issue3: 素体轮质检必须受 $vlmOk 控制')
+
+assert.ok(bridgeSrcV101.includes('function buildInjectCfgSwitches(cfg, args)'), 'Issue2: 必须有共用的 cfg 开关构建器')
+assert.equal((bridgeSrcV101.match(/for \(const sw of injectCfgSwitches\)/g) || []).length, 2, 'Issue2: 命令与 launcher 必须共用同一份开关（两处调用）')
+assert.ok(/vramRelease: true/.test(bridgeSrcV101) && /vramMinFreeGb: 4\.0/.test(bridgeSrcV101), 'Issue3: 必须暴露 vramRelease / vramMinFreeGb 默认值')
+assert.ok(/vramRelease: z/.test(bridgeSrcV101) && /vramMinFreeGb: z/.test(bridgeSrcV101), 'Issue3: 必须暴露 vramRelease / vramMinFreeGb schema')
+assert.ok(bridgeSrcV101.includes('function withGitOnPath(env)'), 'Issue5: 必须有 git PATH 修补函数')
+assert.ok(bridgeSrcV101.includes('const patched = withGitOnPath(base)'), 'Issue5: buildLaunchEnv 必须调用 withGitOnPath')
+
+const installSrcV101 = fs.readFileSync(new URL('./install-sd.ps1', import.meta.url), 'utf8')
+assert.ok(installSrcV101.includes('return @{ Ok = $false; Errs = $errs }'), 'Issue4: SegmentWorker 必须回报失败原因')
+assert.ok(installSrcV101.includes('分段失败原因（共'), 'Issue4: 必须打印每段失败原因')
+assert.ok(/429\|Too Many Requests/.test(installSrcV101), 'Issue4: 单流必须对 429 退避重试')
+console.log('REAL-ISSUES SMOKE OK')
+
+
+// ---------------------------------------------------------------------------
+// 显存自愈三级降级（用户要求 2026-10-16）：
+// ① 最多 3 轮清理显存；② 仍不够 → CPU 推理；③ CPU 起不来 → 核显。
+// ---------------------------------------------------------------------------
+assert.ok(bridgeSrcV101.includes('async function ensureVramWithRetry'), '显存自愈：必须有三级降级决策函数')
+assert.ok(bridgeSrcV101.includes('function queryFreeVramGb'), '显存自愈：必须能读剩余显存')
+assert.ok(bridgeSrcV101.includes('async function releaseVramSide'), '显存自愈：必须能清 SD 与本地模型两侧')
+assert.ok(/for \(let i = 1; i <= 3; i\+\+\)/.test(bridgeSrcV101), '显存自愈：必须是「最多 3 轮」清理')
+assert.ok(bridgeSrcV101.includes("'--use-cpu', 'all'"), '显存自愈：CPU 模式必须用 --use-cpu all')
+assert.ok(bridgeSrcV101.includes("'--no-half'") && bridgeSrcV101.includes("'--precision', 'full'"), '显存自愈：CPU 模式必须 --no-half + --precision full')
+assert.ok(!/cpuModeArgs\(\)[\s\S]{0,400}--threads/.test(bridgeSrcV101), '显存自愈：CPU 参数不得含 --threads（A1111 v1.10.1 不认，实测启动失败）')
+assert.ok(bridgeSrcV101.includes('function igpuModeArgs'), '显存自愈：必须有核显模式')
+assert.ok(bridgeSrcV101.includes('function detectIgpu'), '显存自愈：必须能探测核显')
+assert.ok(bridgeSrcV101.includes('async function apiPostWithVramHeal'), '显存自愈：出图撞 500 必须能自愈')
+assert.ok(bridgeSrcV101.includes('function isVramError'), '显存自愈：必须能识别显存类错误')
+assert.ok(/Not enough memory/.test(bridgeSrcV101) && /Expected all tensors to be on the same device/.test(bridgeSrcV101), '显存自愈：两类现场都要认（内存不足 + 设备分裂）')
+assert.ok(bridgeSrcV101.includes('vramAutoFallback: true'), '显存自愈：必须有开关且默认开')
+assert.ok((bridgeSrcV101.match(/apiPostWithVramHeal\(/g) || []).length >= 4, '显存自愈：txt2img/img2img 出图路径都要接上')
+console.log('VRAM-FALLBACK SMOKE OK')
 
 
 // ---------------------------------------------------------------------------
