@@ -1,7 +1,7 @@
 {
   "name": "dsh-sd-bridge-guard",
-  "version": "1.0.2",
-  "generatedAt": "2026-10-16T14:03:02.620Z",
+  "version": "1.0.3",
+  "generatedAt": "2026-10-16T14:04:39.988Z",
   "fileCount": 38,
   "files": [
     {
@@ -27,8 +27,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "c4249f1bf697f54d5b87730baaf5d0cb3eb7f8c69b874f929e5f1eb279e7481d",
-      "bytes": 139948,
+      "sha256": "d53e54743b696bd64c3217a444397c2fad621150d3d6f4c09a54cb214fd75665",
+      "bytes": 140542,
       "category": "doc",
       "shipped": true
     },
@@ -146,7 +146,7 @@
     },
     {
       "path": "package.json",
-      "sha256": "13f06dc3280feb851625ffa5af637116b237ab9d4dbd96fea8c2ff9a0cb943b9",
+      "sha256": "cbd1276e865f505226d6c31d538bf111a50cb50a7e54b432746ab44c1d84af7e",
       "bytes": 2979,
       "category": "runtime",
       "shipped": false
