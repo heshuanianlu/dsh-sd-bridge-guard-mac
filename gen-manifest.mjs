@@ -61,6 +61,9 @@ function classify(rel) {
 
 /** 忽略的路径（不参与清单）。 */
 function ignored(rel) {
+  // 误落进仓库目录的无关文档（2026-10-16）：不参与清单
+  if (rel.startsWith('你们要学，我便教/')) return true
+  if (/~\$/.test(rel)) return true
   if (rel.startsWith('node_modules/')) return true
   if (rel.startsWith('.git/')) return true
   if (rel.startsWith('Microsoft/')) return true // PS ModuleAnalysisCache 之类运行时产物

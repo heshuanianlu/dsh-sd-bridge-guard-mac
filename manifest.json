@@ -1,8 +1,8 @@
 {
   "name": "dsh-sd-bridge-guard",
   "version": "1.0.2",
-  "generatedAt": "2026-10-16T13:56:52.129Z",
-  "fileCount": 40,
+  "generatedAt": "2026-10-16T14:03:02.620Z",
+  "fileCount": 38,
   "files": [
     {
       "path": ".gitattributes",
@@ -132,8 +132,8 @@
     },
     {
       "path": "gen-manifest.mjs",
-      "sha256": "02899a9e14723508e177f3d0b74029655c1e4dc8f70e0e5b5cc55bacd2ee1d6f",
-      "bytes": 5494,
+      "sha256": "745f3a505bf212785fe327ba6efd53bb18db757e562c32b12ed9b5409140273e",
+      "bytes": 5668,
       "category": "dev",
       "shipped": false
     },
@@ -267,20 +267,6 @@
       "path": "verify-integrity.mjs",
       "sha256": "96f2674b9dda7be3ba6d351c6ede91c0573af2a36f13114d2ceb53a1406fe03b",
       "bytes": 11906,
-      "category": "other",
-      "shipped": false
-    },
-    {
-      "path": "你们要学，我便教/~$要学，我便教.docx",
-      "sha256": "2148ec8ca4727c061f294f302f9039821ee17d8d882f67a0d753cb05aa8a4a50",
-      "bytes": 162,
-      "category": "other",
-      "shipped": false
-    },
-    {
-      "path": "你们要学，我便教/你们要学，我便教.docx",
-      "sha256": "02d11fcca6df0afaed68df59f5096050e55a7daf7ca125fbbfe404edac7e559c",
-      "bytes": 6749581,
       "category": "other",
       "shipped": false
     }
