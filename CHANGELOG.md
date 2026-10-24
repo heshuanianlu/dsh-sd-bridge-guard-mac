@@ -1,12 +1,12 @@
 # Changelog
 
-> **验证范围（0.7.0-mac）**：仅在一台机器验证 —— Apple M4（`Mac16,10`）/ 16 GB 统一内存 /
+> **验证范围（0.7.0-mac.1）**：仅在一台机器验证 —— Apple M4（`Mac16,10`）/ 16 GB 统一内存 /
 > macOS 27.0.1（build `26A434`，arm64）/ Python 3.10.22 / torch 2.3.1（MPS 可用）/ Node v22.22.3。
 > 未验证：Intel Mac、其它 macOS 版本与芯片（M1/M2/M3/M5）、其它 DSH 版本、
 > `sd-auto-mask.py` / `sd-mask-qa.py` 支线、MPS 显存自愈（macOS 上跳过显存门槛判断）。
 
 
-## 0.7.0-mac（macOS / Apple Silicon 移植）
+## 0.7.0-mac.1（macOS / Apple Silicon 移植）
 
 上游 0.7.0 只能跑 Windows；本 fork 把**平台层**整体重做，六个工具的参数、返回结构、贴图/附件链路一字不改。
 后端选择 A1111-compatible WebUI（`/sdapi/v1/*`），因为六个工具与它 1:1 对应，ComfyUI/stable-diffusion.cpp 都需要重写调用层。

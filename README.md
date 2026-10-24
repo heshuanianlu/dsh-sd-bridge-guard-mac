@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/dsh-sd-bridge-guard.svg)](https://www.npmjs.com/package/dsh-sd-bridge-guard)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/savinglighting/dsh-sd-bridge-guard/blob/main/LICENSE)
 
-**DeepSeek Harness 插件 · 本机 Stable Diffusion 生图六件套 · macOS 移植版（0.7.0 → 0.7.0-mac）**
+**DeepSeek Harness 插件 · 本机 Stable Diffusion 生图六件套 · macOS 移植版（0.7.0 → 0.7.0-mac.1）**
 
 > 本目录是 npm 包 `dsh-sd-bridge-guard@0.7.0`（Windows 向）的 **macOS 移植 fork**：六个工具的参数、返回结构、贴图与附件链路完全不变，只重做平台层（目录探测、venv 解释器、Apple Silicon 启动参数、可复现脚本改成 `sd-direct.sh` + bash）。Windows 分支代码保留在同一个文件里，用 `IS_POSIX` / `IS_MAC` 判据分叉。
 > 下面标 🍎 的段落是本 fork 相对上游的差异；其余文档与上游一致（个别路径已改成 POSIX 写法）。
