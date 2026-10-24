@@ -1,6 +1,6 @@
 {
   "name": "dsh-sd-bridge-guard",
-  "version": "0.7.0-mac.1",
+  "version": "0.7.0-mac",
   "description": "DeepSeek Harness 插件（macOS 移植自 0.7.0）：本机 Stable Diffusion（A1111-compatible WebUI）生图六件套——文生图 / 图生图 / 蒙版重绘 / 只生成可复现脚本 / 模型清单 / 服务管理。SD 目录自动探测（含 /Volumes 外接卷），找不到时可一键自举安装（install-sd-macos.sh：Python 3.10 venv + MPS 版 torch + 同 sha256 校验的模型/VAE/LoRA）；Apple Silicon 必需的 launch.py 参数由插件自动补齐。",
   "keywords": [
     "dsh",
