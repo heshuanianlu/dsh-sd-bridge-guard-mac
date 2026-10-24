@@ -62,6 +62,17 @@ export const inject = ['tools']
 
 const PKG_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)))
 
+// ---------------------------------------------------------------------------
+// 平台分叉（macOS 移植）：全文件只有这一处判据，其余代码只读这两个常量。
+//   IS_POSIX —— venv 布局（venv/bin/python）、可复现脚本形态（bash 而非 PowerShell）、无盘符概念
+//   IS_MAC   —— Apple Silicon / Intel Mac 的 launch.py 参数与 MPS 环境（对齐 webui-macos-env.sh）
+//   注意：必须声明在 DEFAULTS 之前——DEFAULTS.startupTimeoutMs 就用到 IS_MAC，
+//   放到函数区（detectSdDir 之前）会踩 ES 模块的暂时性死区（真机冒烟测试抓到的）。
+// ---------------------------------------------------------------------------
+const IS_POSIX = process.platform !== 'win32'
+const IS_MAC = process.platform === 'darwin'
+
+
 /**
  * 反 NSFW「安全底噪」——**加权**负向词（权重机制）。
  *
@@ -90,7 +101,7 @@ const DEFAULTS = {
   /** 探测不到 API 时是否由插件自动启动 SD */
   autoStart: true,
   /** 启动 SD 的最长等待（首次还要加载 checkpoint，给足余量） */
-  startupTimeoutMs: 420000,
+  startupTimeoutMs: IS_MAC ? 900000 : 420000,
   /** 单次生图请求的最长等待 */
   requestTimeoutMs: 600000,
   /** 空闲多少分钟后自动关掉由本插件拉起的 SD（0 = 不自动关） */
@@ -314,19 +325,40 @@ function detectSdDir(explicit) {
   ]
   const home = process.env.USERPROFILE || process.env.HOME || ''
   const localAppData = process.env.LOCALAPPDATA || ''
-  const fixedCandidates = [
-    home && path.join(home, 'stable-diffusion-webui'),
-    home && path.join(home, 'sd.webui'),
-    localAppData && path.join(localAppData, 'stable-diffusion-webui'),
-    localAppData && path.join(localAppData, 'Programs'),
-    'D:/SD.4.8',
-  ]
+  const fixedCandidates = IS_POSIX
+    ? [
+        home && path.join(home, 'stable-diffusion-webui'),
+        home && path.join(home, 'sd.webui'),
+        home && path.join(home, 'ComfyUI'),
+        '/opt/stable-diffusion-webui',
+        '/usr/local/stable-diffusion-webui',
+        '/srv/stable-diffusion-webui',
+      ]
+    : [
+        home && path.join(home, 'stable-diffusion-webui'),
+        home && path.join(home, 'sd.webui'),
+        localAppData && path.join(localAppData, 'stable-diffusion-webui'),
+        localAppData && path.join(localAppData, 'Programs'),
+        'D:/SD.4.8',
+      ]
   for (const candidate of fixedCandidates) {
     if (looksLikeSdDir(candidate)) return path.resolve(candidate).replace(/[\\/]+$/, '')
   }
-  // 各盘根目录下的常见安装名
-  for (let code = 67; code <= 90; code += 1) {
-    const root = `${String.fromCharCode(code)}:/`
+  // 常见安装名所在的「根」：Windows = 盘符 C:–Z:；macOS = /Volumes 下每个外接卷；
+  // Linux = /media、/mnt 下每个挂载点（用户常把 WebUI 装在外置盘）
+  const roots = []
+  if (IS_POSIX) {
+    for (const parent of IS_MAC ? ['/Volumes'] : ['/media', '/mnt']) {
+      try {
+        for (const name of fs.readdirSync(parent)) roots.push(path.join(parent, name))
+      } catch {
+        /* 目录不存在就跳过 */
+      }
+    }
+  } else {
+    for (let code = 67; code <= 90; code += 1) roots.push(`${String.fromCharCode(code)}:/`)
+  }
+  for (const root of roots) {
     for (const name of dirNames) {
       const candidate = path.join(root, name)
       if (looksLikeSdDir(candidate)) return path.resolve(candidate).replace(/[\\/]+$/, '')
@@ -337,6 +369,17 @@ function detectSdDir(explicit) {
 
 /** 找不到 SD 时给所有工具统一的可读指引（不抛栈、不静默） */
 function installGuidance() {
+  if (IS_POSIX) {
+    const script = path.join(PKG_DIR, 'install-sd-macos.sh')
+    return (
+      'sd-bridge: 未找到本机 Stable Diffusion WebUI（配置 sdDir 为空且自动探测无果）。\n' +
+      '尚未安装 SD？在终端里跑一条命令自动装（WebUI + 模型，约 10-30 分钟）：\n' +
+      `bash "${script}" -Target "$HOME/stable-diffusion-webui"\n` +
+      '装完重启 DSH 即可；外置盘安装把 -Target 指到那个盘（需 ≥15GB）。' +
+      'Apple Silicon 走 MPS，512×768 约 20-60 秒/张。\n' +
+      '已装过 SD？把路径写进环境变量 DSH_SD_DIR，或在 cordis.patch.yml 按 id sd-bridge 覆盖 sdDir。'
+    )
+  }
   const script = path.join(PKG_DIR, 'install-sd.ps1')
   return (
     'sd-bridge: 未找到本机 Stable Diffusion WebUI（配置 sdDir 为空且自动探测无果）。\n' +
@@ -539,18 +582,32 @@ async function apiPostWithVramHeal(route, payload, timeoutMs) {
 // ---------------------------------------------------------------------------
 
 function resolvePython() {
-  const candidates = [
-    path.join(cfg.sdDir, 'python', 'python.exe'),
-    path.join(cfg.sdDir, 'venv', 'Scripts', 'python.exe'),
-    path.join(cfg.sdDir, 'venv', 'bin', 'python'),
-  ]
+  const candidates = IS_POSIX
+    ? [
+        // A1111 的 webui.sh 与 install-sd-macos.sh 都建 venv/bin/python
+        path.join(cfg.sdDir, 'venv', 'bin', 'python'),
+        path.join(cfg.sdDir, 'venv', 'bin', 'python3'),
+        // 有的 mac 安装把解释器放在 python/ 下（conda 基底）
+        path.join(cfg.sdDir, 'python', 'bin', 'python3'),
+        path.join(cfg.sdDir, '.py310', 'bin', 'python'),
+      ]
+    : [
+        path.join(cfg.sdDir, 'python', 'python.exe'),
+        path.join(cfg.sdDir, 'venv', 'Scripts', 'python.exe'),
+      ]
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) return candidate
   }
-  // 兜底：install-sd.ps1 自举装的 Python（记录里的 pythonDir），排在 SD 自带 python/venv 之后
+  // 兜底：自举安装记录里的解释器目录，排在 SD 自带 python/venv 之后
   const recorded = statePythonDir()
-  if (recorded) return path.join(recorded, 'python.exe')
-  return 'python'
+  if (recorded) {
+    for (const rel of IS_POSIX ? [['bin', 'python3'], ['bin', 'python']] : [['python.exe']]) {
+      const candidate = path.join(recorded, ...rel)
+      if (fs.existsSync(candidate)) return candidate
+    }
+  }
+  // 现代 macOS 只有 python3、没有 python（spawn('python') 会 ENOENT）
+  return IS_POSIX ? 'python3' : 'python'
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +794,8 @@ function buildLaunchEnv(prepared) {
   const base = {
     ...process.env,
     GRADIO_ANALYTICS_ENABLED: 'False',
+    // Apple Silicon：MPS 缺算子时回落 CPU 而不是直接崩（A1111 + torch 2.x 的必需项）
+    ...(IS_MAC ? { PYTORCH_ENABLE_MPS_FALLBACK: '1' } : {}),
     ...buildHfEnv(prepared),
     ...(prepared ? {} : buildFreshEnv()),
   }
@@ -772,6 +831,9 @@ function buildLaunchEnv(prepared) {
 
 /** 用 nvidia-smi 查剩余显存（GB）；没 nvidia-smi / 查询失败返回 -1（表示「拿不到信息」）。 */
 function queryFreeVramGb() {
+  // macOS 没有 CUDA/nvidia-smi（统一内存走 MPS），直接返回「拿不到信息」，
+  // 让显存自愈逻辑跳过硬门槛判断，而不是 spawn 一个不存在的命令。
+  if (IS_MAC) return -1
   try {
     const r = spawnSync('nvidia-smi', ['--query-gpu=memory.free', '--format=csv,noheader,nounits'], {
       encoding: 'utf8',
@@ -968,6 +1030,11 @@ function spawnServer(mode = 'gpu') {
     '--port', String(cfg.port),
     ...(prepared ? ['--skip-prepare-environment'] : []),
     '--skip-version-check',
+    // macOS 必需（本机实测踩坑）：绕过 webui.sh 直接 spawn launch.py 拿不到
+    // webui-macos-env.sh 里的 COMMANDLINE_ARGS，必须在这里补齐，否则 prepare_environment
+    // 会按 CUDA 装机、或半精度在 MPS 上出黑图。interrogate 单独走 CPU（CLIP 在 MPS 上不稳）。
+    ...(IS_MAC ? ['--skip-torch-cuda-test', '--upcast-sampling', '--no-half-vae'] : []),
+    ...(IS_MAC && mode === 'gpu' ? ['--use-cpu', 'interrogate'] : []),
     ...modeArgs,
     ...(Array.isArray(cfg.extraArgs) ? cfg.extraArgs : []),
   ]
@@ -1616,15 +1683,34 @@ function syncScriptFile(file, target) {
   }
 }
 
+/** 平台对应的可复现脚本文件名（Windows = PowerShell，POSIX = bash） */
+const DIRECT_SCRIPT = IS_POSIX ? 'sd-direct.sh' : 'sd-direct.ps1'
+
 function syncDirectScripts(wsRoot) {
   const root = path.resolve(wsRoot || process.cwd())
   let allOk = true
-  for (const file of ['sd-direct.ps1', 'sd-inject.ps1', 'sd-auto-mask.py']) {
+  // sd-auto-mask.py 两边通用；sd-inject.ps1 是 PowerShell 专用，POSIX 不发
+  const files = IS_POSIX ? [DIRECT_SCRIPT, 'sd-auto-mask.py'] : [DIRECT_SCRIPT, 'sd-inject.ps1', 'sd-auto-mask.py']
+  for (const file of files) {
     if (!syncScriptFile(file, path.join(root, file))) allOk = false
   }
-  // SD 目录只放 sd-direct.ps1（用户想从 SD 目录手跑脚本时用得到；放 sd-inject.ps1 没意义）
+  // POSIX 上 bash 脚本必须有执行位（否则用户 `./sd-direct.sh` 直接 Permission denied）
+  if (IS_POSIX) {
+    try {
+      fs.chmodSync(path.join(root, DIRECT_SCRIPT), 0o755)
+    } catch {
+      /* 不支持 chmod 的文件系统忽略 */
+    }
+  }
   if (cfg.sdDir && path.resolve(cfg.sdDir) !== root) {
-    if (!syncScriptFile('sd-direct.ps1', path.join(cfg.sdDir, 'sd-direct.ps1'))) allOk = false
+    if (!syncScriptFile(DIRECT_SCRIPT, path.join(cfg.sdDir, DIRECT_SCRIPT))) allOk = false
+    if (IS_POSIX) {
+      try {
+        fs.chmodSync(path.join(cfg.sdDir, DIRECT_SCRIPT), 0o755)
+      } catch {
+        /* 同上 */
+      }
+    }
   }
   if (allOk) syncedRoots.add(root)
 }
@@ -1637,14 +1723,26 @@ function syncDirectScripts(wsRoot) {
  */
 function syncDirectInto() {
   if (!cfg.sdDir) return
-  syncScriptFile('sd-direct.ps1', path.join(cfg.sdDir, 'sd-direct.ps1'))
+  syncScriptFile(DIRECT_SCRIPT, path.join(cfg.sdDir, DIRECT_SCRIPT))
+  if (IS_POSIX) {
+    try {
+      fs.chmodSync(path.join(cfg.sdDir, DIRECT_SCRIPT), 0o755)
+    } catch {
+      /* 忽略 */
+    }
+  }
 }
 
 /** 命令里的脚本路径 = 当前工作区根目录下的 sd-direct.ps1（绝对路径，单行命令可直接复制运行） */
 function directPathFor(wsRoot) {
   const root = path.resolve(wsRoot || process.cwd())
   if (!syncedRoots.has(root)) syncDirectScripts(root)
-  return path.join(root, 'sd-direct.ps1')
+  return path.join(root, DIRECT_SCRIPT)
+}
+
+/** 文本 → POSIX shell 单引号字面量（单引号内除 ' 外都是字面量，最安全） */
+function shQuote(text) {
+  return "'" + String(text ?? '').replace(/'/g, `'\\''`) + "'"
 }
 
 /** 文本 → powershell 双引号字符串字面量（PowerShell 用反引号转义 ` " $） */
@@ -1669,15 +1767,19 @@ function psQuote(text) {
  * mode：'文生图' | '图生图'
  */
 function buildCommand(mode, opts, directPath, outDir) {
-  const parts = ['powershell', '-ExecutionPolicy', 'Bypass', '-File', psQuote(directPath), '-Prompt', psQuote(opts.prompt)]
-  if (opts.negative) parts.push('-Negative', psQuote(opts.negative))
+  // POSIX：bash "<脚本>" -Prompt '...'（单行、可直接复制到终端跑）
+  const q = IS_POSIX ? shQuote : psQuote
+  const parts = IS_POSIX
+    ? ['bash', q(directPath), '-Prompt', q(opts.prompt)]
+    : ['powershell', '-ExecutionPolicy', 'Bypass', '-File', q(directPath), '-Prompt', q(opts.prompt)]
+  if (opts.negative) parts.push('-Negative', q(opts.negative))
   const usesInitImage = mode === '图生图' || mode === '蒙版重绘'
   if (usesInitImage) {
-    if (opts.initImage) parts.push('-InitImage', psQuote(opts.initImage))
+    if (opts.initImage) parts.push('-InitImage', q(opts.initImage))
     if (opts.denoising !== undefined) parts.push('-Denoising', String(opts.denoising))
   }
   if (mode === '蒙版重绘') {
-    if (opts.mask) parts.push('-Mask', psQuote(opts.mask))
+    if (opts.mask) parts.push('-Mask', q(opts.mask))
     if (opts.maskBlur !== undefined) parts.push('-MaskBlur', String(opts.maskBlur))
     if (opts.inpaintingFill !== undefined) parts.push('-InpaintFill', String(opts.inpaintingFill))
     if (opts.maskInvert) parts.push('-MaskInvert')
@@ -1686,12 +1788,12 @@ function buildCommand(mode, opts, directPath, outDir) {
   }
   parts.push('-Width', String(opts.width), '-Height', String(opts.height))
   if (opts.steps !== undefined) parts.push('-Steps', String(opts.steps))
-  if (opts.sampler) parts.push('-Sampler', psQuote(opts.sampler))   // 采样器显式带上，复现才一致
+  if (opts.sampler) parts.push('-Sampler', q(opts.sampler))   // 采样器显式带上，复现才一致
   if (Number.isFinite(opts.seed) && opts.seed >= 0) parts.push('-Seed', String(opts.seed))
-  if (outDir) parts.push('-OutDir', psQuote(outDir))
-  if (mode === '文生图' && opts.name) parts.push('-Name', psQuote(opts.name))
+  if (outDir) parts.push('-OutDir', q(outDir))
+  if (mode === '文生图' && opts.name) parts.push('-Name', q(opts.name))
   // 外部词表：只透传路径，内容由用户在执行前提供；插件不读取、不写入、不解析
-  if (opts.termFile) parts.push('-TermFile', psQuote(opts.termFile))
+  if (opts.termFile) parts.push('-TermFile', q(opts.termFile))
   return parts.join(' ')
 }
 
@@ -1701,8 +1803,10 @@ function commandBlock(mode, command) {
     mode,
     command,
     asMarkdown:
-      '【' + mode + '】\n```powershell\n' +
-      '# 复制下面整行到 PowerShell / cmd 直接运行（已含 powershell -ExecutionPolicy Bypass 前缀，勿拆行、勿改成 & "路径" 调用；跑完保存后会**自动打开这张图**，加 -NoOpen 可关）\n' +
+      '【' + mode + '】\n' + (IS_POSIX ? '```bash\n' : '```powershell\n') +
+      (IS_POSIX
+        ? '# 复制下面整行到终端直接运行（跑完保存后会**自动打开这张图**，加 -NoOpen 可关）\n'
+        : '# 复制下面整行到 PowerShell / cmd 直接运行（已含 powershell -ExecutionPolicy Bypass 前缀，勿拆行、勿改成 & "路径" 调用；跑完保存后会**自动打开这张图**，加 -NoOpen 可关）\n') +
       command +
       '\n```',
   }

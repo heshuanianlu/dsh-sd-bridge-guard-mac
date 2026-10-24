@@ -1,6 +1,6 @@
 {
   "name": "dsh-sd-bridge-guard",
-  "version": "1.0.3",
+  "version": "1.0.3-mac.1",
   "description": "DeepSeek Harness 插件：本机 Stable Diffusion 生图九件套（文生图/图生图/蒙版重绘/只生成脚本/双版本对齐脚本/C 档本地注入命令/模型清单/服务管理/完整性检测）+ 违规分流协议 + C 档选项表（A 档出图后罗列模型/LoRA/比例等，一句话即可重出图）；C 档蒙版支持鼠标手绘。跨机器零适配——SD 目录自动探测，找不到可一键自举安装，产物目录自动落在会话工作区。",
   "keywords": [
     "dsh",
@@ -35,7 +35,10 @@
     "test-vlm-cleanup.ps1",
     "test-automask-retry.ps1",
     "test-vram-release.ps1",
-    "test-trailing-comma.ps1"
+    "test-trailing-comma.ps1",
+    "install-sd-macos.sh",
+    "sd-direct.sh",
+    "fix-macho-zerofill.py"
   ],
   "scripts": {
     "test": "node smoke-skill.mjs && node test-install-record.mjs && node test-settings.mjs && node test-install-catalog.mjs",

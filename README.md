@@ -9,6 +9,26 @@
 
 ---
 
+## macOS / Apple Silicon 支持（实验性）
+
+本分支为 1.0.3 增加 macOS 原生支持，**Windows 行为未变**（全部由 `IS_POSIX` / `IS_MAC` 守卫）：
+
+- **SD 目录探测**：`$HOME` 常见位置 + `/opt` `/usr/local` `/srv` + **`/Volumes/*` 每个外接卷**
+- **解释器解析**：`venv/bin/python` → `venv/bin/python3` → `python/bin/python3` → `.py310/bin/python` → `python3`
+- **launch.py 参数**：`--skip-torch-cuda-test --upcast-sampling --no-half-vae`，gpu 模式另加 `--use-cpu interrogate`
+- **MPS 环境**：`PYTORCH_ENABLE_MPS_FALLBACK=1`；冷启动超时 900s（外接盘读权重 + MPS 首编内核）
+- **可复现脚本**：`sd-direct.sh`（bash，参数同 `sd-direct.ps1`，同步时 `chmod 755`，代码块标注改 ```bash）
+- **自举安装**：`install-sd-macos.sh`；辅助工具 `fix-macho-zerofill.py`
+
+### ⚠️ 验证范围
+
+**仅在一台机器验证过**：Apple M4（`Mac16,10`）/ 16 GB 统一内存 / **macOS 27.0.1（build 26A434，arm64）**
+/ Python 3.10.22 / torch 2.3.1（MPS 可用）/ Node v22.22.3。
+
+**未验证**：Intel Mac、其它 macOS 版本与芯片（M1/M2/M3/M5）、其它 DSH 版本、
+`sd-auto-mask.py` 与 `sd-mask-qa.py` 支线、MPS 显存压力自愈（macOS 上 `queryFreeVramGb()` 返回 `-1`，跳过门槛判断）。
+
+
 ## 🆕 版本更新内容（v1.0.1 · 2026-10-16）
 
 **本轮三件事：下载后能自查缺什么、蒙版可以鼠标手绘、C 档违禁词能注入表单。**

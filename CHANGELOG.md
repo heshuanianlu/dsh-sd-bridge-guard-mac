@@ -1,4 +1,18 @@
-# Changelog
+## 1.0.3-mac.1（macOS / Apple Silicon 支持 · 实验性）
+
+基于 `1.0.3` 增加 macOS 原生支持，Windows 行为不变（`IS_POSIX` / `IS_MAC` 守卫）。
+
+- `detectSdDir()`：POSIX 扫 `$HOME`、`/opt`、`/usr/local`、`/srv` 与 `/Volumes/*`；Linux 扫 `/media` `/mnt`
+- `resolvePython()`：`venv/bin/python{,3}` → `python/bin/python3` → `.py310` → 记录 → `python3`
+- `buildLaunchEnv()`：macOS 注入 `PYTORCH_ENABLE_MPS_FALLBACK=1`
+- `spawnServer()`：macOS 补 `--skip-torch-cuda-test --upcast-sampling --no-half-vae`（gpu 另加 `--use-cpu interrogate`）
+- `queryFreeVramGb()`：macOS 返回 `-1`（无 CUDA，跳过显存门槛）
+- `DEFAULTS.startupTimeoutMs`：macOS 900s
+- 可复现脚本 `sd-direct.sh`（bash）+ `chmod 755`；自举安装 `install-sd-macos.sh`；工具 `fix-macho-zerofill.py`
+
+**验证**：仅 Apple M4（`Mac16,10`）/ macOS 27.0.1（`26A434`）/ Python 3.10.22 / torch 2.3.1(MPS) 单机。
+未验证 Intel Mac、其它系统与芯片、其它 DSH 版本、auto-mask / mask-qa 支线、MPS 显存自愈。
+
 
 ## 1.0.3（manifest 基线清理 · 2026-10-16）
 
