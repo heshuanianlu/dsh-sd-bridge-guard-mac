@@ -1,4 +1,4 @@
-## 1.0.3-mac.1（macOS / Apple Silicon 支持 · 实验性）
+## 1.0.3-mac（macOS / Apple Silicon 支持 · 实验性）
 
 基于 `1.0.3` 增加 macOS 原生支持，Windows 行为不变（`IS_POSIX` / `IS_MAC` 守卫）。
 
