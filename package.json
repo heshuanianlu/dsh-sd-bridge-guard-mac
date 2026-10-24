@@ -1,7 +1,7 @@
 {
   "name": "dsh-sd-bridge-guard",
-  "version": "0.7.0",
-  "description": "DeepSeek Harness 插件：本机 Stable Diffusion 生图六件套（文生图/图生图/蒙版重绘/只生成脚本/模型清单/服务管理）+ 违规分流协议。跨机器零适配——SD 目录自动探测，找不到可一键自举安装（先补齐 git/Python/VC++ 等环境），产物目录自动落在会话工作区；设置 → 插件可直接改配置。",
+  "version": "0.7.0-mac.1",
+  "description": "DeepSeek Harness 插件（macOS 移植自 0.7.0）：本机 Stable Diffusion（A1111-compatible WebUI）生图六件套——文生图 / 图生图 / 蒙版重绘 / 只生成可复现脚本 / 模型清单 / 服务管理。SD 目录自动探测（含 /Volumes 外接卷），找不到时可一键自举安装（install-sd-macos.sh：Python 3.10 venv + MPS 版 torch + 同 sha256 校验的模型/VAE/LoRA）；Apple Silicon 必需的 launch.py 参数由插件自动补齐。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -11,26 +11,32 @@
     "txt2img",
     "img2img",
     "image-generation",
-    "guard"
+    "macos",
+    "apple-silicon",
+    "mps"
   ],
   "type": "module",
   "main": "sd-bridge.js",
   "files": [
     "sd-bridge.js",
-    "sd-direct.ps1",
-    "install-sd.ps1",
+    "sd-direct.sh",
+    "install-sd-macos.sh",
+    "fix-macho-zerofill.py",
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "test-mac.mjs",
+    "test-mac-smoke.mjs",
+    "test-mac-e2e.mjs",
+    "check-sh-varquote.mjs"
   ],
   "scripts": {
-    "test": "node smoke-skill.mjs && node test-install-record.mjs && node test-settings.mjs && node test-install-catalog.mjs",
-    "test:smoke": "node smoke-skill.mjs",
-    "test:record": "node test-install-record.mjs",
-    "test:settings": "node test-settings.mjs",
-    "test:catalog": "node test-install-catalog.mjs",
-    "acceptance": "node acceptance.mjs"
+    "test": "node test-mac.mjs",
+    "check": "node check-sh-varquote.mjs && bash -n sd-direct.sh && bash -n install-sd-macos.sh && node --check sd-bridge.js && python3 -c \"import py_compile;py_compile.compile('fix-macho-zerofill.py', doraise=True)\"",
+    "install:sd": "bash install-sd-macos.sh",
+    "test:smoke": "node test-mac-smoke.mjs",
+    "test:e2e": "node test-mac-e2e.mjs"
   },
   "license": "MIT",
   "repository": {
